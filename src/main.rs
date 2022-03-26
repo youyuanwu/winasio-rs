@@ -8,16 +8,16 @@ use wchar::wch;
 
 fn main() {
     println!("Start");
-    let mut dwSize: DWORD = 0;
-    let mut dwDownloaded: DWORD = 0;
-    let mut pszOutBuffer: LPSTR;
-    let mut bResults: bool = false;
-    let mut hSession: HINTERNET = std::ptr::null_mut();
-    let mut hConnect: HINTERNET = std::ptr::null_mut();
-    let mut hRequest: HINTERNET = std::ptr::null_mut();
+    let mut dw_size: DWORD;
+    let mut dw_downloaded: DWORD = 0;
+    let mut psz_out_buffer: LPSTR;
+    let mut b_results: bool = false;
+    let h_session: HINTERNET;
+    let mut h_connect: HINTERNET = std::ptr::null_mut();
+    let mut h_request: HINTERNET = std::ptr::null_mut();
 
     unsafe {
-        hSession = WinHttpOpen(
+        h_session = WinHttpOpen(
             wch!("Rust\0").as_ptr(),
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             std::ptr::null(), //WINHTTP_NO_PROXY_NAME,
@@ -26,10 +26,10 @@ fn main() {
         );
     }
 
-    if hSession != std::ptr::null_mut() {
+    if h_session != std::ptr::null_mut() {
         unsafe {
-            hConnect = WinHttpConnect(
-                hSession,
+            h_connect = WinHttpConnect(
+                h_session,
                 wch!("api.github.com\0").as_ptr(),
                 INTERNET_DEFAULT_HTTPS_PORT.try_into().unwrap(),
                 0,
@@ -39,10 +39,10 @@ fn main() {
         eprintln!("fail to open session");
     }
 
-    if hConnect != std::ptr::null_mut() {
+    if h_connect != std::ptr::null_mut() {
         unsafe {
-            hRequest = WinHttpOpenRequest(
-                hConnect,
+            h_request = WinHttpOpenRequest(
+                h_connect,
                 wch!("GET\0").as_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
@@ -55,10 +55,10 @@ fn main() {
         eprintln!("fail to connect");
     }
 
-    if hRequest != std::ptr::null_mut() {
+    if h_request != std::ptr::null_mut() {
         unsafe {
-            bResults = WinHttpSendRequest(
-                hRequest,
+            b_results = WinHttpSendRequest(
+                h_request,
                 std::ptr::null(), // WINHTTP_NO_ADDITIONAL_HEADERS,
                 0,
                 std::ptr::null_mut(), //WINHTTP_NO_REQUEST_DATA,
@@ -71,39 +71,44 @@ fn main() {
         eprintln!("fail to open request");
     }
 
-    if bResults {
+    if b_results {
         unsafe {
-            bResults = WinHttpReceiveResponse(hRequest, std::ptr::null_mut()) == 1;
+            b_results = WinHttpReceiveResponse(h_request, std::ptr::null_mut()) == 1;
         }
     } else {
         eprintln!("fail to send request");
     }
 
-    if bResults {
-        while true {
+    if b_results {
+        loop {
             // Check for available data.
-            dwSize = 0;
-            let dwSize_ptr: *mut u32 = &mut dwSize;
-            if unsafe { WinHttpQueryDataAvailable(hRequest, dwSize_ptr) } == 0 {
+            dw_size = 0;
+            let dw_size_ptr: *mut u32 = &mut dw_size;
+            if unsafe { WinHttpQueryDataAvailable(h_request, dw_size_ptr) } == 0 {
                 println!("Error {} in WinHttpQueryDataAvailable.\n", unsafe {
                     GetLastError()
                 });
             }
-            // println!("got dwSize {}", dwSize);
-            if dwSize == 0 {
+            // println!("got dw_size {}", dw_size);
+            if dw_size == 0 {
                 break;
             }
             // Allocate space for the buffer.
-            let mut vec: Vec<CHAR> = vec![0; (dwSize + 1) as usize];
+            let mut vec: Vec<CHAR> = vec![0; (dw_size + 1) as usize];
 
-            pszOutBuffer = vec.as_mut_ptr();
+            psz_out_buffer = vec.as_mut_ptr();
 
             // Read the data.
-            // ZeroMemory(pszOutBuffer, dwSize + 1);
+            // ZeroMemory(psz_out_buffer, dw_size + 1);
 
-            let dwDownloaded_ptr: *mut u32 = &mut dwDownloaded;
+            let dw_downloaded_ptr: *mut u32 = &mut dw_downloaded;
             if unsafe {
-                WinHttpReadData(hRequest, pszOutBuffer as LPVOID, dwSize, dwDownloaded_ptr)
+                WinHttpReadData(
+                    h_request,
+                    psz_out_buffer as LPVOID,
+                    dw_size,
+                    dw_downloaded_ptr,
+                )
             } != 1
             {
                 print!("Error {} in WinHttpReadData.\n", unsafe { GetLastError() });
@@ -113,7 +118,7 @@ fn main() {
                     Ok(res) => res,
                     Err(e) => {
                         eprintln!("Parse error");
-                        panic!("fail");
+                        panic!("fail {}", e);
                     }
                 };
                 print!("{}", res);
