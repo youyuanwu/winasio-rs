@@ -7,7 +7,7 @@ pub mod winhttpraw {
 #![allow(unaligned_references)]
 #![allow(deref_nullptr)]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+// include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 }
 

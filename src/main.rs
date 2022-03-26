@@ -1,4 +1,9 @@
-use winhttp_rs::winhttpraw::*;
+use winapi::shared::minwindef::*;
+use winapi::um::winhttp::*;
+use winapi::shared::ntdef::LPSTR;
+use winapi::shared::ntdef::CHAR;
+use winapi::um::errhandlingapi::GetLastError;
+
 use wchar::{wch, wchz, wchar_t};
 
 fn main() {
