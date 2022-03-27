@@ -1,130 +1,85 @@
-use winapi::shared::minwindef::*;
-use winapi::shared::ntdef::CHAR;
-use winapi::shared::ntdef::LPSTR;
-use winapi::um::errhandlingapi::GetLastError;
-use winapi::um::winhttp::*;
+// use winapi::shared::minwindef::*;
+// use winapi::shared::ntdef::CHAR;
+// use winapi::shared::ntdef::LPSTR;
+// use winapi::um::errhandlingapi::GetLastError;
+// use winapi::um::winhttp::*;
 
-use wchar::wch;
+// use wchar::wch;
+
+use winhttp_rs::winhttp::*;
 
 fn main() {
     println!("Start");
-    let mut dw_size: DWORD;
-    let mut dw_downloaded: DWORD = 0;
-    let mut psz_out_buffer: LPSTR;
-    let mut b_results: bool = false;
-    let h_session: HINTERNET;
-    let mut h_connect: HINTERNET = std::ptr::null_mut();
-    let mut h_request: HINTERNET = std::ptr::null_mut();
+    let mut dw_size: u32;
+    let mut dw_downloaded: u32 = 0;
+    let h_session: HInternet;
+    let h_connect: HInternet;
+    let h_request: HInternet;
 
-    unsafe {
-        h_session = WinHttpOpen(
-            wch!("Rust\0").as_ptr(),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            std::ptr::null(), //WINHTTP_NO_PROXY_NAME,
-            std::ptr::null(), // WINHTTP_NO_PROXY_BYPASS,
-            0,
-        );
-    }
+    h_session = WinHttpOpen(
+        Some(wchar::wchz!("RUST1").to_vec()),
+        AccessType::WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        WinHttpOpenFlag::new(),
+    )
+    .unwrap();
 
-    if h_session != std::ptr::null_mut() {
-        unsafe {
-            h_connect = WinHttpConnect(
-                h_session,
-                wch!("api.github.com\0").as_ptr(),
-                INTERNET_DEFAULT_HTTPS_PORT.try_into().unwrap(),
-                0,
-            );
+    h_connect = WinHttpConnect(
+        &h_session,
+        wchar::wchz!("api.github.com").to_vec(),
+        INTERNET_DEFAULT_HTTPS_PORT,
+        0,
+    )
+    .unwrap();
+
+    h_request = WinHttpOpenRequest(
+        &h_connect,
+        wchar::wchz!("GET").to_vec(),
+        None, //Some(wchar::wchz!("").to_vec()),
+        Some(wchar::wchz!("HTTP/1.1").to_vec()),
+        WINHTTP_NO_REFERER,
+        Some(vec![wchar::wchz!("application/json").to_vec()]), //wchar::wchz!("text/plain").to_vec(),
+        WinHttpOpenRequestFlag::new().set_WINHTTP_FLAG_SECURE(),
+    )
+    .unwrap();
+
+    WinHttpSendRequest(
+        &h_request,
+        WINHTTP_NO_ADDITIONAL_HEADERS,
+        0,
+        WINHTTP_NO_REQUEST_DATA,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    WinHttpReceiveResponse(&h_request, None).unwrap();
+
+    loop {
+        // Check for available data.
+        dw_size = 0;
+        WinHttpQueryDataAvailable(&h_request, &mut dw_size).unwrap();
+        // println!("got dw_size {}", dw_size);
+        if dw_size == 0 {
+            break;
         }
-    } else {
-        eprintln!("fail to open session");
-    }
+        // Allocate space for the buffer.
+        let mut vec: Vec<std::os::raw::c_char> = vec![0; (dw_size + 1) as usize];
 
-    if h_connect != std::ptr::null_mut() {
-        unsafe {
-            h_request = WinHttpOpenRequest(
-                h_connect,
-                wch!("GET\0").as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),     //WINHTTP_NO_REFERER,
-                std::ptr::null_mut(), //WINHTTP_DEFAULT_ACCEPT_TYPES,
-                WINHTTP_FLAG_SECURE,
-            );
-        }
-    } else {
-        eprintln!("fail to connect");
-    }
+        // Read the data.
+        // ZeroMemory(psz_out_buffer, dw_size + 1);
+        WinHttpReadData(&h_request, &mut vec, dw_size, &mut dw_downloaded).unwrap();
 
-    if h_request != std::ptr::null_mut() {
-        unsafe {
-            b_results = WinHttpSendRequest(
-                h_request,
-                std::ptr::null(), // WINHTTP_NO_ADDITIONAL_HEADERS,
-                0,
-                std::ptr::null_mut(), //WINHTTP_NO_REQUEST_DATA,
-                0,
-                0,
-                0,
-            ) == 1;
-        }
-    } else {
-        eprintln!("fail to open request");
-    }
-
-    if b_results {
-        unsafe {
-            b_results = WinHttpReceiveResponse(h_request, std::ptr::null_mut()) == 1;
-        }
-    } else {
-        eprintln!("fail to send request");
-    }
-
-    if b_results {
-        loop {
-            // Check for available data.
-            dw_size = 0;
-            let dw_size_ptr: *mut u32 = &mut dw_size;
-            if unsafe { WinHttpQueryDataAvailable(h_request, dw_size_ptr) } == 0 {
-                println!("Error {} in WinHttpQueryDataAvailable.\n", unsafe {
-                    GetLastError()
-                });
+        vec.pop(); // skip the null terminator
+        let res = match String::from_utf8(unsafe { std::mem::transmute(vec) }) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Parse error");
+                panic!("fail {}", e);
             }
-            // println!("got dw_size {}", dw_size);
-            if dw_size == 0 {
-                break;
-            }
-            // Allocate space for the buffer.
-            let mut vec: Vec<CHAR> = vec![0; (dw_size + 1) as usize];
-
-            psz_out_buffer = vec.as_mut_ptr();
-
-            // Read the data.
-            // ZeroMemory(psz_out_buffer, dw_size + 1);
-
-            let dw_downloaded_ptr: *mut u32 = &mut dw_downloaded;
-            if unsafe {
-                WinHttpReadData(
-                    h_request,
-                    psz_out_buffer as LPVOID,
-                    dw_size,
-                    dw_downloaded_ptr,
-                )
-            } != 1
-            {
-                print!("Error {} in WinHttpReadData.\n", unsafe { GetLastError() });
-            } else {
-                vec.pop(); // skip the null terminator
-                let res = match String::from_utf8(unsafe { std::mem::transmute(vec) }) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        eprintln!("Parse error");
-                        panic!("fail {}", e);
-                    }
-                };
-                print!("{}", res);
-            }
-        }
-    } else {
-        eprintln!("Fail to recieve response");
+        };
+        print!("{}", res);
     }
 }

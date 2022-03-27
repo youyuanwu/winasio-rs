@@ -8,7 +8,10 @@ edition = "2021"
 [dependencies]
 wchar = "0.11.0"
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winhttp", "errhandlingapi"] }
+winapi = { version = "0.3", features = ["winhttp", "errhandlingapi", "winbase"] }
+widestring = "0.5.1"
+kernel32-sys = "*"
+win32-error = "0.9.0"
 
 # using winapi crate. generate is no longer needed.
 #[build-dependencies]

@@ -3,8 +3,8 @@ mod tests {
     //    use super::*;
     //    use std::mem;
 
-    use wchar::{wch, wchar_t, wchz};
-    use winhttp_rs::winhttpraw::*;
+    //use wchar::{wch, wchar_t, wchz};
+    //use winhttp_rs::winhttpraw::*;
 
     #[test]
     fn simple() {
