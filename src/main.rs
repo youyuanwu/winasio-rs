@@ -7,10 +7,10 @@
 // use wchar::wch;
 // mod lib;
 
-use winhttp_rs::winhttpw::*;
+use winhttp_rs::winhttp::*;
 
 fn main() {
-    println!("Start");
+    println!("Open");
     let mut dw_size: u32;
     let mut dw_downloaded: u32 = 0;
     let h_session: HInternet;
@@ -18,7 +18,7 @@ fn main() {
     let h_request: HInternet;
 
     h_session = WinHttpOpen(
-        Some(wchar::wchz!("RUST1").to_vec()),
+        Some(String::from("RUST1")),
         AccessType::WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -26,25 +26,28 @@ fn main() {
     )
     .unwrap();
 
+    println!("Connect");
     h_connect = WinHttpConnect(
         &h_session,
-        wchar::wchz!("api.github.com").to_vec(),
+        String::from("api.github.com"),
         INTERNET_DEFAULT_HTTPS_PORT,
         0,
     )
     .unwrap();
 
+    println!("open request");
     h_request = WinHttpOpenRequest(
         &h_connect,
-        wchar::wchz!("GET").to_vec(),
+        String::from("GET"),
         None, //Some(wchar::wchz!("").to_vec()),
-        Some(wchar::wchz!("HTTP/1.1").to_vec()),
+        Some(String::from("HTTP/1.1")),
         WINHTTP_NO_REFERER,
-        Some(vec![wchar::wchz!("application/json").to_vec()]), //wchar::wchz!("text/plain").to_vec(),
+        Some(vec![String::from("application/json")]), //wchar::wchz!("text/plain").to_vec(),
         WinHttpOpenRequestFlag::new().set_WINHTTP_FLAG_SECURE(),
     )
     .unwrap();
 
+    println!("Send Request");
     WinHttpSendRequest(
         &h_request,
         WINHTTP_NO_ADDITIONAL_HEADERS,
@@ -56,13 +59,15 @@ fn main() {
     )
     .unwrap();
 
+    println!("RecieveResponse");
     WinHttpReceiveResponse(&h_request, None).unwrap();
 
     loop {
+        println!("Query data available");
         // Check for available data.
         dw_size = 0;
         WinHttpQueryDataAvailable(&h_request, &mut dw_size).unwrap();
-        // println!("got dw_size {}", dw_size);
+        println!("got dw_size {}", dw_size);
         if dw_size == 0 {
             break;
         }

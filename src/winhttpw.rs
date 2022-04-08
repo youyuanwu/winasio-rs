@@ -109,11 +109,16 @@ pub fn WinHttpOpen(
     pszProxyBypassW: Option<Vec<wchar::wchar_t>>,
     dwFlags: WinHttpOpenFlag,
 ) -> Result<HInternet, win32_error::Win32Error> {
+
     let h_session: winapi::um::winhttp::HINTERNET;
     unsafe {
         h_session = winapi::um::winhttp::WinHttpOpen(
             match pszAgentW {
-                Some(x) => x.as_ptr(),
+                Some(x) => {
+                    // assert_eq!(6, x.len());
+                    // assert_eq!(wchar::wchz!("RUST1").to_vec(), x);
+                    x.as_ptr()
+                }
                 None => std::ptr::null(),
             },
             dwAccessType as u32,
@@ -145,6 +150,8 @@ pub fn WinHttpConnect(
 ) -> Result<HInternet, win32_error::Win32Error> {
     let h_connect: winapi::um::winhttp::HINTERNET;
 
+    assert_eq!(wchar::wchz!("api.github.com").to_vec(), pswzServerName);
+
     unsafe {
         h_connect = winapi::um::winhttp::WinHttpConnect(
             hSession.handle,
@@ -171,10 +178,17 @@ pub fn WinHttpOpenRequest(
     ppwszAcceptTypes: Option<Vec<Vec<wchar::wchar_t>>>,
     dwFlags: WinHttpOpenRequestFlag,
 ) -> Result<HInternet, win32_error::Win32Error> {
+
+    // assert_eq!(wchar::wchz!("HTTP/1.1").to_vec(), pwszVersion..unwrap());
+
+
     // const wchar_t *att[] = { L"text/plain", L"multipart/signed", NULL };
     let mut acceptTypes: Vec<*const wchar::wchar_t> = match ppwszAcceptTypes {
         Some(v) => {
-            let mut out = v.into_iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+            let mut out = v.into_iter().map(|s| {
+                // assert_eq!(wchar::wchz!("application/json").to_vec(),s);
+                s.as_ptr()
+            }).collect::<Vec<_>>();
             out.push(std::ptr::null()); // ending of c array
             out
         }
@@ -196,7 +210,10 @@ pub fn WinHttpOpenRequest(
                 None => std::ptr::null(),
             },
             match pwszVersion {
-                Some(x) => x.as_ptr(),
+                Some(x) => {
+                    // assert_eq!(wchar::wchz!("HTTP/1.1").to_vec(),x);
+                    x.as_ptr()}
+                ,
                 None => std::ptr::null(),
             },
             match pwszReferrer {

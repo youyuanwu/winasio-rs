@@ -24,7 +24,22 @@ fn OptionStringToVecN(x: Option<String>) -> Option<Vec<u8>> {
     }
 }
 fn StringToVecN(x: String) -> Vec<u8> {
-    return x.as_bytes().to_vec();
+    // because the c interface needs null terminator
+    let mut y = x.as_bytes().to_vec();
+    let last = y.last().copied();
+    match last{
+        Some(x) => { 
+            if x != 0 as u8{
+                // no terminator
+                y.push(0);
+            }
+        }
+        None => {
+            assert_eq!(0, y.len());
+            y.push(0); // empty c string
+        }
+    }
+    return y;
 }
 
 fn VecStringToVecN(narrow: Vec<String>) -> Vec<Vec<u8>> {
