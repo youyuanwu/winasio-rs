@@ -5,8 +5,9 @@
 // use winapi::um::winhttp::*;
 
 // use wchar::wch;
+// mod lib;
 
-use winhttp_rs::winhttp::*;
+use winhttp_rs::winhttpw::*;
 
 fn main() {
     println!("Start");
