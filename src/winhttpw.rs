@@ -187,6 +187,7 @@ pub fn WinHttpOpenRequest(
         Some(v) => {
             let mut out = v.into_iter().map(|s| {
                 // assert_eq!(wchar::wchz!("application/json").to_vec(),s);
+                // assert_eq!(wchar::wchz!("text/plain").to_vec(),s);
                 s.as_ptr()
             }).collect::<Vec<_>>();
             out.push(std::ptr::null()); // ending of c array

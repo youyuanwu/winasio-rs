@@ -18,7 +18,7 @@ fn main() {
     let h_request: HInternet;
 
     h_session = WinHttpOpen(
-        Some(String::from("RUST1")),
+        Some(String::from("RUST2")),
         AccessType::WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -39,10 +39,10 @@ fn main() {
     h_request = WinHttpOpenRequest(
         &h_connect,
         String::from("GET"),
-        None, //Some(wchar::wchz!("").to_vec()),
+        Some(String::from("unkown")), //None, //Some(wchar::wchz!("").to_vec()),
         Some(String::from("HTTP/1.1")),
         WINHTTP_NO_REFERER,
-        Some(vec![String::from("application/json")]), //wchar::wchz!("text/plain").to_vec(),
+        Some(vec![String::from("application/json"), String::from("text/plain")]), //wchar::wchz!("text/plain").to_vec(),
         WinHttpOpenRequestFlag::new().set_WINHTTP_FLAG_SECURE(),
     )
     .unwrap();
