@@ -27,9 +27,9 @@ fn StringToVecN(x: String) -> Vec<u8> {
     // because the c interface needs null terminator
     let mut y = x.as_bytes().to_vec();
     let last = y.last().copied();
-    match last{
-        Some(x) => { 
-            if x != 0 as u8{
+    match last {
+        Some(x) => {
+            if x != 0 as u8 {
                 // no terminator
                 y.push(0);
             }

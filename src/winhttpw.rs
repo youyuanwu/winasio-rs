@@ -109,7 +109,6 @@ pub fn WinHttpOpen(
     pszProxyBypassW: Option<Vec<wchar::wchar_t>>,
     dwFlags: WinHttpOpenFlag,
 ) -> Result<HInternet, win32_error::Win32Error> {
-
     let h_session: winapi::um::winhttp::HINTERNET;
     unsafe {
         h_session = winapi::um::winhttp::WinHttpOpen(
@@ -178,23 +177,35 @@ pub fn WinHttpOpenRequest(
     ppwszAcceptTypes: Option<Vec<Vec<wchar::wchar_t>>>,
     dwFlags: WinHttpOpenRequestFlag,
 ) -> Result<HInternet, win32_error::Win32Error> {
-
+    println!("{:?}", ppwszAcceptTypes);
     // assert_eq!(wchar::wchz!("HTTP/1.1").to_vec(), pwszVersion..unwrap());
-
 
     // const wchar_t *att[] = { L"text/plain", L"multipart/signed", NULL };
     let mut acceptTypes: Vec<*const wchar::wchar_t> = match ppwszAcceptTypes {
-        Some(v) => {
-            let mut out = v.into_iter().map(|s| {
-                // assert_eq!(wchar::wchz!("application/json").to_vec(),s);
-                // assert_eq!(wchar::wchz!("text/plain").to_vec(),s);
-                s.as_ptr()
-            }).collect::<Vec<_>>();
+        Some(ref v) => {
+            // must use ref, since the vec can be freed/moved before the pointers get passed to c api.
+            let mut out = v
+                .into_iter()
+                .map(|s| {
+                    // assert_eq!(&wchar::wchz!("application/json").to_vec(),s);
+                    // assert_eq!(wchar::wchz!("text/plain").to_vec(),s);
+                    s.as_ptr()
+                })
+                .collect::<Vec<_>>();
             out.push(std::ptr::null()); // ending of c array
             out
         }
         WINHTTP_DEFAULT_ACCEPT_TYPES => Vec::new(),
     };
+
+    // let j = wchar::wchz!("application/json").to_vec();
+    // acceptTypes.clear();
+    // acceptTypes.push(j.as_ptr());
+    // acceptTypes.push(std::ptr::null());
+
+    // println!("{:?}", ppwszAcceptTypes);
+    // println!("{:?}",acceptTypes);
+    // println!("{:?}",acceptTypes[0]);
 
     let mut acceptTypesPtr: *mut winapi::shared::ntdef::LPCWSTR = std::ptr::null_mut();
     if acceptTypes.len() != 0 {
@@ -213,8 +224,8 @@ pub fn WinHttpOpenRequest(
             match pwszVersion {
                 Some(x) => {
                     // assert_eq!(wchar::wchz!("HTTP/1.1").to_vec(),x);
-                    x.as_ptr()}
-                ,
+                    x.as_ptr()
+                }
                 None => std::ptr::null(),
             },
             match pwszReferrer {

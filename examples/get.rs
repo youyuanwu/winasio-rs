@@ -39,10 +39,10 @@ fn main() {
     h_request = WinHttpOpenRequest(
         &h_connect,
         String::from("GET"),
-        Some(String::from("unkown")), //None, //Some(wchar::wchz!("").to_vec()),
+        None, // Some(String::from("")), //None, //Some(wchar::wchz!("").to_vec()),
         Some(String::from("HTTP/1.1")),
         WINHTTP_NO_REFERER,
-        Some(vec![String::from("application/json"), String::from("text/plain")]), //wchar::wchz!("text/plain").to_vec(),
+        Some(vec![String::from("application/json")]), // String::from("text/plain")
         WinHttpOpenRequestFlag::new().set_WINHTTP_FLAG_SECURE(),
     )
     .unwrap();
