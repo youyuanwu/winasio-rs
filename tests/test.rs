@@ -1,25 +1,54 @@
 #[cfg(test)]
 mod tests {
-    //    use super::*;
-    //    use std::mem;
-
-    //use wchar::{wch, wchar_t, wchz};
-    //use winhttp_rs::winhttpraw::*;
+    use windows::{core::HSTRING, Win32::Networking::WinHttp::*};
+    use winhttp_rs::{self, winhttp::*};
 
     #[test]
     fn simple() {
-        //     DWORD dwSize = 0;
-        // DWORD dwDownloaded = 0;
-        // LPSTR pszOutBuffer;
-        // BOOL  bResults = FALSE;
-        // HINTERNET  hSession = NULL,
-        // 	hConnect = NULL,
-        // 	hRequest = NULL;
+        let session = open_session(
+            HSTRING::from("Rust2"),
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            HSTRING::new(),
+            HSTRING::new(),
+            0,
+        )
+        .unwrap();
 
-        // // Use WinHttpOpen to obtain a session handle.
-        // hSession = WinHttpOpen(L"WinHTTP Example/1.0",
-        // 	WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        // 	WINHTTP_NO_PROXY_NAME,
-        // 	WINHTTP_NO_PROXY_BYPASS, 0);
+        let conn = connect(
+            &session,
+            HSTRING::from("api.github.com"),
+            INTERNET_DEFAULT_HTTPS_PORT,
+        )
+        .unwrap();
+
+        let req = open_request(
+            &conn,
+            HSTRING::from("GET"),
+            HSTRING::new(),
+            HSTRING::from("HTTP/1.1"),
+            HSTRING::new(),
+            Some(vec![HSTRING::from("application/json")]),
+            WINHTTP_FLAG_SECURE,
+        )
+        .unwrap();
+
+        req.send(HSTRING::new(), &[], 0, 0).unwrap();
+
+        req.receieve_response().unwrap();
+
+        loop {
+            let mut len = 0;
+            req.query_data_available(&mut len).unwrap();
+            if len == 0 {
+                break;
+            }
+            let mut buffer: Vec<u8> = vec![0; len as usize];
+            let mut lpdwnumberofbytesread: u32 = 0;
+            req.read_data(buffer.as_mut_slice(), len, &mut lpdwnumberofbytesread)
+                .unwrap();
+
+            let s = String::from_utf8_lossy(&buffer);
+            print!("{}", s);
+        }
     }
 }
