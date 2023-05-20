@@ -4,12 +4,138 @@ use windows::core::Error;
 use windows::core::HSTRING;
 use windows::Win32::Networking::WinHttp::*;
 
-pub struct HInternet {
+// wrapper for raw handle
+struct HInternet {
     handle: *mut ::core::ffi::c_void,
 }
 
+// winhttp session
+pub struct HSession {
+    h: HInternet,
+}
+
+// winhttp connection
+pub struct HConnect {
+    h: HInternet,
+}
+
+// winhttp request
+pub struct HRequest {
+    h: HInternet,
+}
+
+impl HSession {
+    pub fn new(
+        agent: HSTRING,
+        access_type: WINHTTP_ACCESS_TYPE,
+        proxy: HSTRING,
+        proxy_bypass: HSTRING,
+        dwflags: u32,
+    ) -> Result<HSession, Error> {
+        let hi = open_session(agent, access_type, proxy, proxy_bypass, dwflags)?;
+        Ok(HSession { h: hi })
+    }
+
+    // create winhttp connection
+    pub fn connect(
+        &self,
+        servername: HSTRING,
+        serverport: INTERNET_PORT,
+    ) -> Result<HConnect, Error> {
+        let conn = connect(&self.h, servername, serverport)?;
+        Ok(HConnect { h: conn })
+    }
+}
+
+impl HConnect {
+    // creates winhttp request
+    pub fn open_request(
+        &self,
+        verb: HSTRING,
+        object_name: HSTRING,
+        version: HSTRING,
+        referer: HSTRING,
+        accept_types: Option<Vec<HSTRING>>,
+        dwflags: WINHTTP_OPEN_REQUEST_FLAGS,
+    ) -> Result<HRequest, Error> {
+        let req = open_request(
+            &self.h,
+            verb,
+            object_name,
+            version,
+            referer,
+            accept_types,
+            dwflags,
+        )?;
+        Ok(HRequest { h: req })
+    }
+}
+
+impl HRequest {
+    // works on connection handle
+    // header example: L"Content-Length: 68719476735\r\n"
+    // optional is body
+    pub fn send(
+        &self,
+        headers: HSTRING,
+        optional: &[u8],
+        total_length: u32,
+        context: usize,
+    ) -> Result<(), Error> {
+        // prepare header
+        let mut headers_op: Option<&[u16]> = None;
+        if !headers.is_empty() {
+            headers_op = Some(headers.as_wide());
+        }
+        let mut optional_op: Option<*const ::core::ffi::c_void> = None;
+        // prepare optional body
+        if !optional.is_empty() {
+            optional_op = Some(optional.as_ptr() as *mut std::ffi::c_void);
+        }
+
+        let ok = unsafe {
+            WinHttpSendRequest(
+                self.h.handle,
+                headers_op,
+                optional_op,
+                optional.len() as u32,
+                total_length,
+                context,
+            )
+        };
+        ok.ok()
+    }
+
+    pub fn receieve_response(&self) -> Result<(), Error> {
+        let ok = unsafe { WinHttpReceiveResponse(self.h.handle, std::ptr::null_mut()) };
+        ok.ok()
+    }
+
+    pub fn query_data_available(&self, lpdwnumberofbytesavailable: &mut u32) -> Result<(), Error> {
+        let ok = unsafe { WinHttpQueryDataAvailable(self.h.handle, lpdwnumberofbytesavailable) };
+        ok.ok()
+    }
+
+    pub fn read_data(
+        &self,
+        buffer: &mut [u8],
+        dwnumberofbytestoread: u32,
+        lpdwnumberofbytesread: &mut u32,
+    ) -> Result<(), Error> {
+        let ok = unsafe {
+            WinHttpReadData(
+                self.h.handle,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                dwnumberofbytestoread,
+                lpdwnumberofbytesread,
+            )
+        };
+        ok.ok()
+    }
+}
+
 // open session
-pub fn open_session(
+fn open_session(
     agent: HSTRING,
     access_type: WINHTTP_ACCESS_TYPE,
     proxy: HSTRING,
@@ -23,7 +149,7 @@ pub fn open_session(
     Ok(HInternet { handle: h })
 }
 
-pub fn connect(
+fn connect(
     session: &HInternet,
     servername: HSTRING,
     serverport: INTERNET_PORT,
@@ -42,7 +168,7 @@ pub fn connect(
     Ok(HInternet { handle: h })
 }
 
-pub fn open_request(
+fn open_request(
     connect: &HInternet,
     verb: HSTRING,
     object_name: HSTRING,
@@ -88,69 +214,6 @@ pub fn open_request(
         return Err(Error::from_win32());
     }
     Ok(HInternet { handle: h })
-}
-
-impl HInternet {
-    // works on connection handle
-    // header example: L"Content-Length: 68719476735\r\n"
-    // optional is body
-    pub fn send(
-        &self,
-        headers: HSTRING,
-        optional: &[u8],
-        total_length: u32,
-        context: usize,
-    ) -> Result<(), Error> {
-        // prepare header
-        let mut headers_op: Option<&[u16]> = None;
-        if !headers.is_empty() {
-            headers_op = Some(headers.as_wide());
-        }
-        let mut optional_op: Option<*const ::core::ffi::c_void> = None;
-        // prepare optional body
-        if !optional.is_empty() {
-            optional_op = Some(optional.as_ptr() as *mut std::ffi::c_void);
-        }
-
-        let ok = unsafe {
-            WinHttpSendRequest(
-                self.handle,
-                headers_op,
-                optional_op,
-                optional.len() as u32,
-                total_length,
-                context,
-            )
-        };
-        ok.ok()
-    }
-
-    pub fn receieve_response(&self) -> Result<(), Error> {
-        let ok = unsafe { WinHttpReceiveResponse(self.handle, std::ptr::null_mut()) };
-        ok.ok()
-    }
-
-    pub fn query_data_available(&self, lpdwnumberofbytesavailable: &mut u32) -> Result<(), Error> {
-        let ok = unsafe { WinHttpQueryDataAvailable(self.handle, lpdwnumberofbytesavailable) };
-        ok.ok()
-    }
-
-    pub fn read_data(
-        &self,
-        buffer: &mut [u8],
-        dwnumberofbytestoread: u32,
-        lpdwnumberofbytesread: &mut u32,
-    ) -> Result<(), Error> {
-        let ok = unsafe {
-            WinHttpReadData(
-                self.handle,
-                buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                dwnumberofbytestoread,
-                lpdwnumberofbytesread,
-            )
-        };
-        ok.ok()
-    }
 }
 
 impl Drop for HInternet {

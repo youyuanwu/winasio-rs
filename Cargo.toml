@@ -11,3 +11,8 @@ features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp"
 ]
+
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+warp = "0.3"
