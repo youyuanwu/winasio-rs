@@ -143,7 +143,7 @@ fn open_session(
     dwflags: u32,
 ) -> Result<HInternet, Error> {
     let h = unsafe { WinHttpOpen(&agent, access_type, &proxy, &proxy_bypass, dwflags) };
-    if h == std::ptr::null_mut() {
+    if h.is_null() {
         return Err(Error::from_win32());
     }
     Ok(HInternet { handle: h })
@@ -162,7 +162,7 @@ fn connect(
             /*reserved */ 0,
         )
     };
-    if h == std::ptr::null_mut() {
+    if h.is_null() {
         return Err(Error::from_win32());
     }
     Ok(HInternet { handle: h })
@@ -192,7 +192,7 @@ fn open_request(
     };
 
     let mut temp_ptr: *mut ::windows::core::PCWSTR = std::ptr::null_mut();
-    if at.len() != 0 {
+    if !at.is_empty() {
         temp_ptr = at.as_mut_ptr();
     }
 
@@ -210,7 +210,7 @@ fn open_request(
             dwflags,
         )
     };
-    if h == std::ptr::null_mut() {
+    if h.is_null() {
         return Err(Error::from_win32());
     }
     Ok(HInternet { handle: h })
@@ -218,7 +218,7 @@ fn open_request(
 
 impl Drop for HInternet {
     fn drop(&mut self) {
-        if self.handle == std::ptr::null_mut() {
+        if self.handle.is_null() {
             return;
         }
         let ok = unsafe { WinHttpCloseHandle(self.handle) };
