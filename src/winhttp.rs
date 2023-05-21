@@ -1,5 +1,7 @@
 // replacement using windows-rs
 
+pub mod fasync;
+
 use windows::core::Error;
 use windows::core::HSTRING;
 use windows::Win32::Networking::WinHttp::*;
@@ -111,8 +113,15 @@ impl HRequest {
         ok.ok()
     }
 
-    pub fn query_data_available(&self, lpdwnumberofbytesavailable: &mut u32) -> Result<(), Error> {
-        let ok = unsafe { WinHttpQueryDataAvailable(self.h.handle, lpdwnumberofbytesavailable) };
+    pub fn query_data_available(
+        &self,
+        lpdwnumberofbytesavailable: Option<&mut u32>,
+    ) -> Result<(), Error> {
+        let numberofbytesavailable_op: *mut u32 = match lpdwnumberofbytesavailable {
+            Some(op) => op,
+            None => std::ptr::null_mut(),
+        };
+        let ok = unsafe { WinHttpQueryDataAvailable(self.h.handle, numberofbytesavailable_op) };
         ok.ok()
     }
 
@@ -120,17 +129,61 @@ impl HRequest {
         &self,
         buffer: &mut [u8],
         dwnumberofbytestoread: u32,
-        lpdwnumberofbytesread: &mut u32,
+        lpdwnumberofbytesread: Option<&mut u32>,
     ) -> Result<(), Error> {
+        let numberofbytesread_op: *mut u32 = match lpdwnumberofbytesread {
+            Some(op) => op,
+            None => std::ptr::null_mut(),
+        };
+
         let ok = unsafe {
             WinHttpReadData(
                 self.h.handle,
                 buffer.as_mut_ptr() as *mut std::ffi::c_void,
                 dwnumberofbytestoread,
-                lpdwnumberofbytesread,
+                numberofbytesread_op,
             )
         };
         ok.ok()
+    }
+
+    pub fn write_data(
+        &self,
+        buf: &[u8],
+        dwnumberofbytestowrite: u32,
+        lpdwnumberofbyteswritten: Option<&mut u32>,
+    ) -> Result<(), Error> {
+        let len = buf.len();
+        let lpdwnumberofbyteswritten_op: *mut u32 = match lpdwnumberofbyteswritten {
+            Some(op) => op,
+            None => std::ptr::null_mut(),
+        };
+        assert!(dwnumberofbytestowrite as usize <= len);
+        let ok = unsafe {
+            WinHttpWriteData(
+                self.h.handle,
+                Some(buf.as_ptr() as *const std::ffi::c_void),
+                dwnumberofbytestowrite,
+                lpdwnumberofbyteswritten_op,
+            )
+        };
+        ok.ok()
+    }
+
+    pub fn set_status_callback(
+        &self,
+        lpfninternetcallback: WINHTTP_STATUS_CALLBACK,
+        dwnotificationflags: u32,
+        dwreserved: usize,
+    ) -> WINHTTP_STATUS_CALLBACK {
+        unsafe {
+            WinHttpSetStatusCallback(
+                self.h.handle,
+                lpfninternetcallback,
+                dwnotificationflags,
+                dwreserved,
+            )
+        }
     }
 }
 
