@@ -1,6 +1,8 @@
-# README
-![ci](https://github.com/youyuanwu/winhttp-rs/actions/workflows/build.yaml/badge.svg)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://raw.githubusercontent.com/youyuanwu/winhttp-rs/main/LICENSE)
+# winasio-rs
+![ci](https://github.com/youyuanwu/winasio-rs/actions/workflows/build.yaml/badge.svg)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://raw.githubusercontent.com/youyuanwu/winasio-rs/main/LICENSE)
+
+Windows Async I/O and Networking lib for Rust.
 
 # Winhttp
 Winhttp in async mode with rust async await wrapper.

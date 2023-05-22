@@ -941,6 +941,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
+name = "winasio-rs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tokio",
+ "warp",
+ "windows",
+]
+
+[[package]]
 name = "windows"
 version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1086,15 +1098,3 @@ name = "windows_x86_64_msvc"
 version = "0.48.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a515f5799fe4961cb532f983ce2b23082366b898e52ffbce459c86f67c8378a"
-
-[[package]]
-name = "winhttp-rs"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_derive",
- "serde_json",
- "tokio",
- "warp",
- "windows",
-]
