@@ -1,2 +1,8 @@
 /target
+build
 .vscode
+*.profraw
+*.profdata
+coverage.txt
+summary.txt
+coverage.json

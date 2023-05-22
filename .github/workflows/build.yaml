@@ -22,6 +22,12 @@ jobs:
       with:
         command: check
 
+    - name: Install coverage unmangle tool
+      uses: actions-rs/cargo@v1
+      with:
+        command: install
+        args: rustfilt
+
     - name: Run cargo fmt
       uses: actions-rs/cargo@v1
       with:
@@ -39,3 +45,20 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: test
+
+    # coverage
+    - name: run cmake
+      run: > 
+        cmake . -DCMAKE_BUILD_TYPE=Debug -B build
+    
+    - name: run coverage
+      run: |
+        cmake --build build --config Debug --target cov_all
+
+    - name: Upload Report to Codecov
+      if: ${{ matrix.BUILD_TYPE == 'Debug' }}
+      uses: codecov/codecov-action@v2
+      with:
+        files: ./coverage.json
+        fail_ci_if_error: true
+        functionalities: fix
