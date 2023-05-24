@@ -72,7 +72,7 @@ mod tests {
         let ip = addr.ip();
         let port = addr.port();
         let conn = session
-            .connect(HSTRING::from(ip.to_string()), INTERNET_PORT(port as u32))
+            .connect(HSTRING::from(ip.to_string()), port)
             .unwrap();
 
         let req = conn
@@ -120,7 +120,7 @@ mod tests {
         let ip = addr.ip();
         let port = addr.port();
         let conn = session
-            .connect(HSTRING::from(ip.to_string()), INTERNET_PORT(port as u32))
+            .connect(HSTRING::from(ip.to_string()), port)
             .unwrap();
         {
             let req = conn

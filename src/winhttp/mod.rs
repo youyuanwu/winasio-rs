@@ -43,11 +43,7 @@ impl HSession {
     }
 
     // create winhttp connection
-    pub fn connect(
-        &self,
-        servername: HSTRING,
-        serverport: INTERNET_PORT,
-    ) -> Result<HConnect, Error> {
+    pub fn connect(&self, servername: HSTRING, serverport: u16) -> Result<HConnect, Error> {
         let conn = connect(&self.h, servername, serverport)?;
         Ok(HConnect { h: conn })
     }
@@ -206,11 +202,7 @@ fn open_session(
     Ok(HInternet { handle: h })
 }
 
-fn connect(
-    session: &HInternet,
-    servername: HSTRING,
-    serverport: INTERNET_PORT,
-) -> Result<HInternet, Error> {
+fn connect(session: &HInternet, servername: HSTRING, serverport: u16) -> Result<HInternet, Error> {
     let h = unsafe {
         WinHttpConnect(
             session.handle,
@@ -254,7 +246,7 @@ fn open_request(
     }
 
     // there might be a bug in the api where PCWSTR should be accepted
-    let at_ptr: *mut ::windows::core::PWSTR = unsafe { ::core::mem::transmute(temp_ptr) };
+    //let at_ptr: *mut ::windows::core::PWSTR = unsafe { ::core::mem::transmute(temp_ptr) };
 
     let h = unsafe {
         WinHttpOpenRequest(
@@ -263,7 +255,7 @@ fn open_request(
             &object_name,
             &version,
             &referer,
-            at_ptr,
+            temp_ptr,
             dwflags,
         )
     };
