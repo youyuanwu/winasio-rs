@@ -45,6 +45,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: test
+        args: -- --nocapture
 
     # coverage
     - name: run cmake
