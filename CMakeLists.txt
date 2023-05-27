@@ -7,7 +7,7 @@ find_program(cargo_exe cargo
 REQUIRED
 )
 
-# extract test executable name
+# extract test executable name, compiled from tests folder
 execute_process(
   COMMAND powershell.exe -Command "$env:RUSTFLAGS='-C instrument-coverage'; 
   (& \"${cargo_exe}\" test --test test --no-run *>&1) | ForEach-Object ToString"
@@ -19,13 +19,42 @@ message(STATUS "Using test exe ${_test_target}")
 string(REGEX MATCH "target[\\].*\.exe" Target_Var "${_test_target}")
 message(STATUS "Cmake target test ${Target_Var}")
 
+# extract test executable name for lib package, compiled from src folder
+execute_process(
+  COMMAND powershell.exe -Command "$env:RUSTFLAGS='-C instrument-coverage'; 
+  (& \"${cargo_exe}\" test --lib --no-run *>&1) | ForEach-Object ToString"
+  OUTPUT_VARIABLE _test_lib_target
+  COMMAND_ERROR_IS_FATAL ANY
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+message(STATUS "Using lib test exe ${_test_lib_target}")
+string(REGEX MATCH "target[\\].*\.exe" Lib_Target_Var "${_test_lib_target}")
+message(STATUS "Cmake target lib test ${Lib_Target_Var}")
+
+# remove profraw file generated during compiling
+execute_process(
+  COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
+  COMMAND_ERROR_IS_FATAL ANY
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# run lib test
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw
+  # remove old data
+  # COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
+  COMMAND ${Lib_Target_Var}
+  COMMAND powershell.exe -Command "Get-ChildItem default_*.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName lib.profraw}"
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 # run tests with name contains "test"
 add_custom_command(
-  OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/MyPerf.profraw
+  OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/tests.profraw
   # remove old data
-  COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
+  # COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
   COMMAND ${Target_Var}
-  COMMAND powershell.exe -Command "Get-ChildItem *.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName MyPerf.profraw}"
+  COMMAND powershell.exe -Command "Get-ChildItem default_*.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName tests.profraw}"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -34,6 +63,7 @@ add_custom_target(cov_clean
   COMMAND powershell.exe -Command "Remove-Item * -Include *.profdata"
   COMMAND powershell.exe -Command "Remove-Item * -Include *.xml"
   COMMAND powershell.exe -Command "Remove-Item * -Include coverage.*"
+  COMMAND powershell.exe -Command "Remove-Item summary.txt"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -43,9 +73,10 @@ REQUIRED
 
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/winio.profdata
-  COMMAND powershell.exe -Command "& \'${llvm_profdata_exe}\' merge -sparse MyPerf.profraw -o winio.profdata"
+  COMMAND powershell.exe -Command "& \'${llvm_profdata_exe}\' merge -sparse *.profraw -o winio.profdata"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/MyPerf.profraw
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests.profraw 
+          ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw
 )
 
 find_program(llvm_cov_exe llvm-cov
@@ -71,7 +102,8 @@ add_custom_command(
   --ignore-filename-regex="\\\\.cargo\\\\registry" 
   --instr-profile=winio.profdata 
   --format text
-  --object "${Target_Var}" > summary.txt
+  --object "${Target_Var}"
+  --object "${Lib_Target_Var}" > summary.txt
   COMMAND type summary.txt
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/winio.profdata
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
