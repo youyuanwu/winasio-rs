@@ -4,6 +4,7 @@
 // license information.
 // ------------------------------------------------------------
 
+pub mod httpsys;
 pub mod winhttp;
 
 pub mod sys;

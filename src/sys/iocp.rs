@@ -39,6 +39,10 @@ unsafe extern "system" fn private_callback(
     wrap.as_obj.wake();
 }
 
+// add some unsafe rust def
+unsafe impl Send for OverlappedWrap {}
+unsafe impl Sync for OverlappedWrap {}
+
 #[repr(C)]
 pub struct OverlappedWrap {
     o: OVERLAPPED,
@@ -93,6 +97,14 @@ impl OverlappedObject {
 
     pub async fn wait(&self) {
         self.o.as_obj.get_await_token().await;
+    }
+
+    pub fn get_ec(&self) -> Error {
+        self.o.err.clone()
+    }
+
+    pub fn get_len(&self) -> u32 {
+        self.o.len
     }
 }
 

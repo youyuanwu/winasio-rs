@@ -10,7 +10,7 @@ REQUIRED
 # extract test executable name, compiled from tests folder
 execute_process(
   COMMAND powershell.exe -Command "$env:RUSTFLAGS='-C instrument-coverage'; 
-  (& \"${cargo_exe}\" test --test test --no-run *>&1) | ForEach-Object ToString"
+  (& \"${cargo_exe}\" test --test winhttp --no-run *>&1) | ForEach-Object ToString"
   OUTPUT_VARIABLE _test_target
   COMMAND_ERROR_IS_FATAL ANY
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -43,7 +43,7 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw
   # remove old data
   # COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
-  COMMAND ${Lib_Target_Var}
+  COMMAND ${Lib_Target_Var} --nocapture
   COMMAND powershell.exe -Command "Get-ChildItem default_*.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName lib.profraw}"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -63,7 +63,7 @@ add_custom_target(cov_clean
   COMMAND powershell.exe -Command "Remove-Item * -Include *.profdata"
   COMMAND powershell.exe -Command "Remove-Item * -Include *.xml"
   COMMAND powershell.exe -Command "Remove-Item * -Include coverage.*"
-  COMMAND powershell.exe -Command "Remove-Item summary.txt"
+  COMMAND powershell.exe -Command "Remove-Item * -Include summary.txt"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -135,6 +135,7 @@ add_custom_command(
 
 add_custom_target(cov_all
   DEPENDS 
+    cov_clean
     ${CMAKE_CURRENT_SOURCE_DIR}/coverage.txt 
     ${CMAKE_CURRENT_SOURCE_DIR}/summary.txt
     ${CMAKE_CURRENT_SOURCE_DIR}/coverage.json
