@@ -43,7 +43,7 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw
   # remove old data
   # COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
-  COMMAND ${Lib_Target_Var} --nocapture
+  COMMAND powershell.exe -Command "$env:RUST_BACKTRACE=1; ${Lib_Target_Var} --nocapture"
   COMMAND powershell.exe -Command "Get-ChildItem default_*.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName lib.profraw}"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -53,9 +53,18 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/tests.profraw
   # remove old data
   # COMMAND powershell.exe -Command "Remove-Item * -Include *.profraw"
-  COMMAND ${Target_Var}
+  COMMAND powershell.exe -Command "$env:RUST_BACKTRACE=1; ${Target_Var} --nocapture"
   COMMAND powershell.exe -Command "Get-ChildItem default_*.profraw | ForEach-Object {Rename-Item -Path $_.Name -NewName tests.profraw}"
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  # DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw # make sure public test runs after lib test
+)
+
+add_custom_target(cov_winhttp
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests.profraw
+)
+
+add_custom_target(cov_lib
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/lib.profraw
 )
 
 add_custom_target(cov_clean
@@ -100,6 +109,7 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/summary.txt
   COMMAND ${llvm_cov_exe} report 
   --ignore-filename-regex="\\\\.cargo\\\\registry" 
+  --ignore-filename-regex="\\\\rustc" 
   --instr-profile=winio.profdata 
   --format text
   --object "${Target_Var}"
@@ -113,11 +123,13 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/coverage.txt
   COMMAND ${llvm_cov_exe} show 
   --ignore-filename-regex="\\\\.cargo\\\\registry" 
+  --ignore-filename-regex="\\\\rustc" 
   --instr-profile=winio.profdata 
   --format text
   --show-instantiations --show-line-counts-or-regions
   --Xdemangler=rustfilt
-  --object "${Target_Var}" > coverage.txt
+  --object "${Target_Var}"
+  --object "${Lib_Target_Var}" > coverage.txt
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/winio.profdata
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
@@ -126,9 +138,11 @@ add_custom_command(
   OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/coverage.json
   COMMAND ${llvm_cov_exe} export
   --ignore-filename-regex="\\\\.cargo\\\\registry" 
+  --ignore-filename-regex="\\\\rustc" 
   --instr-profile=winio.profdata 
   --Xdemangler=rustfilt
-  --object "${Target_Var}" > coverage.json
+  --object "${Target_Var}"
+  --object "${Lib_Target_Var}" > coverage.json
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/winio.profdata
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )

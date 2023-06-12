@@ -4,12 +4,14 @@
 // license information.
 // ------------------------------------------------------------
 
+use std::sync::Mutex;
+
 use windows::{
     core::{Error, HRESULT, HSTRING},
     Win32::Networking::WinHttp::*,
 };
 
-use crate::sys::wait::AsyncWaitObject;
+use crate::sys::wait::{AsyncWaitObject, AwaitableToken};
 
 use super::HRequest;
 
@@ -24,14 +26,17 @@ const WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS: u32 = WINHTTP_CALLBACK_STATUS_SENDR
 // Async request handle
 pub struct HRequestAsync {
     h: HRequest,
-    ctx: AsyncContext,
+    // mutex introduced to protect thread shared data.
+    // It is only needed as memory barrier. front end and callback are
+    // forms an strand already. This is a overkill.
+    ctx: Mutex<AsyncContext>,
 }
 
 impl HRequestAsync {
     pub fn new(h: HRequest) -> HRequestAsync {
         let ha = HRequestAsync {
             h,
-            ctx: AsyncContext::new(),
+            ctx: Mutex::new(AsyncContext::new()),
         };
 
         let prev = ha.h.set_status_callback(
@@ -60,32 +65,66 @@ impl HRequestAsync {
         total_length: u32,
     ) -> Result<(), Error> {
         // does not need to reset ctx
-        self.ctx.state = WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE;
-        // case ctx pass to winhttp
-        let ctx_ptr: *const AsyncContext = &self.ctx;
-        let raw_ctx: *mut ::core::ffi::c_void = ctx_ptr as *mut ::core::ffi::c_void;
-        self.h
-            .send(headers, optional, total_length, raw_ctx as usize)?;
-        // wait for ctx to get signalled
-        self.ctx.wait().await;
-        self.ctx.err.code().ok()
+        let token: AwaitableToken;
+        {
+            {
+                let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+                token = lctx.get_await_token();
+                assert_eq!(lctx.state, 0);
+                lctx.state = WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE;
+            }
+            // case ctx pass to winhttp
+            let ctx_ptr: *const Mutex<AsyncContext> = &self.ctx;
+            let raw_ctx: *mut ::core::ffi::c_void = ctx_ptr as *mut ::core::ffi::c_void;
+            self.h
+                .send(headers, optional, total_length, raw_ctx as usize)?;
+        }
+
+        token.await;
+
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            lctx.err.code().ok()
+        }
     }
 
     pub async fn async_receive_response(&mut self) -> Result<(), Error> {
-        self.ctx.reset();
-        self.ctx.state = WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE;
+        let token: AwaitableToken;
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            assert_eq!(lctx.state, 0);
+            lctx.reset();
+            token = lctx.get_await_token();
+            lctx.state = WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE;
+        }
         self.h.receieve_response()?;
-        self.ctx.wait().await;
-        self.ctx.err.code().ok()
+        token.await;
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            lctx.err.code().ok()
+        }
     }
 
     pub async fn async_query_data_available(&mut self) -> Result<u32, Error> {
-        self.ctx.reset();
-        self.ctx.state = WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE;
+        let token: AwaitableToken;
+        {
+            // be careful not to hold the mutex and calling winhttp function
+            // if the callback completes synchronously, lock is not reentrant
+            // and we have a double aquire and stuck.
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            assert_eq!(lctx.state, 0);
+            lctx.reset();
+            token = lctx.get_await_token();
+            lctx.state = WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE;
+        }
         self.h.query_data_available(None)?;
-        self.ctx.wait().await;
-        self.ctx.err.code().ok()?;
-        Ok(self.ctx.len)
+
+        token.await;
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            lctx.err.code().ok()?;
+            Ok(lctx.len)
+        }
     }
 
     pub async fn async_read_data(
@@ -93,12 +132,20 @@ impl HRequestAsync {
         buffer: &mut [u8],
         dwnumberofbytestoread: u32,
     ) -> Result<u32, Error> {
-        self.ctx.reset();
-        self.ctx.state = WINHTTP_CALLBACK_STATUS_READ_COMPLETE;
+        let token: AwaitableToken;
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            assert_eq!(lctx.state, 0);
+            lctx.reset();
+            token = lctx.get_await_token();
+            lctx.state = WINHTTP_CALLBACK_STATUS_READ_COMPLETE;
+        }
         self.h.read_data(buffer, dwnumberofbytestoread, None)?;
-        self.ctx.wait().await;
-        self.ctx.err.code().ok()?;
-        Ok(self.ctx.len)
+        token.await;
+
+        let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+        lctx.err.code().ok()?;
+        Ok(lctx.len)
     }
 
     // buf should be valid until async_write_data finishes.
@@ -108,12 +155,19 @@ impl HRequestAsync {
         buf: &[u8],
         dwnumberofbytestowrite: u32,
     ) -> Result<u32, Error> {
-        self.ctx.reset();
-        self.ctx.state = WINHTTP_CALLBACK_FLAG_WRITE_COMPLETE;
+        let token: AwaitableToken;
+        {
+            let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+            assert_eq!(lctx.state, 0);
+            lctx.reset();
+            token = lctx.get_await_token();
+            lctx.state = WINHTTP_CALLBACK_FLAG_WRITE_COMPLETE;
+        }
         self.h.write_data(buf, dwnumberofbytestowrite, None)?;
-        self.ctx.wait().await;
-        self.ctx.err.code().ok()?;
-        Ok(self.ctx.len)
+        token.await;
+        let lctx: &mut AsyncContext = &mut self.ctx.lock().unwrap();
+        lctx.err.code().ok()?;
+        Ok(lctx.len)
     }
 }
 
@@ -147,8 +201,12 @@ impl AsyncContext {
     }
 
     // make ctx unchanged when doing wait
-    async fn wait(&self) {
-        self.as_obj.get_await_token().await;
+    // async fn wait(&self) {
+    //     self.as_obj.get_await_token().await;
+    // }
+
+    fn get_await_token(&self) -> AwaitableToken {
+        self.as_obj.get_await_token()
     }
 }
 
@@ -163,24 +221,28 @@ extern "system" fn AsyncCallback(
     assert_ne!(dwcontext, 0);
 
     // convert ctx
-    let ctx_raw: *mut AsyncContext = dwcontext as *mut AsyncContext;
-    let ctx: &mut AsyncContext = unsafe { &mut *ctx_raw };
+    let ctx_mtx_raw: *mut Mutex<AsyncContext> = dwcontext as *mut Mutex<AsyncContext>;
+    let ctx_mtx: &mut Mutex<AsyncContext> = unsafe { &mut *ctx_mtx_raw };
+    let ctx: &mut AsyncContext = ctx_mtx.get_mut().unwrap();
     assert_ne!(ctx.state, 0);
 
     match dwinternetstatus {
         WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
             //println!("WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE");
             assert_eq!(ctx.state, WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE);
+            ctx.state = 0;
             ctx.wake();
         }
         WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
             //println!("WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE");
             assert_eq!(ctx.state, WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE);
+            ctx.state = 0;
             ctx.wake();
         }
         WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
             //println!("WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE");
             assert_eq!(ctx.state, WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE);
+            ctx.state = 0;
             assert_eq!(
                 dwstatusinformationlength as usize,
                 std::mem::size_of::<u32>()
@@ -193,6 +255,7 @@ extern "system" fn AsyncCallback(
         }
         WINHTTP_CALLBACK_FLAG_WRITE_COMPLETE => {
             assert_eq!(ctx.state, WINHTTP_CALLBACK_FLAG_WRITE_COMPLETE);
+            ctx.state = 0;
             assert_eq!(
                 dwstatusinformationlength as usize,
                 std::mem::size_of::<u32>()
@@ -214,6 +277,7 @@ extern "system" fn AsyncCallback(
 
             //println!("WINHTTP_CALLBACK_STATUS_READ_COMPLETE");
             assert_eq!(ctx.state, WINHTTP_CALLBACK_STATUS_READ_COMPLETE);
+            ctx.state = 0;
             ctx.len = dwstatusinformationlength;
             ctx.wake();
         }
@@ -245,6 +309,7 @@ extern "system" fn AsyncCallback(
                 }
             }
             // assign err and finish so that front end can pick up err
+            ctx.state = 0;
             ctx.err = err;
             ctx.wake();
         }

@@ -1,7 +1,7 @@
 use windows::{
     core::Error,
     Win32::{
-        Foundation::{CloseHandle, BOOLEAN, HANDLE},
+        Foundation::{CloseHandle, BOOLEAN, HANDLE, INVALID_HANDLE_VALUE},
         System::Threading::{
             CreateEventA, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWaitEx,
             INFINITE, WT_EXECUTEONLYONCE,
@@ -94,6 +94,7 @@ mod tests {
 
 // reference boost\asio\detail\impl\win_object_handle_service.ipp
 
+#[repr(C)]
 struct PrivateContext {
     as_obj: AsyncWaitObject,
 
@@ -102,22 +103,27 @@ struct PrivateContext {
     wait_obj: HANDLE,
 }
 
+impl Drop for PrivateContext {
+    fn drop(&mut self) {
+        assert_eq!(self.wait_obj, HANDLE::default());
+        // println!("Private ctx dropped");
+    }
+}
+
 // event that is awaitable
 pub struct AwaitableObject {
-    // event handle to be waited
-    h: HANDLE,
-
-    ctx: PrivateContext,
+    ctx: Box<PrivateContext>,
 }
 
 impl AwaitableObject {
     fn default() -> AwaitableObject {
         AwaitableObject {
-            h: HANDLE::default(),
-            ctx: PrivateContext {
+            // ctx on stack dows not work. Maybe it gets moved by compiler.
+            // allocate on heap the C registered address does not change.
+            ctx: Box::new(PrivateContext {
                 as_obj: AsyncWaitObject::new(),
                 wait_obj: HANDLE::default(),
-            },
+            }),
         }
     }
 
@@ -125,7 +131,6 @@ impl AwaitableObject {
     // since there are various handle that can be waited
     pub fn new(h: HANDLE) -> AwaitableObject {
         let mut res = AwaitableObject::default();
-        res.h = h;
 
         // register the callback
         AwaitableObject::register_callback(h, &mut res.ctx).unwrap();
@@ -135,7 +140,6 @@ impl AwaitableObject {
 
     pub async fn wait(&mut self) {
         self.ctx.as_obj.get_await_token().await;
-        // wait ended, unregister
         Self::unregister(&mut self.ctx);
     }
 
@@ -146,7 +150,6 @@ impl AwaitableObject {
 
         let ctx_ptr: *const PrivateContext = ctx;
         let raw_ctx: *mut ::core::ffi::c_void = ctx_ptr as *mut ::core::ffi::c_void;
-
         let ok = unsafe {
             RegisterWaitForSingleObject(
                 wh_ptr,
@@ -163,7 +166,9 @@ impl AwaitableObject {
 
     fn unregister(ctx: &mut PrivateContext) {
         if !ctx.wait_obj.is_invalid() {
-            unsafe { UnregisterWaitEx(ctx.wait_obj, None) }.unwrap();
+            // INVALID_HANDLE_VALUE will force wait for the callback to complete
+            let ok = unsafe { UnregisterWaitEx(ctx.wait_obj, INVALID_HANDLE_VALUE) };
+            ok.unwrap();
             ctx.wait_obj = HANDLE::default();
         }
     }
@@ -172,13 +177,13 @@ impl AwaitableObject {
 unsafe extern "system" fn my_callback(ctx: *mut ::core::ffi::c_void, timer_or_wait_fired: BOOLEAN) {
     // convert ctx
     let ctx_raw: *mut PrivateContext = ctx as *mut PrivateContext;
+
     let ctx: &mut PrivateContext = unsafe { &mut *ctx_raw };
 
     // we always wait for infinite. param true means timed-out.
     assert!(!timer_or_wait_fired.as_bool());
 
     // we cannot unregister in the callback
-
     ctx.as_obj.wake();
 }
 
@@ -189,19 +194,20 @@ mod tests2 {
     #[test]
     fn awaitable_object_test() {
         let rt = tokio::runtime::Runtime::new().unwrap();
+
         rt.block_on(async {
             let e1 = ManualResetEvent::new();
             let h = e1.get();
 
-            tokio::task::spawn(async move {
-                //let e = ManualResetEvent::new();
-                let mut awaitable_obj = AwaitableObject::new(h);
+            let sh = tokio::task::spawn(async move {
+                let mut awaitable_obj = Box::new(AwaitableObject::new(h));
                 awaitable_obj.wait().await;
             });
 
+            // set event
             e1.set().unwrap();
-            // wait for clean up.
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            // wait for callback complete
+            sh.await.unwrap();
         });
     }
 }

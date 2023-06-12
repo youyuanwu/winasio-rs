@@ -152,7 +152,7 @@ mod tests {
                     .unwrap();
                 assert!(len == len_read);
                 let s = String::from_utf8_lossy(&buffer);
-                print!("{}", s);
+                print!("res body: {}", s);
             }
         }
         // post for count
@@ -203,7 +203,7 @@ mod tests {
                     result.push(buf[0] as char);
                 }
             }
-            println!("{}", result);
+            println!("resp body: {}", result);
         }
     }
 
@@ -227,9 +227,13 @@ mod tests {
         rt.block_on(async {
             let (tx, addr) = run_test_server().await;
 
-            // send request to server
-            send_req_async(&addr).await;
+            let h = tokio::spawn(async move {
+                // send request to server
+                send_req_async(&addr).await;
+            });
 
+            // wait for task complete
+            h.await.unwrap();
             println!("Shutdown");
             tx.send(()).unwrap();
         });

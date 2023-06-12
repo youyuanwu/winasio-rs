@@ -6,12 +6,12 @@ use windows::{
         Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, HANDLE, NO_ERROR, WIN32_ERROR},
         Networking::HttpServer::{
             HttpAddUrlToUrlGroup, HttpCloseRequestQueue, HttpCloseServerSession, HttpCloseUrlGroup,
-            HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup, HttpInitialize,
-            HttpReceiveHttpRequest, HttpSendHttpResponse, HttpServerBindingProperty,
-            HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION, HTTP_BINDING_INFO,
-            HTTP_CACHE_POLICY, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER, HTTP_LOG_DATA,
-            HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_V2, HTTP_RESPONSE_V2,
-            HTTP_SERVER_PROPERTY,
+            HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup,
+            HttpDataChunkFromMemory, HttpInitialize, HttpReceiveHttpRequest, HttpSendHttpResponse,
+            HttpServerBindingProperty, HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION,
+            HTTP_BINDING_INFO, HTTP_CACHE_POLICY, HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG,
+            HTTP_INITIALIZE_SERVER, HTTP_LOG_DATA, HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
+            HTTP_REQUEST_V2, HTTP_RESPONSE_V2, HTTP_SERVER_PROPERTY,
         },
     },
 };
@@ -150,10 +150,77 @@ impl Drop for UrlGroup<'_> {
     }
 }
 
+// request wrapper
+#[repr(C)]
+pub struct Request {
+    raw: HTTP_REQUEST_V2,
+    // additional buffer
+    buff: [u8; 1024],
+}
+
+impl Default for Request {
+    fn default() -> Request {
+        Request {
+            raw: HTTP_REQUEST_V2::default(),
+            buff: [0; 1024],
+        }
+    }
+}
+
+impl Request {
+    pub fn raw(&mut self) -> &mut HTTP_REQUEST_V2 {
+        &mut self.raw
+    }
+
+    pub fn size() -> u32 {
+        std::mem::size_of::<Request>() as u32
+    }
+}
+// request should be safe
+unsafe impl Send for Request {}
+unsafe impl Sync for Request {}
+
+// respose wrapper
+#[derive(Default)]
+#[repr(C)]
+pub struct Response {
+    raw: HTTP_RESPONSE_V2,
+    data_chunks: Box<HTTP_DATA_CHUNK>,
+    strings: String,
+}
+// resp should be safe
+unsafe impl Send for Response {}
+unsafe impl Sync for Response {}
+
+impl Response {
+    pub fn raw(&mut self) -> &mut HTTP_RESPONSE_V2 {
+        &mut self.raw
+    }
+
+    // only support 1 chunk for now.
+    pub fn add_body_chunk(&mut self, data: String) {
+        self.strings = data;
+
+        let mut chunk = Box::<HTTP_DATA_CHUNK>::default();
+        chunk.DataChunkType = HttpDataChunkFromMemory;
+        chunk.Anonymous.FromMemory.BufferLength = self.strings.len() as u32;
+        chunk.Anonymous.FromMemory.pBuffer = self.strings.as_mut_ptr() as *mut std::ffi::c_void;
+
+        self.raw.Base.EntityChunkCount = 1;
+        self.raw.Base.pEntityChunks = &mut *chunk;
+
+        self.data_chunks = chunk;
+    }
+}
+
 pub struct RequestQueue {
     h: HANDLE,
     optr: OverlappedObject,
 }
+
+// resp should be safe
+unsafe impl Send for RequestQueue {}
+unsafe impl Sync for RequestQueue {}
 
 impl RequestQueue {
     pub fn new() -> Result<RequestQueue, Error> {
@@ -230,7 +297,7 @@ impl RequestQueue {
         &self,
         requestid: u64,
         flags: u32,
-        httpresponse: *const HTTP_RESPONSE_V2,
+        httpresponse: &HTTP_RESPONSE_V2,
         cachepolicy: ::core::option::Option<*const HTTP_CACHE_POLICY>,
         logdata: ::core::option::Option<*const HTTP_LOG_DATA>,
     ) -> Result<u32, Error> {

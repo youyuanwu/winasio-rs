@@ -15,6 +15,9 @@ struct HInternet {
     handle: *mut ::core::ffi::c_void,
 }
 
+// The handle raw ptr should be Send
+unsafe impl Send for HInternet {}
+
 // winhttp session
 pub struct HSession {
     h: HInternet,
@@ -275,5 +278,6 @@ impl Drop for HInternet {
             let e = Error::from_win32();
             assert!(e.code().is_ok(), "Error: {}", e);
         }
+        self.handle = std::ptr::null_mut();
     }
 }

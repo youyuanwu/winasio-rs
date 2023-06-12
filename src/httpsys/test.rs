@@ -1,100 +1,111 @@
 #[cfg(test)]
 mod tests {
 
-    use tokio::sync::oneshot::{self};
+    use std::sync::Arc;
+
+    use tokio::sync::{
+        oneshot::{self},
+        Mutex,
+    };
     use windows::{
-        core::{HSTRING, PCSTR},
+        core::HSTRING,
         Win32::Networking::{
-            HttpServer::{
-                HttpDataChunkFromMemory, HTTP_DATA_CHUNK, HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
-                HTTP_REQUEST_V2, HTTP_RESPONSE_V2, HTTP_SEND_RESPONSE_FLAG_DISCONNECT,
-            },
+            HttpServer::{HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY, HTTP_SEND_RESPONSE_FLAG_DISCONNECT},
             WinHttp::{WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_OPEN_REQUEST_FLAGS},
         },
     };
 
     use crate::{
-        httpsys::{HttpInitializer, RequestQueue, ServerSession, UrlGroup},
+        httpsys::{HttpInitializer, Request, RequestQueue, Response, ServerSession, UrlGroup},
         winhttp::HSession,
     };
 
-    async fn run_test_server(queue: &mut RequestQueue) {
+    async fn handle_request(queue: Arc<Mutex<RequestQueue>>, mut req: Request) {
+        let id = req.raw().Base.RequestId;
+
+        let body = String::from("hello world");
+        let mut resp = Response::default();
+        resp.add_body_chunk(body);
+
+        println!("run_test_server async_send_response");
+
+        let err = queue
+            .lock()
+            .await
+            .async_send_response(
+                id,
+                HTTP_SEND_RESPONSE_FLAG_DISCONNECT,
+                &resp.raw(),
+                None,
+                None,
+            )
+            .await;
+        if err.is_err() {
+            println!("send resp failed: {:?}", err.err());
+        }
+    }
+
+    async fn run_test_server(queue: Arc<Mutex<RequestQueue>>) {
         println!("run_test_server begin");
         loop {
-            let mut buff = vec![0; std::mem::size_of::<HTTP_REQUEST_V2>() + 1024 as usize];
-            let req_ptr: &mut HTTP_REQUEST_V2 =
-                unsafe { &mut *(buff.as_mut_ptr() as *mut HTTP_REQUEST_V2) };
+            let mut req = Request::default();
+
             println!("run_test_server async_receive_request");
-            let err = queue
-                .async_receive_request(
-                    0,
-                    HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
-                    req_ptr,
-                    buff.len() as u32,
-                )
-                .await;
-            if err.is_err() {
-                println!("receive request failed: {:?}", err.err());
-                continue;
+            {
+                let err = queue
+                    .lock()
+                    .await
+                    .async_receive_request(
+                        0,
+                        HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
+                        req.raw(),
+                        Request::size(),
+                    )
+                    .await;
+                if err.is_err() {
+                    println!("receive request failed: {:?}", err.err());
+                    continue;
+                }
             }
-            let req: &mut HTTP_REQUEST_V2 = &mut *req_ptr;
-            let id = req.Base.RequestId;
-
-            let mut body = String::from("hello world");
-            //let mut resp = HTTP_RESPONSE_V2::default();
-            let mut resp: Box<HTTP_RESPONSE_V2> = Box::new(HTTP_RESPONSE_V2::default());
-            resp.Base.StatusCode = 200;
-            let ok_str = "OK";
-            resp.Base.pReason = PCSTR(ok_str.as_ptr());
-
-            let mut chunk = HTTP_DATA_CHUNK::default();
-            chunk.DataChunkType = HttpDataChunkFromMemory;
-            chunk.Anonymous.FromMemory.BufferLength = body.len() as u32;
-            chunk.Anonymous.FromMemory.pBuffer = body.as_mut_ptr() as *mut std::ffi::c_void;
-            resp.Base.EntityChunkCount = 1;
-            resp.Base.pEntityChunks = &mut chunk;
-
-            let resp_ptr: *const HTTP_RESPONSE_V2 = &*resp;
-            println!("run_test_server async_send_response");
-            let err = queue
-                .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, resp_ptr, None, None)
-                .await;
-            if err.is_err() {
-                println!("receive request failed: {:?}", err.err());
-                continue;
-            }
+            //tokio::spawn(async move {
+            handle_request(queue.clone(), req).await;
+            //});
         }
     }
 
     #[test]
     fn server_test() {
-        let _ = HttpInitializer::default();
-
-        let session = ServerSession::default();
-
-        let url_group = UrlGroup::new(&session);
-        url_group
-            .add_url(HSTRING::from("http://localhost:12356/winhttpapitest/"))
-            .unwrap();
-
-        let mut request_queue = RequestQueue::new().unwrap();
-        request_queue.bind_url_group(&url_group).unwrap();
-
         let (tx, rx) = oneshot::channel::<()>();
 
         let th = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
+                let _ = HttpInitializer::default();
+
+                let session = ServerSession::default();
+
+                let url_group = UrlGroup::new(&session);
+                url_group
+                    .add_url(HSTRING::from("http://localhost:12356/winhttpapitest/"))
+                    .unwrap();
+
+                let request_queue = Arc::new(Mutex::new(RequestQueue::new().unwrap()));
+                request_queue
+                    .lock()
+                    .await
+                    .bind_url_group(&url_group)
+                    .unwrap();
+
                 tokio::select! {
                   _ = rx =>{
                     println!("Shutdown signal received.")
                   }
                   _ = async{
-                    run_test_server(&mut request_queue).await
+                    run_test_server(request_queue.clone()).await
                   } => {}
                 }
                 println!("closing queue handle");
-                request_queue.close()
+                request_queue.lock().await.close();
             });
         });
 
