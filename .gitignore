@@ -6,3 +6,4 @@ build
 coverage.txt
 summary.txt
 coverage.json
+*.info

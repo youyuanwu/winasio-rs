@@ -17,16 +17,15 @@ jobs:
       with:
         toolchain: stable
 
+    # enable cache
+    - uses: Swatinem/rust-cache@v2
+
     - name: Run cargo check
       uses: actions-rs/cargo@v1
       with:
         command: check
 
-    - name: Install coverage unmangle tool
-      uses: actions-rs/cargo@v1
-      with:
-        command: install
-        args: rustfilt
+    - uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Run cargo fmt
       uses: actions-rs/cargo@v1
@@ -36,7 +35,6 @@ jobs:
 
     - name: Run cargo clippy
       uses: actions-rs/cargo@v1
-      continue-on-error: true  # WARNING: only for this example, remove it!
       with:
         command: clippy
         args: -- -D warnings
@@ -55,11 +53,12 @@ jobs:
     - name: run coverage
       run: |
         cmake --build build --config Debug --target cov_all
+        cmake --build build --config Debug --target cov_summary
 
     - name: Upload Report to Codecov
       if: ${{ matrix.BUILD_TYPE == 'Debug' }}
       uses: codecov/codecov-action@v2
       with:
-        files: ./coverage.json
+        files: ./lcov.info
         fail_ci_if_error: true
         functionalities: fix

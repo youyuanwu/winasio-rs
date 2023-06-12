@@ -1,5 +1,6 @@
 # winasio-rs
 ![ci](https://github.com/youyuanwu/winasio-rs/actions/workflows/build.yaml/badge.svg)
+[![codecov](https://codecov.io/github/youyuanwu/winasio-rs/branch/main/graph/badge.svg?token=B5HPWPDJCI)](https://codecov.io/github/youyuanwu/winasio-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://raw.githubusercontent.com/youyuanwu/winasio-rs/main/LICENSE)
 
 Windows Async I/O and Networking lib for Rust.
