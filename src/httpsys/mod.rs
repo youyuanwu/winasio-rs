@@ -1,5 +1,7 @@
 mod test;
 
+use std::sync::Arc;
+
 use windows::{
     core::{Error, HRESULT, HSTRING},
     Win32::{
@@ -9,9 +11,9 @@ use windows::{
             HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup,
             HttpDataChunkFromMemory, HttpInitialize, HttpReceiveHttpRequest, HttpSendHttpResponse,
             HttpServerBindingProperty, HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION,
-            HTTP_BINDING_INFO, HTTP_CACHE_POLICY, HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG,
-            HTTP_INITIALIZE_SERVER, HTTP_LOG_DATA, HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-            HTTP_REQUEST_V2, HTTP_RESPONSE_V2, HTTP_SERVER_PROPERTY,
+            HTTP_BINDING_INFO, HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER,
+            HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_V2, HTTP_RESPONSE_V2,
+            HTTP_SERVER_PROPERTY,
         },
     },
 };
@@ -193,8 +195,8 @@ unsafe impl Send for Response {}
 unsafe impl Sync for Response {}
 
 impl Response {
-    pub fn raw(&mut self) -> &mut HTTP_RESPONSE_V2 {
-        &mut self.raw
+    pub fn raw(&self) -> *const HTTP_RESPONSE_V2 {
+        &self.raw
     }
 
     // only support 1 chunk for now.
@@ -215,7 +217,7 @@ impl Response {
 
 pub struct RequestQueue {
     h: HANDLE,
-    optr: OverlappedObject,
+    // optr: OverlappedObject,
 }
 
 // resp should be safe
@@ -237,7 +239,7 @@ impl RequestQueue {
             register_iocp_handle(h).unwrap();
             Ok(RequestQueue {
                 h,
-                optr: OverlappedObject::new(),
+                //optr: OverlappedObject::new(),
             })
         }
     }
@@ -251,37 +253,38 @@ impl RequestQueue {
     }
 
     pub async fn async_receive_request(
-        &mut self,
+        &self,
         requestid: u64,
         flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-        requestbuffer: &mut HTTP_REQUEST_V2,
-        requestbufferlength: u32,
+        requestbuffer: &mut Request,
+        // requestbufferlength: u32,
     ) -> Result<u32, Error> {
         // !!! not thread safe. assume only one thread now.
         // we need to store in self because when server shutdown, await is cancelled,
         // but callback is invoked on this optr, and will result access violation if
         // put on stack, since the stack might be gone if await is cancelled.
         // TODO: maybe other functions the optr needs to be on self or heap as well.
-        self.optr = OverlappedObject::new();
+        let optr = Arc::new(OverlappedObject::new());
         let ec = unsafe {
             HttpReceiveHttpRequest(
                 self.h,
                 requestid,
                 flags,
-                requestbuffer,
-                requestbufferlength,
+                requestbuffer.raw(),
+                Request::size(),
                 None,
-                Some(self.optr.get()),
+                Some(optr.get()),
             )
         };
         let err = WIN32_ERROR(ec);
         if err == ERROR_IO_PENDING || err == NO_ERROR {
             //println!("HttpReceiveHttpRequest waiting. {:?}", err);
-            self.optr.wait().await;
-            let async_err = self.optr.get_ec();
+            std::mem::forget(optr.clone());
+            optr.wait().await;
+            let async_err = optr.get_ec();
             //println!("HttpReceiveHttpRequest waiting complete . {:?}", async_err);
             if async_err == Error::OK {
-                Ok(self.optr.get_len())
+                Ok(optr.get_len())
             } else {
                 Err(async_err)
             }
@@ -297,27 +300,28 @@ impl RequestQueue {
         &self,
         requestid: u64,
         flags: u32,
-        httpresponse: &HTTP_RESPONSE_V2,
-        cachepolicy: ::core::option::Option<*const HTTP_CACHE_POLICY>,
-        logdata: ::core::option::Option<*const HTTP_LOG_DATA>,
+        httpresponse: &Response,
+        //cachepolicy: ::core::option::Option<*const HTTP_CACHE_POLICY>,
+        //logdata: ::core::option::Option<*const HTTP_LOG_DATA>,
     ) -> Result<u32, Error> {
-        let mut optr = OverlappedObject::new();
+        let optr = Arc::new(OverlappedObject::new());
         let ec = unsafe {
             HttpSendHttpResponse(
                 self.h,
                 requestid,
                 flags,
-                httpresponse,
-                cachepolicy,
+                httpresponse.raw(),
+                None, //cachepolicy,
                 None,
                 None,
                 0,
                 Some(optr.get()),
-                logdata,
+                None, //logdata,
             )
         };
         let err = WIN32_ERROR(ec);
         if err == ERROR_IO_PENDING || err == NO_ERROR {
+            std::mem::forget(optr.clone());
             optr.wait().await;
             let async_err = optr.get_ec();
             if async_err == Error::OK {

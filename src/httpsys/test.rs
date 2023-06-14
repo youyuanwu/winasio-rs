@@ -3,10 +3,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use tokio::sync::{
-        oneshot::{self},
-        Mutex,
-    };
+    use tokio::sync::oneshot::{self};
     use windows::{
         core::HSTRING,
         Win32::Networking::{
@@ -20,7 +17,7 @@ mod tests {
         winhttp::HSession,
     };
 
-    async fn handle_request(queue: Arc<Mutex<RequestQueue>>, mut req: Request) {
+    async fn handle_request(queue: Arc<RequestQueue>, mut req: Request) {
         let id = req.raw().Base.RequestId;
 
         let body = String::from("hello world");
@@ -30,46 +27,34 @@ mod tests {
         println!("run_test_server async_send_response");
 
         let err = queue
-            .lock()
-            .await
-            .async_send_response(
-                id,
-                HTTP_SEND_RESPONSE_FLAG_DISCONNECT,
-                &resp.raw(),
-                None,
-                None,
-            )
+            .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, &resp)
             .await;
         if err.is_err() {
             println!("send resp failed: {:?}", err.err());
         }
     }
 
-    async fn run_test_server(queue: Arc<Mutex<RequestQueue>>) {
+    async fn run_test_server(queue: Arc<RequestQueue>) {
         println!("run_test_server begin");
         loop {
             let mut req = Request::default();
 
             println!("run_test_server async_receive_request");
             {
+                // task can be cancelled here when queue shutdown.
                 let err = queue
-                    .lock()
-                    .await
-                    .async_receive_request(
-                        0,
-                        HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY,
-                        req.raw(),
-                        Request::size(),
-                    )
+                    .async_receive_request(0, HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY, &mut req)
                     .await;
                 if err.is_err() {
                     println!("receive request failed: {:?}", err.err());
                     continue;
                 }
             }
-            //tokio::spawn(async move {
-            handle_request(queue.clone(), req).await;
-            //});
+            let queue_cp = queue.clone();
+            // task is detached and not joinable.
+            let _h = tokio::spawn(async move {
+                handle_request(queue_cp, req).await;
+            });
         }
     }
 
@@ -89,12 +74,8 @@ mod tests {
                     .add_url(HSTRING::from("http://localhost:12356/winhttpapitest/"))
                     .unwrap();
 
-                let request_queue = Arc::new(Mutex::new(RequestQueue::new().unwrap()));
-                request_queue
-                    .lock()
-                    .await
-                    .bind_url_group(&url_group)
-                    .unwrap();
+                let request_queue = Arc::new(RequestQueue::new().unwrap());
+                request_queue.bind_url_group(&url_group).unwrap();
 
                 tokio::select! {
                   _ = rx =>{
@@ -104,8 +85,9 @@ mod tests {
                     run_test_server(request_queue.clone()).await
                   } => {}
                 }
-                println!("closing queue handle");
-                request_queue.lock().await.close();
+                println!("queue handle out of scope.");
+                // rely on drop to close
+                // request_queue.close();
             });
         });
 

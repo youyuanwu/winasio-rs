@@ -2,6 +2,8 @@
 // windows API, and when overlapped operation is pending, rs code can do await.
 // When pending operation finishes, await finishes, and rs code continues.
 
+use std::sync::Arc;
+
 use crate::sys::wait::AsyncWaitObject;
 use windows::{
     core::Error,
@@ -22,13 +24,24 @@ unsafe extern "system" fn private_callback(
     dwnumberofbytestransfered: u32,
     lpoverlapped: *mut OVERLAPPED,
 ) {
+    let e = Error::from(WIN32_ERROR(dwerrorcode));
+    if e.code().is_err() {
+        // TODO: observe which error code this is when cancel operation.
+        // TODO: need to check with cpp implmentation.
+        // private_callback: operation failed 3221225760: Attempt to release mutex not owned by caller. (0x80070120).
+        // println!("private_callback: operation failed {}: {}.", dwerrorcode, e);
+    }
+
     // println!("private_callback invoked.");
     // convert to wrap struct
     let wrap_ptr: *mut OverlappedWrap = lpoverlapped as *mut OverlappedWrap;
+
+    // this is to make sure we free it since we forget it when constructing the wrap in the front end.
+    let _wrap = Arc::from_raw(wrap_ptr);
+
     let wrap: &mut OverlappedWrap = &mut *wrap_ptr;
 
     // set the result and wake.
-    let e = Error::from(WIN32_ERROR(dwerrorcode));
     if e.code().is_err() {
         // println!("private_callback err: {}", e);
         wrap.err = e;
@@ -68,8 +81,13 @@ impl OverlappedWrap {
     }
 }
 
-// overlapped object is used in rust code to create overlapped pointer
+// overlapped object is used in rust code to create overlapped pointer.
+// This needs to be used in Arc and need to reserve a ref count when the io requires the callback to complete,
+// and the callback is responsible to release once.
+// This makes sure that the Overlapped ptr is valid in callback, especially to tolerate cancelled await.
+// TODO: this requires some more mem leak testing.
 pub struct OverlappedObject {
+    // cannot arc this because it is hard to deref.
     o: OverlappedWrap, // overlapped struct to be passed to windows
 }
 
@@ -89,8 +107,15 @@ impl OverlappedObject {
     // get the reference to overlapped struct to pass to windows.
     // the iocp threadpool callback will wake the AsyncWaitObject,
     // while the front end should await.
-    pub fn get(&mut self) -> *mut OVERLAPPED {
-        let ow_ptr: *mut OverlappedWrap = std::ptr::addr_of_mut!(self.o);
+    pub fn get(&self) -> *const OVERLAPPED {
+        let ow_ptr: *const OverlappedWrap = std::ptr::addr_of!(self.o);
+        let ow_cast_ptr: *const OVERLAPPED = ow_ptr as *const OVERLAPPED;
+        ow_cast_ptr
+    }
+
+    // get a mut pointer
+    pub fn get_mut(&self) -> *mut OVERLAPPED {
+        let ow_ptr: *const OverlappedWrap = std::ptr::addr_of!(self.o);
         let ow_cast_ptr: *mut OVERLAPPED = ow_ptr as *mut OVERLAPPED;
         ow_cast_ptr
     }
@@ -110,6 +135,8 @@ impl OverlappedObject {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use windows::{
         core::{Error, HSTRING},
         w,
@@ -200,13 +227,16 @@ mod tests {
             // write file
             {
                 println!("writing to file");
-                let mut optr = OverlappedObject::new();
+                let optr = Arc::new(OverlappedObject::new());
                 // try async read and write to this file
-                let ok = unsafe { WriteFile(hfile, Some(data.as_bytes()), None, Some(optr.get())) };
+                let ok =
+                    unsafe { WriteFile(hfile, Some(data.as_bytes()), None, Some(optr.get_mut())) };
                 let err = ok.ok().err();
                 match err {
                     Some(e) => {
                         if e == Error::from(ERROR_IO_PENDING) {
+                            // forget one ref and let callback handle it.
+                            std::mem::forget(optr.clone());
                             // println!("IO pending");
                             optr.wait().await;
                             assert_eq!(optr.o.err, Error::OK);
@@ -224,6 +254,7 @@ mod tests {
                         // completed synchronously
                         // println!("No error: Completed synchronously");
                         // callback is invoked when success.
+                        std::mem::forget(optr.clone());
                         optr.wait().await;
                     }
                 }
@@ -231,7 +262,7 @@ mod tests {
             // read file
             {
                 println!("Reading file.");
-                let mut optr = OverlappedObject::new();
+                let optr = Arc::new(OverlappedObject::new());
                 let mut buffer: Vec<u8> = vec![0; data.len()];
                 let ok = unsafe {
                     ReadFile(
@@ -239,13 +270,14 @@ mod tests {
                         Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
                         buffer.len() as u32,
                         None,
-                        Some(optr.get()),
+                        Some(optr.get_mut()),
                     )
                 };
                 match ok.ok().err() {
                     Some(e) => {
                         if e == Error::from(ERROR_IO_PENDING) {
                             //println!("IO pending");
+                            std::mem::forget(optr.clone());
                             optr.wait().await;
                             assert_eq!(optr.o.err, Error::OK);
                         } else {
@@ -257,6 +289,7 @@ mod tests {
                         // completed synchronously
                         // println!("No error: Completed synchronously");
                         // callback is invoked when success.
+                        std::mem::forget(optr.clone());
                         optr.wait().await;
                     }
                 }
