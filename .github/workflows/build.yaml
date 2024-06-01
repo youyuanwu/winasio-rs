@@ -57,8 +57,8 @@ jobs:
 
     - name: Upload Report to Codecov
       if: ${{ matrix.BUILD_TYPE == 'Debug' }}
-      uses: codecov/codecov-action@v2
+      uses: codecov/codecov-action@v4
       with:
         files: ./lcov.info
         fail_ci_if_error: true
-        functionalities: fix
+        token: ${{ secrets.CODECOV_TOKEN }} # required
