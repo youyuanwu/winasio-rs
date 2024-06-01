@@ -98,7 +98,7 @@ impl HRequest {
             optional_op = Some(optional.as_ptr() as *mut std::ffi::c_void);
         }
 
-        let ok = unsafe {
+        unsafe {
             WinHttpSendRequest(
                 self.h.handle,
                 headers_op,
@@ -107,13 +107,11 @@ impl HRequest {
                 total_length,
                 context,
             )
-        };
-        ok.ok()
+        }
     }
 
     pub fn receieve_response(&self) -> Result<(), Error> {
-        let ok = unsafe { WinHttpReceiveResponse(self.h.handle, std::ptr::null_mut()) };
-        ok.ok()
+        unsafe { WinHttpReceiveResponse(self.h.handle, std::ptr::null_mut()) }
     }
 
     pub fn query_data_available(
@@ -124,8 +122,7 @@ impl HRequest {
             Some(op) => op,
             None => std::ptr::null_mut(),
         };
-        let ok = unsafe { WinHttpQueryDataAvailable(self.h.handle, numberofbytesavailable_op) };
-        ok.ok()
+        unsafe { WinHttpQueryDataAvailable(self.h.handle, numberofbytesavailable_op) }
     }
 
     pub fn read_data(
@@ -139,15 +136,14 @@ impl HRequest {
             None => std::ptr::null_mut(),
         };
 
-        let ok = unsafe {
+        unsafe {
             WinHttpReadData(
                 self.h.handle,
                 buffer.as_mut_ptr() as *mut std::ffi::c_void,
                 dwnumberofbytestoread,
                 numberofbytesread_op,
             )
-        };
-        ok.ok()
+        }
     }
 
     pub fn write_data(
@@ -162,15 +158,14 @@ impl HRequest {
             None => std::ptr::null_mut(),
         };
         assert!(dwnumberofbytestowrite as usize <= len);
-        let ok = unsafe {
+        unsafe {
             WinHttpWriteData(
                 self.h.handle,
                 Some(buf.as_ptr() as *const std::ffi::c_void),
                 dwnumberofbytestowrite,
                 lpdwnumberofbyteswritten_op,
             )
-        };
-        ok.ok()
+        }
     }
 
     pub fn set_status_callback(
@@ -274,7 +269,7 @@ impl Drop for HInternet {
             return;
         }
         let ok = unsafe { WinHttpCloseHandle(self.handle) };
-        if !ok.as_bool() {
+        if ok.is_ok() {
             let e = Error::from_win32();
             assert!(e.code().is_ok(), "Error: {}", e);
         }

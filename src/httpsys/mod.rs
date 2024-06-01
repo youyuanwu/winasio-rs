@@ -37,7 +37,7 @@ impl HttpInitializer {
             )
         };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
     }
 
     // pub fn create_request_queue() -> Result<HANDLE, Error> {
@@ -59,7 +59,7 @@ impl Drop for HttpInitializer {
     fn drop(&mut self) {
         let ec = unsafe { HttpTerminate(HTTP_INITIALIZE_SERVER | HTTP_INITIALIZE_CONFIG, None) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
     }
 }
 
@@ -72,7 +72,7 @@ impl ServerSession {
         let mut id: u64 = 0;
         let ec = unsafe { HttpCreateServerSession(G_HTTP_VERSION, std::ptr::addr_of_mut!(id), 0) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
         ServerSession { id }
     }
 }
@@ -86,7 +86,7 @@ impl Drop for ServerSession {
     fn drop(&mut self) {
         let ec = unsafe { HttpCloseServerSession(self.id) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
     }
 }
 
@@ -101,7 +101,7 @@ impl UrlGroup<'_> {
         let mut id: u64 = 0;
         let ec = unsafe { HttpCreateUrlGroup(session.id, std::ptr::addr_of_mut!(id), 0) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
         UrlGroup {
             _session: session,
             id,
@@ -148,7 +148,7 @@ impl Drop for UrlGroup<'_> {
     fn drop(&mut self) {
         let ec = unsafe { HttpCloseUrlGroup(self.id) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
     }
 }
 
@@ -273,7 +273,7 @@ impl RequestQueue {
                 requestbuffer.raw(),
                 Request::size(),
                 None,
-                Some(optr.get()),
+                Some(optr.get_mut()),
             )
         };
         let err = WIN32_ERROR(ec);
@@ -283,7 +283,7 @@ impl RequestQueue {
             optr.wait().await;
             let async_err = optr.get_ec();
             //println!("HttpReceiveHttpRequest waiting complete . {:?}", async_err);
-            if async_err == Error::OK {
+            if async_err == Error::empty() {
                 Ok(optr.get_len())
             } else {
                 Err(async_err)
@@ -324,7 +324,7 @@ impl RequestQueue {
             std::mem::forget(optr.clone());
             optr.wait().await;
             let async_err = optr.get_ec();
-            if async_err == Error::OK {
+            if async_err == Error::empty() {
                 Ok(optr.get_len())
             } else {
                 Err(async_err)
@@ -340,7 +340,7 @@ impl RequestQueue {
         }
         let ec = unsafe { HttpCloseRequestQueue(self.h) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::OK);
+        assert_eq!(err, Error::empty());
         self.h = HANDLE(0);
     }
 }

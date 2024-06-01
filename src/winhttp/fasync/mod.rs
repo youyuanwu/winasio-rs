@@ -197,7 +197,7 @@ impl AsyncContext {
         self.as_obj.reset();
         self.state = 0;
         self.len = 0;
-        self.err = Error::OK;
+        self.err = Error::empty();
     }
 
     // make ctx unchanged when doing wait

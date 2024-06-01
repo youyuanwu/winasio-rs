@@ -32,14 +32,12 @@ impl ManualResetEvent {
     // set the event
     pub fn set(&self) -> Result<(), Error> {
         assert!(!self.h.is_invalid());
-        let ok = unsafe { SetEvent(self.h) };
-        ok.ok()
+        unsafe { SetEvent(self.h) }
     }
 
     pub fn reset(&self) -> Result<(), Error> {
         assert!(!self.h.is_invalid());
-        let ok = unsafe { ResetEvent(self.h) };
-        ok.ok()
+        unsafe { ResetEvent(self.h) }
     }
 
     // releases the ownership of the handle
@@ -63,7 +61,7 @@ impl Drop for ManualResetEvent {
             return;
         }
         let ok = unsafe { CloseHandle(self.h) };
-        if !ok.as_bool() {
+        if ok.is_ok() {
             let e = Error::from_win32();
             assert!(e.code().is_ok(), "Error: {}", e);
         }
@@ -161,7 +159,7 @@ impl AwaitableObject {
             )
         };
         assert!(!ctx.wait_obj.is_invalid());
-        ok.ok()
+        ok
     }
 
     fn unregister(ctx: &mut PrivateContext) {

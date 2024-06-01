@@ -15,8 +15,7 @@ use windows::{
 
 // all handles wish to use overlappedObject in this mod needs to call register.
 pub fn register_iocp_handle(h: HANDLE) -> Result<(), Error> {
-    let ok = unsafe { BindIoCompletionCallback(h, Some(private_callback), 0) };
-    ok.ok()
+    unsafe { BindIoCompletionCallback(h, Some(private_callback), 0) }
 }
 
 unsafe extern "system" fn private_callback(
@@ -75,7 +74,7 @@ impl OverlappedWrap {
         OverlappedWrap {
             o: OVERLAPPED::default(),
             as_obj: AsyncWaitObject::new(),
-            err: Error::OK,
+            err: Error::empty(),
             len: 0,
         }
     }
@@ -138,8 +137,7 @@ mod tests {
     use std::sync::Arc;
 
     use windows::{
-        core::{Error, HSTRING},
-        w,
+        core::{w, Error, HSTRING},
         Win32::{
             Foundation::{CloseHandle, ERROR_IO_PENDING, GENERIC_WRITE},
             Storage::FileSystem::{
@@ -231,15 +229,14 @@ mod tests {
                 // try async read and write to this file
                 let ok =
                     unsafe { WriteFile(hfile, Some(data.as_bytes()), None, Some(optr.get_mut())) };
-                let err = ok.ok().err();
-                match err {
-                    Some(e) => {
+                match ok {
+                    Err(e) => {
                         if e == Error::from(ERROR_IO_PENDING) {
                             // forget one ref and let callback handle it.
                             std::mem::forget(optr.clone());
                             // println!("IO pending");
                             optr.wait().await;
-                            assert_eq!(optr.o.err, Error::OK);
+                            assert_eq!(optr.o.err, Error::empty());
                         } else {
                             // callback might not be invoked for some errors here.
                             // if we wait here, and callback is not invoked, we are stuck
@@ -247,10 +244,10 @@ mod tests {
                             // !!!currently we rely/assume that this case callback is not invoked.
                             // A safer impl is to allocate the optr on heap.
                             // println!("Other error: {}", e);
-                            assert_eq!(e, Error::OK);
+                            assert_eq!(e, Error::empty());
                         }
                     }
-                    None => {
+                    Ok(()) => {
                         // completed synchronously
                         // println!("No error: Completed synchronously");
                         // callback is invoked when success.
@@ -267,25 +264,24 @@ mod tests {
                 let ok = unsafe {
                     ReadFile(
                         hfile,
-                        Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
-                        buffer.len() as u32,
+                        Some(buffer.as_mut_slice()),
                         None,
                         Some(optr.get_mut()),
                     )
                 };
-                match ok.ok().err() {
-                    Some(e) => {
+                match ok {
+                    Err(e) => {
                         if e == Error::from(ERROR_IO_PENDING) {
                             //println!("IO pending");
                             std::mem::forget(optr.clone());
                             optr.wait().await;
-                            assert_eq!(optr.o.err, Error::OK);
+                            assert_eq!(optr.o.err, Error::empty());
                         } else {
                             //println!("Other error: {}", e);
-                            assert_eq!(e, Error::OK);
+                            assert_eq!(e, Error::empty());
                         }
                     }
-                    None => {
+                    Ok(()) => {
                         // completed synchronously
                         // println!("No error: Completed synchronously");
                         // callback is invoked when success.
@@ -301,10 +297,10 @@ mod tests {
         });
 
         let ok = unsafe { CloseHandle(hfile) };
-        assert!(ok.as_bool());
+        assert!(ok.is_ok());
 
         // delete the temp file
         let ok = unsafe { DeleteFileW(&temp_file) };
-        assert!(ok.as_bool());
+        assert!(ok.is_ok());
     }
 }
