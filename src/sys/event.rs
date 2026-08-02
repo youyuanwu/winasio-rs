@@ -1,7 +1,7 @@
 use windows::{
     core::Error,
     Win32::{
-        Foundation::{CloseHandle, BOOLEAN, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         System::Threading::{
             CreateEventA, RegisterWaitForSingleObject, ResetEvent, SetEvent, UnregisterWaitEx,
             INFINITE, WT_EXECUTEONLYONCE,
@@ -62,7 +62,7 @@ impl Drop for ManualResetEvent {
         }
         let ok = unsafe { CloseHandle(self.h) };
         if ok.is_ok() {
-            let e = Error::from_win32();
+            let e = Error::from_thread();
             assert!(e.code().is_ok(), "Error: {}", e);
         }
     }
@@ -107,6 +107,11 @@ impl Drop for PrivateContext {
         // println!("Private ctx dropped");
     }
 }
+
+// HANDLE is a raw pointer in the windows crate, but kernel handles can be
+// safely moved between threads.
+unsafe impl Send for PrivateContext {}
+unsafe impl Sync for PrivateContext {}
 
 // event that is awaitable
 pub struct AwaitableObject {
@@ -165,21 +170,21 @@ impl AwaitableObject {
     fn unregister(ctx: &mut PrivateContext) {
         if !ctx.wait_obj.is_invalid() {
             // INVALID_HANDLE_VALUE will force wait for the callback to complete
-            let ok = unsafe { UnregisterWaitEx(ctx.wait_obj, INVALID_HANDLE_VALUE) };
+            let ok = unsafe { UnregisterWaitEx(ctx.wait_obj, Some(INVALID_HANDLE_VALUE)) };
             ok.unwrap();
             ctx.wait_obj = HANDLE::default();
         }
     }
 }
 
-unsafe extern "system" fn my_callback(ctx: *mut ::core::ffi::c_void, timer_or_wait_fired: BOOLEAN) {
+unsafe extern "system" fn my_callback(ctx: *mut ::core::ffi::c_void, timer_or_wait_fired: bool) {
     // convert ctx
     let ctx_raw: *mut PrivateContext = ctx as *mut PrivateContext;
 
     let ctx: &mut PrivateContext = unsafe { &mut *ctx_raw };
 
     // we always wait for infinite. param true means timed-out.
-    assert!(!timer_or_wait_fired.as_bool());
+    assert!(!timer_or_wait_fired);
 
     // we cannot unregister in the callback
     ctx.as_obj.wake();
@@ -188,6 +193,7 @@ unsafe extern "system" fn my_callback(ctx: *mut ::core::ffi::c_void, timer_or_wa
 #[cfg(test)]
 mod tests2 {
     use super::{AwaitableObject, ManualResetEvent};
+    use windows::Win32::Foundation::HANDLE;
 
     #[test]
     fn awaitable_object_test() {
@@ -195,9 +201,12 @@ mod tests2 {
 
         rt.block_on(async {
             let e1 = ManualResetEvent::new();
-            let h = e1.get();
+            // HANDLE is a raw pointer and not Send, so pass it across the task boundary
+            // as an integer and rebuild the handle inside the task.
+            let h_raw = e1.get().0 as usize;
 
             let sh = tokio::task::spawn(async move {
+                let h = HANDLE(h_raw as *mut std::ffi::c_void);
                 let mut awaitable_obj = Box::new(AwaitableObject::new(h));
                 awaitable_obj.wait().await;
             });

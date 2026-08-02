@@ -46,17 +46,23 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
 
-        let (addr, server) =
-            warp::serve(routes).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        let listener = tokio::net::TcpListener::bind::<SocketAddr>(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = warp::serve(routes)
+            .incoming(listener)
+            .graceful(async {
                 rx.await.ok();
                 println!("Graceful shutdown complete")
-            });
+            })
+            .run();
         // Spawn the server into a runtime
         println!("Server started on {}", addr);
         tokio::task::spawn(server);
         // wait for server to be up
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        return (tx, addr);
+        (tx, addr)
     }
 
     fn send_req(addr: &SocketAddr) {
@@ -193,7 +199,7 @@ mod tests {
                 }
                 // read byte by byte
                 for _ in 0..len {
-                    let mut temp_buf = [0 as u8];
+                    let mut temp_buf = [0_u8];
                     let buf = temp_buf.as_mut_slice();
                     let len_read = async_req
                         .async_read_data(buf, buf.len() as u32)

@@ -168,7 +168,7 @@ mod tests {
         unsafe { test_fn(ow_cast_ptr) };
     }
 
-    unsafe extern "system" fn test_fn(lpoverlapped: *mut OVERLAPPED) -> () {
+    unsafe extern "system" fn test_fn(lpoverlapped: *mut OVERLAPPED) {
         let ol: &mut OVERLAPPED = &mut *lpoverlapped;
         assert_eq!(ol.Internal, 10);
         assert_eq!(ol.InternalHigh, 11);
@@ -179,27 +179,26 @@ mod tests {
         let wrap_ptr: *mut OverlappedWrap = lpoverlapped as *mut OverlappedWrap;
         let wrap: &mut OverlappedWrap = &mut *wrap_ptr;
 
-        let _ = wrap.as_obj.get_await_token();
+        drop(wrap.as_obj.get_await_token());
         wrap.as_obj.wake();
     }
 
     #[test]
     fn async_file_test() {
-        let mut path_buff = Vec::<u16>::new();
-        path_buff.resize(100, 0);
+        let mut path_buff = vec![0u16; 100];
         // create a temp file
         let len = unsafe { GetTempPathW(Some(path_buff.as_mut_slice())) };
         assert_ne!(len, 0);
         assert!(len <= 100);
         path_buff.truncate(len as usize);
-        let temp_path = HSTRING::from_wide(&path_buff).unwrap();
+        let temp_path = HSTRING::from_wide(&path_buff);
         assert_eq!(temp_path.len(), len as usize);
 
         let mut temp_file: [u16; 260] = [0; 260];
         let len2 =
             unsafe { GetTempFileNameW(&temp_path, w!("async_file_test"), 0, &mut temp_file) };
         assert_ne!(len2, 0);
-        let temp_file = HSTRING::from_wide(&temp_file).unwrap();
+        let temp_file = HSTRING::from_wide(&temp_file);
         println!("temp file is: {}", temp_file);
 
         // create this file:

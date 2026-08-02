@@ -90,7 +90,7 @@ impl HRequest {
         // prepare header
         let mut headers_op: Option<&[u16]> = None;
         if !headers.is_empty() {
-            headers_op = Some(headers.as_wide());
+            headers_op = Some(&headers);
         }
         let mut optional_op: Option<*const ::core::ffi::c_void> = None;
         // prepare optional body
@@ -195,7 +195,7 @@ fn open_session(
 ) -> Result<HInternet, Error> {
     let h = unsafe { WinHttpOpen(&agent, access_type, &proxy, &proxy_bypass, dwflags) };
     if h.is_null() {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
     Ok(HInternet { handle: h })
 }
@@ -210,7 +210,7 @@ fn connect(session: &HInternet, servername: HSTRING, serverport: u16) -> Result<
         )
     };
     if h.is_null() {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
     Ok(HInternet { handle: h })
 }
@@ -258,7 +258,7 @@ fn open_request(
         )
     };
     if h.is_null() {
-        return Err(Error::from_win32());
+        return Err(Error::from_thread());
     }
     Ok(HInternet { handle: h })
 }
@@ -270,7 +270,7 @@ impl Drop for HInternet {
         }
         let ok = unsafe { WinHttpCloseHandle(self.handle) };
         if ok.is_ok() {
-            let e = Error::from_win32();
+            let e = Error::from_thread();
             assert!(e.code().is_ok(), "Error: {}", e);
         }
         self.handle = std::ptr::null_mut();

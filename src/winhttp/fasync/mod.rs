@@ -49,7 +49,7 @@ impl HRequestAsync {
             let raw: *mut ::core::ffi::c_void = p as *mut std::ffi::c_void;
             let invalid: *mut ::core::ffi::c_void = -1_i64 as *mut std::ffi::c_void;
             if raw == invalid {
-                let e = Error::from_win32();
+                let e = Error::from_thread();
                 assert!(e.code().is_ok(), "Fail to set callback: {}", e);
             }
         }

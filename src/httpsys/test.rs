@@ -65,7 +65,7 @@ mod tests {
         let th = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let _ = HttpInitializer::default();
+                HttpInitializer::default();
 
                 let session = ServerSession::default();
 

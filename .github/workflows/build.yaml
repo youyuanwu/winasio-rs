@@ -8,42 +8,32 @@ jobs:
     strategy:
       matrix:
         BUILD_TYPE: ["Debug"]
-        os: [ windows-2022 ]
+        os: [ windows-latest ]
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v7
 
-    - name: Install rust stable
-      uses: actions-rs/toolchain@v1
+    - name: Install rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
-        toolchain: stable
+        # channel and components come from rust-toolchain.toml
+        cache: false
 
     # enable cache
     - uses: Swatinem/rust-cache@v2
 
     - name: Run cargo check
-      uses: actions-rs/cargo@v1
-      with:
-        command: check
+      run: cargo check --all-targets --all-features
 
     - uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Run cargo fmt
-      uses: actions-rs/cargo@v1
-      with:
-        command: fmt
-        args: --all -- --check
+      run: cargo fmt --all -- --check
 
     - name: Run cargo clippy
-      uses: actions-rs/cargo@v1
-      with:
-        command: clippy
-        args: -- -D warnings
+      run: cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Run cargo test
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: -- --nocapture
+      run: cargo test --all-targets --all-features -- --nocapture
 
     # coverage
     - name: run cmake
@@ -57,7 +47,7 @@ jobs:
 
     - name: Upload Report to Codecov
       if: ${{ matrix.BUILD_TYPE == 'Debug' }}
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v7
       with:
         files: ./lcov.info
         fail_ci_if_error: true

@@ -70,7 +70,8 @@ pub struct ServerSession {
 impl ServerSession {
     pub fn new() -> ServerSession {
         let mut id: u64 = 0;
-        let ec = unsafe { HttpCreateServerSession(G_HTTP_VERSION, std::ptr::addr_of_mut!(id), 0) };
+        let ec =
+            unsafe { HttpCreateServerSession(G_HTTP_VERSION, std::ptr::addr_of_mut!(id), None) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         assert_eq!(err, Error::empty());
         ServerSession { id }
@@ -97,9 +98,9 @@ pub struct UrlGroup<'a> {
 }
 
 impl UrlGroup<'_> {
-    pub fn new(session: &ServerSession) -> UrlGroup {
+    pub fn new(session: &ServerSession) -> UrlGroup<'_> {
         let mut id: u64 = 0;
-        let ec = unsafe { HttpCreateUrlGroup(session.id, std::ptr::addr_of_mut!(id), 0) };
+        let ec = unsafe { HttpCreateUrlGroup(session.id, std::ptr::addr_of_mut!(id), None) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         assert_eq!(err, Error::empty());
         UrlGroup {
@@ -138,7 +139,7 @@ impl UrlGroup<'_> {
     }
 
     pub fn add_url(&self, url: HSTRING) -> Result<(), Error> {
-        let ec = unsafe { HttpAddUrlToUrlGroup(self.id, &url, 0, 0) };
+        let ec = unsafe { HttpAddUrlToUrlGroup(self.id, &url, 0, None) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         err.code().ok()
     }
@@ -228,7 +229,7 @@ impl RequestQueue {
     pub fn new() -> Result<RequestQueue, Error> {
         let mut h: HANDLE = HANDLE::default();
         let ec = unsafe {
-            HttpCreateRequestQueue(G_HTTP_VERSION, None, None, 0, std::ptr::addr_of_mut!(h))
+            HttpCreateRequestQueue(G_HTTP_VERSION, None, None, None, std::ptr::addr_of_mut!(h))
         };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         if err.code().is_err() {
@@ -314,8 +315,8 @@ impl RequestQueue {
                 None, //cachepolicy,
                 None,
                 None,
-                0,
-                Some(optr.get()),
+                None,
+                Some(optr.get_mut()),
                 None, //logdata,
             )
         };
@@ -341,7 +342,7 @@ impl RequestQueue {
         let ec = unsafe { HttpCloseRequestQueue(self.h) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         assert_eq!(err, Error::empty());
-        self.h = HANDLE(0);
+        self.h = HANDLE::default();
     }
 }
 
