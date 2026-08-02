@@ -6,6 +6,8 @@
 
 //! Reference operations shipped with the crate.
 
+pub mod event;
 pub mod file;
 
+pub use event::WaitForHandle;
 pub use file::{ReadAt, SendHandle, WriteAt};

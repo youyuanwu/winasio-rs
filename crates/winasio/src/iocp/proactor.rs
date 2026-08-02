@@ -207,6 +207,11 @@ impl Proactor {
         }
     }
 
+    /// The raw port handle, so an event wait can post its completion here.
+    pub(crate) fn port_handle(&self) -> HANDLE {
+        self.inner.port.raw()
+    }
+
     /// Retrieve and dispatch available completions.
     ///
     /// Returns how many were delivered. With `timeout` of `None` this blocks

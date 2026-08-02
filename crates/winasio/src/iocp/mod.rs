@@ -37,7 +37,7 @@ mod threadpool;
 pub use buf::{BufResult, IoBuf, IoBufMut};
 pub use future::Submit;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
-pub use ops::{ReadAt, SendHandle, WriteAt};
+pub use ops::{ReadAt, SendHandle, WaitForHandle, WriteAt};
 pub use port::RegistrationError;
 pub use proactor::{Notify, Proactor};
 pub use threadpool::ThreadPoolIo;
