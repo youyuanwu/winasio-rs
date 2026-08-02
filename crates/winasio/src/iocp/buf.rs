@@ -175,6 +175,19 @@ impl<T, S> BufResult<T, S> {
     }
 }
 
+impl<T, S: crate::iocp::op::IntoInner> BufResult<T, S> {
+    /// Split into the result and the operation's *meaningful* value — usually
+    /// the buffer — rather than the operation struct itself.
+    pub fn into_inner_parts(self) -> (windows::core::Result<T>, S::Inner) {
+        (self.result, self.state.into_inner())
+    }
+
+    /// Discard the result and keep the operation's meaningful value.
+    pub fn into_inner_state(self) -> S::Inner {
+        self.state.into_inner()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,11 +26,19 @@
 //! would be a use-after-free.
 
 mod buf;
+mod future;
 mod op;
+pub mod ops;
+mod port;
+mod proactor;
 mod raw;
 
 pub use buf::{BufResult, IoBuf, IoBufMut};
+pub use future::Submit;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
+pub use ops::{ReadAt, SendHandle, WriteAt};
+pub use port::RegistrationError;
+pub use proactor::{Notify, Proactor};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use raw::live_operations;

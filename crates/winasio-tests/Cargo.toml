@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-winasio = { workspace = true }
+winasio = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 warp = { workspace = true }
 serde = { workspace = true }

@@ -35,6 +35,11 @@ jobs:
     - name: Run cargo test
       run: cargo test --workspace --all-targets --all-features -- --nocapture
 
+    # `--all-targets` excludes doctests, so compile_fail proofs and examples
+    # need their own step.
+    - name: Run doc tests
+      run: cargo test --workspace --all-features --doc
+
     # coverage
     - name: run cmake
       run: > 
