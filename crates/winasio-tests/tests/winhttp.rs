@@ -12,7 +12,7 @@ mod tests {
     };
 
     use tokio::sync::oneshot::{self, *};
-    use winasio_rs::{
+    use winasio::{
         self,
         winhttp::{fasync::HRequestAsync, *},
     };

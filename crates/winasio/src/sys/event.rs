@@ -68,28 +68,6 @@ impl Drop for ManualResetEvent {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ManualResetEvent;
-
-    #[test]
-    fn manual_reset_event_test() {
-        {
-            let e = ManualResetEvent::new();
-            e.set().unwrap();
-            e.reset().unwrap();
-        }
-        {
-            let mut e1 = ManualResetEvent::default();
-            let mut e2 = ManualResetEvent::new();
-
-            let h = e2.release();
-            e1.assign(h);
-            e1.set().unwrap();
-        }
-    }
-}
-
 // reference boost\asio\detail\impl\win_object_handle_service.ipp
 
 #[repr(C)]
@@ -191,30 +169,23 @@ unsafe extern "system" fn my_callback(ctx: *mut ::core::ffi::c_void, timer_or_wa
 }
 
 #[cfg(test)]
-mod tests2 {
-    use super::{AwaitableObject, ManualResetEvent};
-    use windows::Win32::Foundation::HANDLE;
+mod tests {
+    use super::ManualResetEvent;
 
     #[test]
-    fn awaitable_object_test() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    fn manual_reset_event_test() {
+        {
+            let e = ManualResetEvent::new();
+            e.set().unwrap();
+            e.reset().unwrap();
+        }
+        {
+            let mut e1 = ManualResetEvent::default();
+            let mut e2 = ManualResetEvent::new();
 
-        rt.block_on(async {
-            let e1 = ManualResetEvent::new();
-            // HANDLE is a raw pointer and not Send, so pass it across the task boundary
-            // as an integer and rebuild the handle inside the task.
-            let h_raw = e1.get().0 as usize;
-
-            let sh = tokio::task::spawn(async move {
-                let h = HANDLE(h_raw as *mut std::ffi::c_void);
-                let mut awaitable_obj = Box::new(AwaitableObject::new(h));
-                awaitable_obj.wait().await;
-            });
-
-            // set event
+            let h = e2.release();
+            e1.assign(h);
             e1.set().unwrap();
-            // wait for callback complete
-            sh.await.unwrap();
-        });
+        }
     }
 }

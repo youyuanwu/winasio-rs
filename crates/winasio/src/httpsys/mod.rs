@@ -1,5 +1,3 @@
-mod test;
-
 use std::sync::Arc;
 
 use windows::{

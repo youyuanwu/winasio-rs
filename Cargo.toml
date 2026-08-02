@@ -1,32 +1,29 @@
-[package]
-name = "winasio-rs"
+[workspace]
+resolver = "2"
+members = ["crates/winasio", "crates/winasio-tests"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/youyuanwu/winasio-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
+winasio = { path = "crates/winasio" }
 
-[dependencies.windows]
-version = "0.62"
-features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_IO",
     "Win32_Networking_HttpServer",
-    "Win32_Networking_WinSock"
-]
+    "Win32_Networking_WinSock",
+] }
 
-
-[dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 warp = { version = "0.4", features = ["server"] }
-serde_derive = "1.0"
 serde = "1.0"
+serde_derive = "1.0"
 serde_json = "1.0"
-
-[dev-dependencies.windows]
-version = "0.62"
-features = [
-    "Win32_Storage_FileSystem"
-]

@@ -8,11 +8,11 @@ REQUIRED
 )
 
 add_custom_target(cov_all
-  COMMAND ${cargo_exe} llvm-cov --lcov --output-path lcov.info
+  COMMAND ${cargo_exe} llvm-cov --workspace --all-features --lcov --output-path lcov.info
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 add_custom_target(cov_summary
-  COMMAND ${cargo_exe} llvm-cov --no-clean
+  COMMAND ${cargo_exe} llvm-cov --workspace --all-features --no-clean
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )

@@ -1,0 +1,10 @@
+[package]
+name = "winasio"
+description = "Windows Async I/O and Networking lib for Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+windows = { workspace = true }

@@ -22,7 +22,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
 
     - name: Run cargo check
-      run: cargo check --all-targets --all-features
+      run: cargo check --workspace --all-targets --all-features
 
     - uses: taiki-e/install-action@cargo-llvm-cov
 
@@ -30,10 +30,10 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run cargo clippy
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
     - name: Run cargo test
-      run: cargo test --all-targets --all-features -- --nocapture
+      run: cargo test --workspace --all-targets --all-features -- --nocapture
 
     # coverage
     - name: run cmake

@@ -41,7 +41,12 @@ Example snippit:
       print!("{}", s);
   }
 ```
-See full working code in [example test](./tests/test.rs)
+See full working code in [example test](./crates/winasio-tests/tests/winhttp.rs)
+
+# Layout
+This repo is a cargo workspace:
+- `crates/winasio`: the library crate.
+- `crates/winasio-tests`: test only crate holding the integration tests.
 
 # MISC
 C++ counterpart of this lib: [winasio](https://github.com/youyuanwu/winasio)

@@ -702,7 +702,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-name = "winasio-rs"
+name = "winasio"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "winasio-tests"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -710,6 +717,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "warp",
+ "winasio",
  "windows",
 ]
 
