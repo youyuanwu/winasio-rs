@@ -212,7 +212,7 @@ fn zero_byte_read_own_port() {
         &proactor,
         proactor.submit(WriteAt::new(file.handle, 0, b"abc".to_vec())),
     );
-    w.into_parts().0.unwrap();
+    w.0.unwrap();
 
     let r = drive_own_port(
         &proactor,
@@ -229,7 +229,7 @@ fn zero_byte_read_thread_pool() {
     let pool = ThreadPoolIo::new(file.handle).unwrap();
 
     let w = drive_thread_pool(pool.submit(WriteAt::new(file.handle, 0, b"abc".to_vec())));
-    w.into_parts().0.unwrap();
+    w.0.unwrap();
 
     let r = drive_thread_pool(pool.submit(ReadAt::new(file.handle, 4096, Vec::with_capacity(16))));
     let (result, buf) = r.into_inner_parts();
@@ -584,8 +584,8 @@ fn both_backends_can_be_active_simultaneously() {
         proactor.submit(WriteAt::new(a.handle, 0, payload.clone())),
     );
     let w2 = drive_thread_pool(pool.submit(WriteAt::new(b.handle, 0, payload)));
-    assert_eq!(w1.into_parts().0.unwrap(), expected);
-    assert_eq!(w2.into_parts().0.unwrap(), expected);
+    assert_eq!(w1.0.unwrap(), expected);
+    assert_eq!(w2.0.unwrap(), expected);
 
     let r1 = drive_own_port(
         &proactor,
@@ -619,7 +619,7 @@ fn a_foreign_overlapped_on_an_attached_handle_is_ignored() {
         &proactor,
         proactor.submit(WriteAt::new(file.handle, 0, vec![7u8; 256])),
     );
-    w.into_parts().0.unwrap();
+    w.0.unwrap();
 
     // Issue an overlapped read the crate knows nothing about. Its OVERLAPPED is
     // the last field of the allocation, so any read past it is out of bounds.
@@ -697,7 +697,7 @@ fn thread_pool_backend_works_under_a_multi_threaded_runtime() {
             tokio::spawn(async move { p.submit(WriteAt::new(p.handle(), 0, payload)).await })
                 .await
                 .unwrap();
-        assert_eq!(written.into_parts().0.unwrap(), expected.len());
+        assert_eq!(written.0.unwrap(), expected.len());
 
         let p = pool.clone();
         let capacity = expected.len();

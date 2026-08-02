@@ -136,7 +136,7 @@ fn seed_file(handle: HANDLE) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(r) = poll_once(&mut fut) {
-            r.into_parts().0.unwrap();
+            r.0.unwrap();
             break;
         }
         proactor.poll(Some(Duration::from_millis(5))).unwrap();
@@ -289,7 +289,7 @@ fn seed_via_pool(pool: &ThreadPoolIo, handle: HANDLE) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(r) = poll_once(&mut fut) {
-            r.into_parts().0.unwrap();
+            r.0.unwrap();
             break;
         }
         std::thread::sleep(Duration::from_millis(1));

@@ -242,7 +242,7 @@ fn an_operation_defined_outside_the_crate_works() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(out) = poll_once(&mut connect) {
-            out.into_parts().0.expect("connection completes");
+            out.0.expect("connection completes");
             break;
         }
         proactor.poll(Some(Duration::from_millis(5))).unwrap();
