@@ -10,10 +10,11 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-winasio = { workspace = true }
+winasio = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 warp = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
-windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+rand = { workspace = true }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes"] }

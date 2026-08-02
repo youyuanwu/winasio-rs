@@ -4,4 +4,10 @@
 // license information.
 // ------------------------------------------------------------
 
-//! Test only crate. Integration tests for the `winasio` crate live in `tests/`.
+//! Reference operations shipped with the crate.
+
+pub mod event;
+pub mod file;
+
+pub use event::WaitForHandle;
+pub use file::{ReadAt, SendHandle, WriteAt};

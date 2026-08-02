@@ -5,6 +5,31 @@
 
 Windows Async I/O and Networking lib for Rust.
 
+# IOCP
+Runtime-agnostic infrastructure for making any Windows overlapped API awaitable.
+
+Define an operation once by implementing `OpCode` — in your own crate, with no
+change to `winasio` — and it works with either completion backend:
+
+| | `Proactor` (own port) | `ThreadPoolIo` (system-managed) |
+|---|---|---|
+| Who drives completions | you, via `poll()` | the Win32 thread pool |
+| Thread affinity | `!Send`, one thread | `Send + Sync` |
+| Suits | single-threaded loops | multi-threaded runtimes |
+
+A handle belongs to exactly one backend, permanently; registering twice fails
+with a distinguishable error.
+
+The operation owns whatever buffers or structures Windows writes into, and gets
+them back on completion. That ownership transfer is what makes cancellation
+safe: dropping a pending future requests cancellation but keeps the memory alive
+until the kernel delivers the completion, so an abandoned read cannot corrupt
+memory. The cost is that the buffer is not returned when you abandon an
+operation.
+
+`ReadAt`/`WriteAt` (byte buffers) and the HTTP Server API operations
+(kernel-filled structures) ship as worked examples of both shapes.
+
 # Winhttp
 Winhttp in async mode with rust async await wrapper.
 Example snippit:

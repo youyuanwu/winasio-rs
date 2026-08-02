@@ -8,3 +8,7 @@ repository.workspace = true
 
 [dependencies]
 windows = { workspace = true }
+
+[features]
+# Exposes allocation accounting used by the integration test suite.
+test-util = []
