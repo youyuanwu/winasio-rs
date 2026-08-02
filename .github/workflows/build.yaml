@@ -40,6 +40,10 @@ jobs:
     - name: Run doc tests
       run: cargo test --workspace --all-features --doc
 
+    # The cancellation soak is #[ignore]d so the default suite stays fast.
+    - name: Run cancellation soak
+      run: cargo test --workspace --all-targets --all-features -- --ignored --nocapture
+
     # coverage
     - name: run cmake
       run: > 

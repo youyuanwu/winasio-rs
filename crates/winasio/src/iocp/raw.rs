@@ -51,7 +51,7 @@
 #![allow(dead_code)]
 
 use std::cell::UnsafeCell;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -125,7 +125,11 @@ pub(crate) struct RawOp<T> {
     result: UnsafeCell<MaybeUninit<Result<usize>>>,
     waker: Mutex<Option<Waker>>,
     /// Locked by `operate`, `cancel`, and `on_complete`, which can race.
-    op: Mutex<T>,
+    ///
+    /// `Option` so the operation can be moved out by whichever thread wins the
+    /// terminal transition, without requiring sole ownership of the allocation.
+    /// The completion path may still hold its own reference at that moment.
+    op: Mutex<Option<T>>,
 }
 
 // SAFETY: `OVERLAPPED` contains raw pointers, which makes `RawOp<T>` `!Send`
@@ -205,7 +209,9 @@ unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize
     // `Drop`, which is the one call that can genuinely race us.
     {
         let mut op = arc.op.lock().unwrap();
-        unsafe { op.on_complete(&result) };
+        if let Some(op) = op.as_mut() {
+            unsafe { op.on_complete(&result) };
+        }
     }
 
     // Write the result *before* publishing `Completed`. Any thread that
@@ -265,7 +271,7 @@ impl<T: OpCode> Key<T> {
                 state: AtomicU32::new(OpState::Submitted as u32),
                 result: UnsafeCell::new(MaybeUninit::uninit()),
                 waker: Mutex::new(None),
-                op: Mutex::new(op),
+                op: Mutex::new(Some(op)),
             }),
         }
     }
@@ -307,6 +313,7 @@ impl<T: OpCode> Key<T> {
     pub(crate) unsafe fn operate(&self) -> std::task::Poll<Result<usize>> {
         let optr = self.overlapped_ptr();
         let mut op = self.inner.op.lock().unwrap();
+        let op = op.as_mut().expect("an operation is started once");
         unsafe { op.operate(optr) }
     }
 
@@ -317,18 +324,26 @@ impl<T: OpCode> Key<T> {
     /// no-op at the Windows level.
     pub(crate) fn cancel(&self) -> Result<()> {
         let optr = self.overlapped_ptr();
-        let mut op = self.inner.op.lock().unwrap();
-        unsafe { op.cancel(optr) }
+        let mut guard = self.inner.op.lock().unwrap();
+        match guard.as_mut() {
+            Some(op) => unsafe { op.cancel(optr) },
+            None => Ok(()),
+        }
     }
 
     /// Read the operation's declared type.
-    pub(crate) fn op_type(&self) -> OpType {
-        self.inner.op.lock().unwrap().op_type()
+    pub(crate) fn op_type(&self) -> Option<OpType> {
+        self.inner.op.lock().unwrap().as_ref().map(|o| o.op_type())
     }
 
     /// The handle this operation targets, if it reports one.
     pub(crate) fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-        self.inner.op.lock().unwrap().handle()
+        self.inner
+            .op
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|o| o.handle())
     }
 
     /// Run the operation's completion hook for a result produced inline.
@@ -337,7 +352,9 @@ impl<T: OpCode> Key<T> {
     /// where no packet is delivered.
     pub(crate) fn on_complete_inline(&self, result: &Result<usize>) {
         let mut op = self.inner.op.lock().unwrap();
-        unsafe { op.on_complete(result) };
+        if let Some(op) = op.as_mut() {
+            unsafe { op.on_complete(result) };
+        }
     }
 
     /// Install the waker to be signalled on completion.
@@ -349,8 +366,12 @@ impl<T: OpCode> Key<T> {
         }
     }
 
-    /// Take the completion result, if one has been written.
-    pub(crate) fn take_result(&self) -> Option<Result<usize>> {
+    /// Take the completion result together with the operation state.
+    ///
+    /// The compare-exchange makes this exclusive, so the operation can be moved
+    /// out without requiring sole ownership of the allocation — the completion
+    /// path may still hold its reference at this moment.
+    pub(crate) fn take_completion(&self) -> Option<(Result<usize>, T)> {
         self.inner
             .state
             .compare_exchange(
@@ -359,11 +380,31 @@ impl<T: OpCode> Key<T> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .ok()
-            // SAFETY: the CAS succeeded, so the state was `Completed`, which is
-            // only published after the result has been written. The CAS also
-            // guarantees no other thread can take it.
-            .map(|_| unsafe { (*self.inner.result.get()).assume_init_read() })
+            .ok()?;
+
+        // SAFETY: the CAS succeeded, so the state was `Completed`, which is only
+        // published after the result has been written, and no other thread can
+        // take it.
+        let result = unsafe { (*self.inner.result.get()).assume_init_read() };
+        let op = self
+            .inner
+            .op
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the terminal transition happens once");
+        Some((result, op))
+    }
+
+    /// Take the operation state for a result produced inline, where no
+    /// completion is coming and no state transition is involved.
+    pub(crate) fn take_op_inline(&self) -> T {
+        self.inner
+            .op
+            .lock()
+            .unwrap()
+            .take()
+            .expect("an inline result is taken once")
     }
 
     /// Mark the operation abandoned because the future was dropped.
@@ -380,33 +421,6 @@ impl<T: OpCode> Key<T> {
                 Ordering::Acquire,
             )
             .is_ok()
-    }
-
-    /// Consume the key and yield the operation, if this is the last reference.
-    pub(crate) fn try_into_op(self) -> std::result::Result<T, Self> {
-        let raw = match Arc::try_unwrap(self.inner) {
-            Ok(raw) => raw,
-            Err(inner) => return Err(Key { inner }),
-        };
-
-        // `Arc::try_unwrap` proved uniqueness, so nothing else can observe this
-        // allocation. Suppress the `Drop` impl and dispose of each field by
-        // hand, because `op` must be moved out rather than dropped.
-        let raw = ManuallyDrop::new(raw);
-
-        if OpState::from_u32(raw.state.load(Ordering::Acquire)) == OpState::Completed {
-            unsafe { (*raw.result.get()).assume_init_drop() };
-        }
-
-        // SAFETY: unique ownership; each field is read or dropped exactly once.
-        // `overlapped`, `header` and `state` are plain data with no drop glue.
-        let op = unsafe { std::ptr::read(&raw.op) };
-        unsafe { std::ptr::drop_in_place(&raw.waker as *const _ as *mut Mutex<Option<Waker>>) };
-
-        #[cfg(any(test, feature = "test-util"))]
-        counter::dec();
-
-        Ok(op.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -581,7 +595,7 @@ mod tests {
             "on_complete must run on the concrete type"
         );
         assert_eq!(REACHED_LEN.load(Ordering::SeqCst), 4242);
-        assert_eq!(key.take_result().unwrap().unwrap(), 4242);
+        assert_eq!(key.take_completion().unwrap().0.unwrap(), 4242);
     }
 
     #[test]
@@ -594,7 +608,7 @@ mod tests {
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(3)) };
 
-        assert_eq!(key.take_result().unwrap().unwrap(), 3);
+        assert_eq!(key.take_completion().unwrap().0.unwrap(), 3);
         drop(key);
         assert_eq!(live_operations(), before, "allocation must be released");
     }
@@ -660,8 +674,8 @@ mod tests {
         let key = Key::new(noop(0));
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(11)) };
-        assert_eq!(key.take_result().unwrap().unwrap(), 11);
-        assert!(key.take_result().is_none(), "the result is taken once");
+        assert_eq!(key.take_completion().unwrap().0.unwrap(), 11);
+        assert!(key.take_completion().is_none(), "the result is taken once");
     }
 
     #[test]
@@ -685,8 +699,9 @@ mod tests {
         let waker = futures_noop_waker();
         key.set_waker(&waker);
 
-        let op = key.try_into_op().unwrap_or_else(|_| panic!("unique"));
+        let op = key.take_op_inline();
         assert_eq!(op._buf.len(), 16);
+        drop(key);
         assert_eq!(live_operations(), before, "allocation must be released");
     }
 
@@ -698,20 +713,29 @@ mod tests {
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(2)) };
         // Result written but deliberately not taken.
-        let op = key.try_into_op().unwrap_or_else(|_| panic!("unique"));
+        let (_result, op) = key.take_completion().expect("a result was written");
         assert_eq!(op._buf.len(), 2);
+        drop(key);
         assert_eq!(live_operations(), before);
     }
 
     #[test]
-    fn try_into_op_fails_while_shared() {
+    fn completion_can_be_taken_while_the_allocation_is_still_shared() {
+        // The completion path may still hold its reference when the future is
+        // woken, so taking the result must not require sole ownership.
+        let _guard = counter_guard();
         let key = Key::new(noop(1));
-        let clone = key.clone();
-        assert!(
-            key.try_into_op().is_err(),
-            "shared keys cannot be unwrapped"
-        );
-        drop(clone);
+        let optr = key.leak();
+        let shadow = key.clone();
+
+        unsafe { dispatch_completion(optr, Ok(1)) };
+
+        let (result, op) = key
+            .take_completion()
+            .expect("takeable even with another reference alive");
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(op._buf.len(), 1);
+        drop(shadow);
     }
 
     #[test]
@@ -746,7 +770,7 @@ mod tests {
             !WOKEN.load(Ordering::SeqCst),
             "an abandoned operation has nobody to wake"
         );
-        assert!(key.take_result().is_none(), "its result is discarded");
+        assert!(key.take_completion().is_none(), "its result is discarded");
     }
 
     #[test]
@@ -792,7 +816,7 @@ mod tests {
             "the completion path must release its reference before waking"
         );
         assert!(
-            key.clone().take_result().is_some(),
+            key.clone().take_completion().is_some(),
             "and the result must be available"
         );
     }

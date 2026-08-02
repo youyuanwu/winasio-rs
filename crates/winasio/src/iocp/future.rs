@@ -58,17 +58,6 @@ impl<T: OpCode> Submit<T> {
     pub fn is_ready(&self) -> bool {
         self.inline.is_some()
     }
-
-    fn finish(&mut self, result: Result<usize>) -> BufResult<usize, T> {
-        let key = self.key.take().expect("operation resolved twice");
-        match key.try_into_op() {
-            Ok(op) => BufResult::new(result, op),
-            Err(_still_shared) => unreachable!(
-                "operation state was still shared after completion; the completion \
-                 path releases its reference before waking"
-            ),
-        }
-    }
 }
 
 impl<T: OpCode> Future for Submit<T> {
@@ -78,7 +67,9 @@ impl<T: OpCode> Future for Submit<T> {
         let this = self.get_mut();
 
         if let Some(result) = this.inline.take() {
-            return Poll::Ready(this.finish(result));
+            let key = this.key.take().expect("resolved once");
+            // Nothing is in flight, so the state can be taken directly.
+            return Poll::Ready(BufResult::new(result, key.take_op_inline()));
         }
 
         let key = this.key.as_ref().expect("polled after completion");
@@ -87,8 +78,14 @@ impl<T: OpCode> Future for Submit<T> {
         // check and the installation still wakes us.
         key.set_waker(cx.waker());
 
-        match key.take_result() {
-            Some(result) => Poll::Ready(this.finish(result)),
+        // Takes the result and the operation together under one exclusive
+        // transition, so this does not depend on the completion path having
+        // already released its own reference to the allocation.
+        match key.take_completion() {
+            Some((result, op)) => {
+                this.key = None;
+                Poll::Ready(BufResult::new(result, op))
+            }
             None => Poll::Pending,
         }
     }
