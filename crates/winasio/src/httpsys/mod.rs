@@ -1,22 +1,25 @@
-use std::sync::Arc;
+pub mod ops;
+
+use std::pin::Pin;
 
 use windows::{
     core::{Error, HRESULT, HSTRING},
     Win32::{
-        Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, HANDLE, NO_ERROR, WIN32_ERROR},
+        Foundation::HANDLE,
         Networking::HttpServer::{
             HttpAddUrlToUrlGroup, HttpCloseRequestQueue, HttpCloseServerSession, HttpCloseUrlGroup,
             HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup,
-            HttpDataChunkFromMemory, HttpInitialize, HttpReceiveHttpRequest, HttpSendHttpResponse,
-            HttpServerBindingProperty, HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION,
-            HTTP_BINDING_INFO, HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER,
+            HttpDataChunkFromMemory, HttpInitialize, HttpServerBindingProperty,
+            HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION, HTTP_BINDING_INFO,
+            HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER,
             HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_V2, HTTP_RESPONSE_V2,
             HTTP_SERVER_PROPERTY,
         },
     },
 };
 
-use crate::sys::iocp::{register_iocp_handle, OverlappedObject};
+use crate::iocp::{BufResult, Submit, ThreadPoolIo};
+pub use ops::{ReceiveRequest, SendResponse};
 
 static G_HTTP_VERSION: HTTPAPI_VERSION = HTTPAPI_VERSION {
     HttpApiMajorVersion: 2,
@@ -173,6 +176,19 @@ impl Request {
         &mut self.raw
     }
 
+    /// Read-only view of the parsed request.
+    ///
+    /// Fields such as `pRawUrl` and the header arrays point into this same
+    /// allocation, which is why a received request is handed back pinned.
+    pub fn raw_ref(&self) -> &HTTP_REQUEST_V2 {
+        &self.raw
+    }
+
+    /// Pointer to the embedded header, for handing to HTTP.sys.
+    pub(crate) fn raw_ptr(&mut self) -> *mut HTTP_REQUEST_V2 {
+        &mut self.raw
+    }
+
     pub fn size() -> u32 {
         std::mem::size_of::<Request>() as u32
     }
@@ -216,7 +232,12 @@ impl Response {
 
 pub struct RequestQueue {
     h: HANDLE,
-    // optr: OverlappedObject,
+    /// Completions are delivered by the Win32 thread pool.
+    ///
+    /// A request queue is shared across tasks on a multi-threaded runtime, so
+    /// the caller-driven `Proactor` -- which is `!Send` and needs someone to
+    /// poll it -- would not fit.
+    io: Option<ThreadPoolIo>,
 }
 
 // resp should be safe
@@ -234,12 +255,8 @@ impl RequestQueue {
             Err(err)
         } else {
             assert!(!h.is_invalid());
-            // register with iocp thread pool callback
-            register_iocp_handle(h).unwrap();
-            Ok(RequestQueue {
-                h,
-                //optr: OverlappedObject::new(),
-            })
+            let io = ThreadPoolIo::new(h).map_err(Error::from)?;
+            Ok(RequestQueue { h, io: Some(io) })
         }
     }
 
@@ -251,92 +268,71 @@ impl RequestQueue {
         url_group.set_binding_info(&info)
     }
 
+    /// Receive the next request.
+    ///
+    /// The request is returned pinned: HTTP.sys writes pointers into its own
+    /// inline buffer, so moving it out would leave them dangling.
+    pub fn receive_request(
+        &self,
+        requestid: u64,
+        flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
+    ) -> Submit<ReceiveRequest> {
+        self.io
+            .as_ref()
+            .expect("request queue is open")
+            .submit(ReceiveRequest::new(self.h, requestid, flags))
+    }
+
+    /// Send a response, taking ownership of it for the operation's duration.
+    pub fn send_response(
+        &self,
+        requestid: u64,
+        flags: u32,
+        response: Response,
+    ) -> Submit<SendResponse> {
+        self.io
+            .as_ref()
+            .expect("request queue is open")
+            .submit(SendResponse::new(self.h, requestid, flags, response))
+    }
+
+    /// Await the next request, returning it with the transferred byte count.
     pub async fn async_receive_request(
         &self,
         requestid: u64,
         flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-        requestbuffer: &mut Request,
-        // requestbufferlength: u32,
-    ) -> Result<u32, Error> {
-        // !!! not thread safe. assume only one thread now.
-        // we need to store in self because when server shutdown, await is cancelled,
-        // but callback is invoked on this optr, and will result access violation if
-        // put on stack, since the stack might be gone if await is cancelled.
-        // TODO: maybe other functions the optr needs to be on self or heap as well.
-        let optr = Arc::new(OverlappedObject::new());
-        let ec = unsafe {
-            HttpReceiveHttpRequest(
-                self.h,
-                requestid,
-                flags,
-                requestbuffer.raw(),
-                Request::size(),
-                None,
-                Some(optr.get_mut()),
-            )
-        };
-        let err = WIN32_ERROR(ec);
-        if err == ERROR_IO_PENDING || err == NO_ERROR {
-            //println!("HttpReceiveHttpRequest waiting. {:?}", err);
-            std::mem::forget(optr.clone());
-            optr.wait().await;
-            let async_err = optr.get_ec();
-            //println!("HttpReceiveHttpRequest waiting complete . {:?}", async_err);
-            if async_err == Error::empty() {
-                Ok(optr.get_len())
-            } else {
-                Err(async_err)
-            }
-        } else {
-            // we do not handle insufficent buffer, caller needs to pass buffer size greater than xxx?
-            assert_ne!(err, ERROR_INSUFFICIENT_BUFFER);
-
-            Err(Error::from(err))
-        }
+    ) -> BufResult<usize, Pin<Box<Request>>> {
+        self.receive_request(requestid, flags)
+            .await
+            .map_state(|op| {
+                use crate::iocp::IntoInner;
+                op.into_inner()
+            })
     }
 
+    /// Await sending a response, getting it back afterwards.
     pub async fn async_send_response(
         &self,
         requestid: u64,
         flags: u32,
-        httpresponse: &Response,
-        //cachepolicy: ::core::option::Option<*const HTTP_CACHE_POLICY>,
-        //logdata: ::core::option::Option<*const HTTP_LOG_DATA>,
-    ) -> Result<u32, Error> {
-        let optr = Arc::new(OverlappedObject::new());
-        let ec = unsafe {
-            HttpSendHttpResponse(
-                self.h,
-                requestid,
-                flags,
-                httpresponse.raw(),
-                None, //cachepolicy,
-                None,
-                None,
-                None,
-                Some(optr.get_mut()),
-                None, //logdata,
-            )
-        };
-        let err = WIN32_ERROR(ec);
-        if err == ERROR_IO_PENDING || err == NO_ERROR {
-            std::mem::forget(optr.clone());
-            optr.wait().await;
-            let async_err = optr.get_ec();
-            if async_err == Error::empty() {
-                Ok(optr.get_len())
-            } else {
-                Err(async_err)
-            }
-        } else {
-            Err(Error::from(err))
-        }
+        response: Response,
+    ) -> BufResult<usize, Response> {
+        self.send_response(requestid, flags, response)
+            .await
+            .map_state(|op| {
+                use crate::iocp::IntoInner;
+                op.into_inner()
+            })
     }
 
     pub fn close(&mut self) {
         if self.h.is_invalid() {
             return;
         }
+        // Release the thread-pool registration first: it cancels and drains
+        // outstanding operations, so the kernel is no longer holding pointers
+        // into them when the handle closes.
+        self.io = None;
         let ec = unsafe { HttpCloseRequestQueue(self.h) };
         let err = Error::from(HRESULT(ec.try_into().unwrap()));
         assert_eq!(err, Error::empty());

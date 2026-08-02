@@ -18,46 +18,65 @@ mod tests {
         },
     };
 
+    use std::pin::Pin;
     use winasio::{
         httpsys::{HttpInitializer, Request, RequestQueue, Response, ServerSession, UrlGroup},
         winhttp::HSession,
     };
 
-    async fn handle_request(queue: Arc<RequestQueue>, mut req: Request) {
-        let id = req.raw().Base.RequestId;
+    /// Reads the raw URL back out of a received request.
+    ///
+    /// This deliberately follows a pointer that HTTP.sys wrote into the
+    /// request's own inline buffer. If the request had been moved after
+    /// completion, this would read freed or relocated memory -- which is why
+    /// it comes back pinned.
+    fn raw_url_of(req: &Request) -> String {
+        let base = &req.raw_ref().Base;
+        if base.pRawUrl.is_null() || base.RawUrlLength == 0 {
+            return String::new();
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(base.pRawUrl.0, base.RawUrlLength as usize) };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 
-        let body = String::from("hello world");
+    async fn handle_request(queue: Arc<RequestQueue>, req: Pin<Box<Request>>) {
+        let id = req.raw_ref().Base.RequestId;
+
+        // Follow a kernel-written pointer after the request was handed back.
+        let url = raw_url_of(&req);
+        assert!(
+            url.contains("winhttpapitest"),
+            "the pinned request's URL pointer must still be valid, got {url:?}"
+        );
+
         let mut resp = Response::default();
-        resp.add_body_chunk(body);
+        resp.add_body_chunk(String::from("hello world"));
 
-        println!("run_test_server async_send_response");
-
-        let err = queue
-            .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, &resp)
+        println!("run_test_server send_response");
+        let out = queue
+            .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, resp)
             .await;
-        if err.is_err() {
-            println!("send resp failed: {:?}", err.err());
+        if let Err(e) = out.as_result() {
+            println!("send resp failed: {e:?}");
         }
     }
 
     async fn run_test_server(queue: Arc<RequestQueue>) {
         println!("run_test_server begin");
         loop {
-            let mut req = Request::default();
-
-            println!("run_test_server async_receive_request");
-            {
-                // task can be cancelled here when queue shutdown.
-                let err = queue
-                    .async_receive_request(0, HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY, &mut req)
-                    .await;
-                if err.is_err() {
-                    println!("receive request failed: {:?}", err.err());
-                    continue;
-                }
+            println!("run_test_server receive_request");
+            // The task can be cancelled here when the queue shuts down.
+            let out = queue
+                .async_receive_request(0, HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY)
+                .await;
+            let (result, req) = out.into_parts();
+            if let Err(e) = result {
+                println!("receive request failed: {e:?}");
+                continue;
             }
             let queue_cp = queue.clone();
-            // task is detached and not joinable.
+            // Detached, not joinable.
             let _h = tokio::spawn(async move {
                 handle_request(queue_cp, req).await;
             });
