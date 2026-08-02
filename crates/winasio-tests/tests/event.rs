@@ -36,6 +36,7 @@ fn poll_once<F: std::future::Future>(fut: &mut std::pin::Pin<Box<F>>) -> Option<
 
 #[test]
 fn a_wait_completes_when_the_handle_is_signalled() {
+    let _guard = counter_guard();
     let proactor = Proactor::new().unwrap();
     let event = ManualResetEvent::new();
 
@@ -65,6 +66,7 @@ fn a_wait_completes_when_the_handle_is_signalled() {
 
 #[test]
 fn a_signalled_handle_completes_promptly() {
+    let _guard = counter_guard();
     let proactor = Proactor::new().unwrap();
     let event = ManualResetEvent::new();
     // Already signalled before the wait is registered.
@@ -131,6 +133,7 @@ fn manual_reset_event_still_works_standalone() {
 
 #[test]
 fn many_waits_can_be_outstanding_at_once() {
+    let _guard = counter_guard();
     let proactor = Proactor::new().unwrap();
     let events: Vec<ManualResetEvent> = (0..8).map(|_| ManualResetEvent::new()).collect();
 

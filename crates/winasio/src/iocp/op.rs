@@ -19,6 +19,7 @@ use windows::Win32::System::IO::OVERLAPPED;
 
 /// How an operation's completion is signalled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpType {
     /// A true overlapped operation. `operate` passes the `OVERLAPPED` pointer to
     /// a Windows API which completes through an I/O completion port or a
@@ -65,19 +66,23 @@ pub unsafe trait OpCode: 'static {
         OpType::Overlapped
     }
 
-    /// Whether this operation may complete inline, and on which handle.
+    /// Which handle this operation runs on, if any.
     ///
-    /// The driver needs this to decide, after [`OpCode::operate`] returns
-    /// `Poll::Ready(Ok(_))`, whether a completion packet is *also* coming: that
-    /// depends on whether the handle skips the completion port on success.
+    /// **This has no default, deliberately.** The driver uses it to decide,
+    /// after [`OpCode::operate`] returns `Poll::Ready(Ok(_))`, whether a
+    /// completion packet is *also* coming — which depends on whether the handle
+    /// skips the completion port on success.
     ///
-    /// Returning `None` means "assume no packet". An operation that can complete
-    /// inline on a handle which does **not** skip the port must return its
-    /// handle here, or the driver will reclaim the operation while Windows still
-    /// holds a pointer to it.
-    fn handle(&self) -> Option<HANDLE> {
-        None
-    }
+    /// Getting it wrong is a use-after-free, so every implementor is required
+    /// to state the answer rather than inherit one:
+    ///
+    /// * `Some(handle)` — the operation runs on this handle. Always correct.
+    /// * `None` — the operation cannot complete inline, so the question does
+    ///   not arise. Only sound if [`OpCode::operate`] never returns
+    ///   `Poll::Ready(Ok(_))`.
+    ///
+    /// When in doubt, return `Some`.
+    fn handle(&self) -> Option<HANDLE>;
 
     /// Start the operation.
     ///

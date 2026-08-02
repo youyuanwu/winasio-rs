@@ -83,6 +83,24 @@ mod tests {
         }
     }
 
+    /// The pinning guarantee is only real if `Request` opts out of `Unpin`.
+    ///
+    /// Were it `Unpin`, safe code could call `Pin::into_inner` on the returned
+    /// request and move it out, dangling every pointer HTTP.sys wrote into its
+    /// inline buffer. This would compile if that protection were lost.
+    #[test]
+    fn request_is_not_unpin() {
+        trait AmbiguousIfUnpin<A> {
+            fn some_item(&self) {}
+        }
+        struct Token;
+        impl<T: ?Sized> AmbiguousIfUnpin<()> for T {}
+        impl<T: ?Sized + Unpin> AmbiguousIfUnpin<Token> for T {}
+
+        // Resolves unambiguously only when `Request` is NOT `Unpin`.
+        <Request as AmbiguousIfUnpin<_>>::some_item(&Request::default());
+    }
+
     #[test]
     fn server_test() {
         let (tx, rx) = oneshot::channel::<()>();

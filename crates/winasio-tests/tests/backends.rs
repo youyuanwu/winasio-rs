@@ -377,6 +377,11 @@ struct FailingOp {
 }
 
 unsafe impl winasio::iocp::OpCode for FailingOp {
+    /// `None`: this never starts, so no completion packet can follow.
+    fn handle(&self) -> Option<HANDLE> {
+        None
+    }
+
     unsafe fn operate(
         &mut self,
         _optr: *mut windows::Win32::System::IO::OVERLAPPED,
@@ -457,6 +462,214 @@ fn failed_start_balances_the_own_port_backend() {
     }
 
     assert_eq!(live_operations(), baseline);
+}
+
+// --- synchronous completion on both backends (FR-010, SC-011) -----------
+
+/// Completes inline without touching Windows, so the synchronous path is
+/// deterministic. Real file I/O essentially never completes inline.
+struct InlineOp {
+    outcome: std::result::Result<usize, windows::core::Error>,
+    completed_with: Option<usize>,
+    buffer: Vec<u8>,
+}
+
+unsafe impl winasio::iocp::OpCode for InlineOp {
+    /// `None`: this operation is not backed by a handle, so no completion
+    /// packet can follow its inline result.
+    fn handle(&self) -> Option<HANDLE> {
+        None
+    }
+
+    unsafe fn operate(
+        &mut self,
+        _optr: *mut windows::Win32::System::IO::OVERLAPPED,
+    ) -> std::task::Poll<windows::core::Result<usize>> {
+        std::task::Poll::Ready(self.outcome.clone())
+    }
+
+    unsafe fn on_complete(&mut self, result: &windows::core::Result<usize>) {
+        self.completed_with = result.as_ref().ok().copied();
+    }
+}
+
+impl winasio::iocp::IntoInner for InlineOp {
+    type Inner = (Vec<u8>, Option<usize>);
+    fn into_inner(self) -> Self::Inner {
+        (self.buffer, self.completed_with)
+    }
+}
+
+fn assert_inline_success(result: windows::core::Result<usize>, buf: Vec<u8>, seen: Option<usize>) {
+    assert_eq!(result.unwrap(), 17, "the transferred count survives");
+    assert_eq!(buf, vec![1, 2, 3], "the buffer comes back");
+    assert_eq!(seen, Some(17), "on_complete runs even with no packet");
+}
+
+#[test]
+fn inline_success_own_port() {
+    let _guard = counter_guard();
+    let file = TempFile::create(w!("bpf"));
+    let proactor = Proactor::new().unwrap();
+    proactor.attach(file.handle).unwrap();
+
+    let submitted = proactor.submit(InlineOp {
+        outcome: Ok(17),
+        completed_with: None,
+        buffer: vec![1, 2, 3],
+    });
+    assert!(
+        submitted.is_ready(),
+        "an inline op resolves without polling"
+    );
+
+    let (result, (buf, seen)) = drive_own_port(&proactor, submitted).into_inner_parts();
+    assert_inline_success(result, buf, seen);
+
+    assert_eq!(
+        proactor.poll(Some(Duration::from_millis(20))).unwrap(),
+        0,
+        "an inline completion must not also queue a packet"
+    );
+}
+
+#[test]
+fn inline_success_thread_pool() {
+    let _guard = counter_guard();
+    let baseline = live_operations();
+    let file = TempFile::create(w!("bpg"));
+    let pool = ThreadPoolIo::new(file.handle).unwrap();
+
+    let submitted = pool.submit(InlineOp {
+        outcome: Ok(17),
+        completed_with: None,
+        buffer: vec![1, 2, 3],
+    });
+    assert!(
+        submitted.is_ready(),
+        "an inline op resolves without polling"
+    );
+
+    let (result, (buf, seen)) = drive_thread_pool(submitted).into_inner_parts();
+    assert_inline_success(result, buf, seen);
+
+    // If StartThreadpoolIo were left unbalanced here, this drop would hang.
+    let started = std::time::Instant::now();
+    drop(pool);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the inline path must balance the thread-pool count"
+    );
+    assert_eq!(live_operations(), baseline);
+}
+
+// --- both backends active at once (FR-013) ------------------------------
+
+#[test]
+fn both_backends_can_be_active_simultaneously() {
+    let _guard = counter_guard();
+    let a = TempFile::create(w!("bph"));
+    let b = TempFile::create(w!("bpi"));
+
+    let proactor = Proactor::new().unwrap();
+    proactor.attach(a.handle).unwrap();
+    let pool = ThreadPoolIo::new(b.handle).unwrap();
+
+    let payload = b"coexisting backends".to_vec();
+    let expected = payload.len();
+
+    // Interleave work on both, with each registration live throughout.
+    let w1 = drive_own_port(
+        &proactor,
+        proactor.submit(WriteAt::new(a.handle, 0, payload.clone())),
+    );
+    let w2 = drive_thread_pool(pool.submit(WriteAt::new(b.handle, 0, payload)));
+    assert_eq!(w1.into_result().unwrap(), expected);
+    assert_eq!(w2.into_result().unwrap(), expected);
+
+    let r1 = drive_own_port(
+        &proactor,
+        proactor.submit(ReadAt::new(a.handle, 0, Vec::with_capacity(expected))),
+    );
+    let r2 = drive_thread_pool(pool.submit(ReadAt::new(b.handle, 0, Vec::with_capacity(expected))));
+    let (_, buf1) = r1.into_inner_parts();
+    let (_, buf2) = r2.into_inner_parts();
+    assert_eq!(buf1, buf2, "both backends produced the same bytes");
+    assert_eq!(buf1.len(), expected);
+}
+
+// --- foreign completion packets (safety regression) ---------------------
+
+/// A completion packet on an attached handle is not necessarily ours: the
+/// completion key is set per handle, so any overlapped call the caller makes on
+/// that handle produces a packet carrying it.
+///
+/// If ownership were decided by reading a header out of the packet, this would
+/// read past the caller's `OVERLAPPED` — an out-of-bounds read that access-
+/// violates when the allocation sits at the end of a page.
+#[test]
+fn a_foreign_overlapped_on_an_attached_handle_is_ignored() {
+    let _guard = counter_guard();
+    let file = TempFile::create(w!("bpj"));
+    let proactor = Proactor::new().unwrap();
+    proactor.attach(file.handle).unwrap();
+
+    // Give the file some content to read.
+    let w = drive_own_port(
+        &proactor,
+        proactor.submit(WriteAt::new(file.handle, 0, vec![7u8; 256])),
+    );
+    w.into_result().unwrap();
+
+    // Issue an overlapped read the crate knows nothing about. Its OVERLAPPED is
+    // the last field of the allocation, so any read past it is out of bounds.
+    #[repr(C)]
+    struct Foreign {
+        pad: [u8; 64],
+        overlapped: windows::Win32::System::IO::OVERLAPPED,
+    }
+    let mut foreign = Box::new(Foreign {
+        pad: [0xCD; 64],
+        overlapped: Default::default(),
+    });
+    let mut buf = vec![0u8; 128];
+
+    let optr = std::ptr::addr_of_mut!(foreign.overlapped);
+    let started = unsafe {
+        windows::Win32::Storage::FileSystem::ReadFile(
+            file.handle,
+            Some(buf.as_mut_slice()),
+            None,
+            Some(optr),
+        )
+    };
+    let pending = started.is_err()
+        && windows::core::Error::from_thread().code()
+            == windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult();
+    assert!(
+        started.is_ok() || pending,
+        "the foreign read should start or complete"
+    );
+
+    // The proactor must ignore this packet rather than read through it.
+    let delivered = proactor.poll(Some(Duration::from_millis(200))).unwrap();
+    assert_eq!(
+        delivered, 0,
+        "a foreign completion must not be dispatched as one of ours"
+    );
+
+    // And the proactor must still work afterwards.
+    let r = drive_own_port(
+        &proactor,
+        proactor.submit(ReadAt::new(file.handle, 0, Vec::with_capacity(256))),
+    );
+    let (result, got) = r.into_inner_parts();
+    result.unwrap();
+    assert_eq!(
+        got.len(),
+        256,
+        "the proactor still serves its own operations"
+    );
 }
 
 // --- multi-threaded runtime ---------------------------------------------

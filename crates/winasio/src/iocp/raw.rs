@@ -61,10 +61,47 @@ use windows::Win32::System::IO::OVERLAPPED;
 
 use super::op::{OpCode, OpType};
 
-/// Guards against acting on a packet whose memory has been corrupted or
-/// mis-attributed. Defence in depth: the driver establishes ownership from the
-/// completion key first.
+/// Guards against acting on a packet whose memory has been corrupted.
+///
+/// Ownership is established by [`is_ours`] before anything is dereferenced;
+/// this tag is a second line of defence against corruption, not the primary
+/// check.
 const OP_MAGIC: u32 = 0x5741_5349; // "WASI"
+
+/// Addresses of operation allocations currently owned by the kernel.
+///
+/// A completion packet arriving on a port or thread-pool registration is **not**
+/// necessarily ours: the completion key is set per *handle*, so any overlapped
+/// call the user makes on a registered handle produces a packet carrying it.
+/// Dereferencing such a pointer to look for our header would read past the
+/// caller's `OVERLAPPED` — an out-of-bounds read, and a potential indirect call
+/// through foreign memory.
+///
+/// So membership is tested by address, before any dereference.
+mod live {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn set() -> &'static Mutex<HashSet<usize>> {
+        static SET: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+        SET.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, HashSet<usize>> {
+        set().lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record that the kernel now owns this allocation.
+    pub(super) fn insert(addr: usize) {
+        lock().insert(addr);
+    }
+
+    /// Claim a completion. Returns `false` if the address is not one of ours,
+    /// or if another thread already claimed it.
+    pub(super) fn claim(addr: usize) -> bool {
+        lock().remove(&addr)
+    }
+}
 
 /// Operation lifecycle.
 ///
@@ -290,8 +327,13 @@ impl<T: OpCode> Key<T> {
     /// Must be called *before* the operation is started: a thread-pool callback
     /// can fire before the initiating call returns, and would otherwise try to
     /// reclaim a reference that does not exist yet.
+    ///
+    /// Also records the allocation as kernel-owned, so a completion carrying
+    /// this address can be recognised as ours without dereferencing it.
     pub(crate) fn leak(&self) -> *mut OVERLAPPED {
-        Arc::into_raw(Arc::clone(&self.inner)) as *mut OVERLAPPED
+        let raw = Arc::into_raw(Arc::clone(&self.inner)) as *mut OVERLAPPED;
+        live::insert(raw as usize);
+        raw
     }
 
     /// Reclaim a reference leaked by [`Key::leak`] for an operation that never
@@ -302,7 +344,9 @@ impl<T: OpCode> Key<T> {
     /// `optr` must be the value returned by a matching [`Key::leak`], and the
     /// operation must not have completed.
     pub(crate) unsafe fn unleak(optr: *mut OVERLAPPED) {
-        drop(unsafe { Arc::from_raw(optr as *const RawOp<T>) });
+        if live::claim(optr as usize) {
+            drop(unsafe { Arc::from_raw(optr as *const RawOp<T>) });
+        }
     }
 
     /// Run the operation's start routine.
@@ -442,27 +486,35 @@ impl<T: OpCode> Key<T> {
 
 /// Deliver a completion to the operation that owns `optr`.
 ///
-/// Returns `false` if the packet does not carry our magic tag, which indicates
-/// corruption or a mis-attributed packet rather than a routine occurrence.
+/// Returns `false` if the packet is not ours — which is a routine occurrence,
+/// not an error: the completion key is set per handle, so any overlapped call
+/// the caller makes on a registered handle produces a packet carrying it.
+///
+/// Ownership is decided by looking the address up in the set of allocations the
+/// kernel currently owns, **before** anything is dereferenced. A foreign
+/// `OVERLAPPED` is therefore never read through, which matters because it may
+/// sit at the end of a page.
 ///
 /// # Safety
 ///
-/// The caller must already have established that this packet belongs to this
-/// crate — the driver does so from the completion key it set when associating
-/// the handle. `optr` must be a pointer produced by [`Key::leak`] whose leaked
-/// reference has not been reclaimed.
-///
-/// The magic check performed here is defence in depth against corruption, not a
-/// validity oracle: reading it requires `optr` to already point at a live
-/// [`RawOp`] allocation.
+/// `optr` may be any pointer, including one this crate has never seen. It is
+/// only dereferenced once membership has been established.
 pub(crate) unsafe fn dispatch_completion(optr: *mut OVERLAPPED, result: Result<usize>) -> bool {
     if optr.is_null() {
         return false;
     }
-    // SAFETY: the caller guarantees `optr` points at one of our allocations, so
-    // the header is in bounds.
+    // Address-based ownership test. Claiming also guarantees exactly one
+    // dispatcher acts on this allocation.
+    if !live::claim(optr as usize) {
+        return false;
+    }
+
+    // SAFETY: the address was registered by `Key::leak` and has not been
+    // reclaimed, so it points at a live `RawOp` allocation and the header is in
+    // bounds.
     let header = unsafe { read_header(optr) };
     if header.0 != OP_MAGIC {
+        debug_assert!(false, "operation allocation header is corrupt");
         return false;
     }
     unsafe { (header.1.complete)(optr, result) };
@@ -496,6 +548,10 @@ mod tests {
     }
 
     unsafe impl OpCode for NoopOp {
+        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+            None
+        }
+
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }
@@ -506,6 +562,10 @@ mod tests {
     }
 
     unsafe impl OpCode for BigOp {
+        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+            None
+        }
+
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }
@@ -518,6 +578,10 @@ mod tests {
     struct ObservingOp;
 
     unsafe impl OpCode for ObservingOp {
+        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+            None
+        }
+
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }

@@ -30,6 +30,10 @@
 //! }
 //!
 //! unsafe impl OpCode for MyOp {
+//!     // Required: says whether a completion packet can follow an inline
+//!     // success. `None` means this operation never completes inline.
+//!     fn handle(&self) -> Option<HANDLE> { None }
+//!
 //!     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<windows::core::Result<usize>> {
 //!         // Call the overlapped API here, deriving every pointer from `self`.
 //!         unsafe { win32_result(false, optr) }

@@ -89,15 +89,18 @@ unsafe extern "system" fn wait_callback(context: *mut core::ffi::c_void, timed_o
     if context.is_null() {
         return;
     }
-    // Reclaim the reference leaked at registration. `WT_EXECUTEONLYONCE` means
-    // this runs at most once.
-    let ctx = unsafe { Arc::from_raw(context as *const WaitContext) };
+    // Never unwind across this boundary; the ABI is not `-unwind`.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Reclaim the reference leaked at registration. `WT_EXECUTEONLYONCE`
+        // means this runs at most once.
+        let ctx = unsafe { Arc::from_raw(context as *const WaitContext) };
 
-    // The wait is registered with an infinite timeout, so a timeout here would
-    // mean the registration was misconfigured.
-    debug_assert!(!timed_out, "an infinite wait cannot time out");
+        // The wait uses an infinite timeout, so a timeout here would mean the
+        // registration was misconfigured.
+        debug_assert!(!timed_out, "an infinite wait cannot time out");
 
-    ctx.post_once();
+        ctx.post_once();
+    }));
 }
 
 /// Waits for a handle to become signalled.
@@ -149,6 +152,13 @@ impl WaitForHandle {
 unsafe impl OpCode for WaitForHandle {
     fn op_type(&self) -> OpType {
         OpType::Event(self.target)
+    }
+
+    /// `None`: a wait never completes inline. `operate` either registers the
+    /// wait and returns pending, or fails outright, so the question of a
+    /// following completion packet does not arise.
+    fn handle(&self) -> Option<HANDLE> {
+        None
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {

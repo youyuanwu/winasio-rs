@@ -89,6 +89,11 @@ struct FailingOp {
 }
 
 unsafe impl OpCode for FailingOp {
+    /// `None`: this never starts, so no completion packet can follow.
+    fn handle(&self) -> Option<HANDLE> {
+        None
+    }
+
     unsafe fn operate(
         &mut self,
         _optr: *mut windows::Win32::System::IO::OVERLAPPED,
@@ -148,7 +153,7 @@ struct SoakConfig {
     seed: u64,
 }
 
-fn soak_own_port(cfg: &SoakConfig) {
+fn soak_own_port(cfg: &SoakConfig) -> (usize, usize) {
     let file = TempFile::create(w!("sk1"));
     let seeder = TempFile::create(w!("sk0"));
     seed_file(seeder.handle);
@@ -222,9 +227,10 @@ fn soak_own_port(cfg: &SoakConfig) {
         "every operation reached a terminal outcome (seed {})",
         cfg.seed
     );
+    (submitted, abandoned)
 }
 
-fn soak_thread_pool(cfg: &SoakConfig) {
+fn soak_thread_pool(cfg: &SoakConfig) -> (usize, usize) {
     let file = TempFile::create(w!("sk2"));
     // A handle can only ever be registered once, so seed through the same
     // registration the soak will use.
@@ -234,6 +240,7 @@ fn soak_thread_pool(cfg: &SoakConfig) {
     let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x5555);
     let started = Instant::now();
     let mut submitted = 0usize;
+    let mut abandoned = 0usize;
 
     // Keep going until both the operation count and the duration floor are
     // satisfied. The elapsed-time guard is generous so a fast machine still
@@ -245,8 +252,11 @@ fn soak_thread_pool(cfg: &SoakConfig) {
             }));
             let out = poll_once(&mut fut).expect("a failed start resolves immediately");
             assert!(out.is_err());
+            RESOLVED.fetch_add(1, Ordering::Relaxed);
         } else if rng.random_bool((cfg.abandon_low + cfg.abandon_high) / 2.0) {
             drop(pool.submit(ReadAt::new(file.handle, 0, Vec::with_capacity(4096))));
+            abandoned += 1;
+            ABANDONED.fetch_add(1, Ordering::Relaxed);
         } else {
             let mut fut =
                 Box::pin(pool.submit(ReadAt::new(file.handle, 0, Vec::with_capacity(4096))));
@@ -255,12 +265,23 @@ fn soak_thread_pool(cfg: &SoakConfig) {
                 std::thread::sleep(Duration::from_micros(200));
                 assert!(Instant::now() < deadline, "operation stalled");
             }
+            RESOLVED.fetch_add(1, Ordering::Relaxed);
         }
         submitted += 1;
     }
 
+    let ratio = abandoned as f64 / submitted as f64;
+    assert!(
+        ratio >= cfg.abandon_low && ratio <= cfg.abandon_high,
+        "abandonment ratio {ratio:.3} outside [{}, {}] (seed {})",
+        cfg.abandon_low,
+        cfg.abandon_high,
+        cfg.seed
+    );
+
     // Dropping the registration cancels and drains everything outstanding.
     drop(pool);
+    (submitted, abandoned)
 }
 
 fn seed_via_pool(pool: &ThreadPoolIo, handle: HANDLE) {
@@ -331,10 +352,36 @@ fn soak_full_both_backends() {
         seed,
     };
 
+    RESOLVED.store(0, Ordering::SeqCst);
+    ABANDONED.store(0, Ordering::SeqCst);
+
     let started = Instant::now();
-    soak_own_port(&cfg);
-    soak_thread_pool(&cfg);
+    let (sub_a, aband_a) = soak_own_port(&cfg);
+    let (sub_b, aband_b) = soak_thread_pool(&cfg);
     let elapsed = started.elapsed();
+
+    let submitted = sub_a + sub_b;
+    let abandoned = aband_a + aband_b;
+    let resolved = RESOLVED.load(Ordering::SeqCst);
+
+    assert!(
+        submitted >= 2 * cfg.operations,
+        "each backend must run at least {} operations, got {submitted} total",
+        cfg.operations
+    );
+    // Every operation reached exactly one terminal outcome: delivered to its
+    // caller, or released after abandonment.
+    assert_eq!(
+        resolved + abandoned,
+        submitted,
+        "terminal outcomes ({resolved} resolved + {abandoned} abandoned) must equal \
+         submissions ({submitted})"
+    );
+    assert_eq!(
+        ABANDONED.load(Ordering::SeqCst),
+        abandoned,
+        "abandonment accounting must agree across backends"
+    );
 
     assert!(
         elapsed >= Duration::from_secs(30),
@@ -344,10 +391,7 @@ fn soak_full_both_backends() {
 
     wait_for_baseline(baseline);
     println!(
-        "soak complete: {} resolved, {} abandoned, {:?}",
-        RESOLVED.load(Ordering::Relaxed),
-        ABANDONED.load(Ordering::Relaxed),
-        elapsed
+        "soak complete: {submitted} submitted = {resolved} resolved + {abandoned} abandoned, {elapsed:?}"
     );
 }
 

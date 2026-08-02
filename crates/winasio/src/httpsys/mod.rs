@@ -1,5 +1,6 @@
 pub mod ops;
 
+use std::marker::PhantomPinned;
 use std::pin::Pin;
 
 use windows::{
@@ -154,12 +155,23 @@ impl Drop for UrlGroup<'_> {
     }
 }
 
-// request wrapper
+/// A received HTTP request.
+///
+/// HTTP.sys treats this whole struct as one buffer: it writes the URL, headers
+/// and entity metadata into `buff` and stores pointers to that region inside
+/// `raw`. Moving the value would dangle every one of those pointers, so a
+/// received request is only ever handed back as `Pin<Box<Request>>`.
+///
+/// The [`PhantomPinned`] is what makes that guarantee real. Without it the type
+/// would be [`Unpin`], and safe code could call `Pin::into_inner` to move the
+/// value straight back out.
 #[repr(C)]
 pub struct Request {
     raw: HTTP_REQUEST_V2,
     // additional buffer
     buff: [u8; 1024],
+    /// Opts out of `Unpin`; see the type docs.
+    _pin: PhantomPinned,
 }
 
 impl Default for Request {
@@ -167,12 +179,23 @@ impl Default for Request {
         Request {
             raw: HTTP_REQUEST_V2::default(),
             buff: [0; 1024],
+            _pin: PhantomPinned,
         }
     }
 }
 
 impl Request {
-    pub fn raw(&mut self) -> &mut HTTP_REQUEST_V2 {
+    /// Mutable access to the parsed header.
+    ///
+    /// # Safety
+    ///
+    /// After a request has been received, `raw` holds pointers into this
+    /// allocation's inline buffer. Overwriting them -- for instance with
+    /// `mem::replace` or `HTTP_REQUEST_V2::default()` -- leaves
+    /// [`Request::raw_ref`] consumers dereferencing arbitrary values.
+    ///
+    /// Callers must not invalidate those pointers.
+    pub unsafe fn raw_mut(&mut self) -> &mut HTTP_REQUEST_V2 {
         &mut self.raw
     }
 

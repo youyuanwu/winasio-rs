@@ -8,9 +8,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use windows::core::Result;
@@ -224,6 +225,73 @@ impl Proactor {
     pub fn pending_count(&self) -> usize {
         self.inner.pending.borrow().len()
     }
+
+    /// Drive this proactor until `fut` resolves, and return its output.
+    ///
+    /// The caller-driven backend needs someone to call [`poll`](Proactor::poll);
+    /// this is that someone, for the common case of awaiting one operation
+    /// without bringing in a runtime.
+    ///
+    /// ```no_run
+    /// # use winasio::iocp::{Proactor, ReadAt};
+    /// # use windows::Win32::Foundation::HANDLE;
+    /// # fn example(handle: HANDLE) -> windows::core::Result<()> {
+    /// let proactor = Proactor::new()?;
+    /// proactor.attach(handle).map_err(windows::core::Error::from)?;
+    ///
+    /// let out = proactor.block_on(
+    ///     proactor.submit(ReadAt::new(handle, 0, Vec::with_capacity(4096)))
+    /// );
+    /// let (result, buffer) = out.into_inner_parts();
+    /// # let _ = (result, buffer);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Being single-threaded, this only makes progress on operations submitted
+    /// to *this* proactor. Use a real runtime, or the thread-pool backend, when
+    /// awaiting anything else concurrently.
+    pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        loop {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+            // Block until something completes. A no-op waker is sound here
+            // because the only thing that can advance the future is a
+            // completion, and dispatching one is exactly what `poll` does.
+            match self.poll(Some(Duration::from_millis(50))) {
+                Ok(_) => {}
+                Err(_) => {
+                    // Keep polling the future so a already-stored result is
+                    // still observed, then give up.
+                    if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                        return out;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+/// A waker that does nothing.
+///
+/// [`Proactor::block_on`] re-polls after every completion batch rather than
+/// relying on notification, so it needs no real waker.
+fn noop_waker() -> Waker {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(std::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: every function in the vtable is a no-op and the data pointer is
+    // never dereferenced.
+    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
 impl ProactorInner {
@@ -266,6 +334,11 @@ impl ProactorInner {
     }
 
     /// Cancel everything in flight and drain their completions.
+    ///
+    /// This must not give up: the port cannot be closed while Windows still
+    /// holds `OVERLAPPED` pointers into allocations that are about to be
+    /// released. `CancelIoEx` guarantees every outstanding operation produces a
+    /// completion, so this terminates.
     fn shutdown(&self) {
         // Take the closures out before calling them, so no borrow is live.
         let cancels: Vec<CancelFn> = self.pending.borrow_mut().drain().map(|(_, c)| c).collect();
@@ -277,22 +350,27 @@ impl ProactorInner {
             return;
         }
 
-        // Drain the cancellations. Without this the port would close while
-        // Windows still holds pointers into allocations about to be released.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let mut warned = false;
         let mut drained = 0usize;
         while drained < outstanding {
             match self.poll(Some(Duration::from_millis(50))) {
                 Ok(n) => drained += n,
-                Err(_) => break,
+                Err(_) => {
+                    // The port itself failed. Nothing further can be drained,
+                    // and continuing would spin forever.
+                    break;
+                }
             }
-            if std::time::Instant::now() > deadline {
-                // Cannot panic here: this runs in `Drop`.
+            // Surface a stall rather than dying quietly, but keep waiting: the
+            // alternative is releasing memory the kernel still points at.
+            if !warned && started.elapsed() > Duration::from_secs(10) {
+                warned = true;
                 eprintln!(
-                    "winasio: timed out draining {} outstanding IOCP completion(s) at shutdown",
+                    "winasio: still draining {} IOCP completion(s) at shutdown \
+                     after 10s; the handle may be stalled",
                     outstanding - drained
                 );
-                break;
             }
         }
     }
@@ -324,6 +402,10 @@ mod tests {
     static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe impl OpCode for InlineOp {
+        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+            None
+        }
+
         // No handle reported: the driver must assume no packet follows.
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Ready(self.outcome.clone())

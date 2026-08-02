@@ -99,12 +99,15 @@ unsafe extern "system" fn io_callback(
         ))
     };
 
-    // SAFETY: this callback fires only for operations started through this
-    // registration, so `optr` refers to a live operation allocation whose
-    // leaked reference has not been reclaimed. No state outside the operation
-    // itself is touched, so nothing here depends on the registration still
-    // being alive.
-    unsafe { dispatch_completion(optr, result) };
+    // Never unwind across this boundary: the ABI is not `-unwind`, so a panic
+    // escaping here aborts the process from a pool thread the user cannot
+    // observe. `on_complete` is user code and may panic.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `dispatch_completion` establishes ownership by address before
+        // dereferencing, so a packet from an unrelated overlapped call on this
+        // handle is ignored rather than read through.
+        unsafe { dispatch_completion(optr, result) };
+    }));
 }
 
 impl ThreadPoolIo {
@@ -162,8 +165,18 @@ impl ThreadPoolIo {
         // pool ignore the completion and corrupt memory.
         unsafe { StartThreadpoolIo(self.inner.io) };
 
+        // If `operate` unwinds, the start above must still be balanced --
+        // otherwise the pool's pending-I/O count is left raised for an I/O that
+        // will never complete, and teardown blocks forever.
+        let guard = StartGuard {
+            io: self.inner.io,
+            armed: true,
+        };
+
         // SAFETY: called once, before the operation is in flight.
         let started = unsafe { key.operate() };
+        let mut guard = guard;
+        guard.armed = false;
 
         match started {
             Poll::Pending => Submit::pending(key),
@@ -188,6 +201,22 @@ impl ThreadPoolIo {
                     Submit::pending(key)
                 }
             }
+        }
+    }
+}
+
+/// Balances `StartThreadpoolIo` if the operation's start panics.
+struct StartGuard {
+    io: PTP_IO,
+    armed: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Unwinding out of `operate`. Release the pool's pending-I/O count
+            // so teardown is not blocked on an I/O that never began.
+            unsafe { CancelThreadpoolIo(self.io) };
         }
     }
 }
