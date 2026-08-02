@@ -5,6 +5,7 @@
 // ------------------------------------------------------------
 
 pub mod httpsys;
+pub mod iocp;
 pub mod winhttp;
 
 pub mod sys;

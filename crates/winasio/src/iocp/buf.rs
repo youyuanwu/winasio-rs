@@ -1,0 +1,208 @@
+// ------------------------------------------------------------
+// Copyright 2023 Youyuan Wu
+// Licensed under the MIT License (MIT). See License.txt in the repo root for
+// license information.
+// ------------------------------------------------------------
+
+//! Buffer traits for operations whose payload is a byte buffer.
+//!
+//! These are a convenience, **not** a requirement of [`OpCode`](super::OpCode).
+//! Many Windows APIs fill a caller-allocated structure rather than a byte slice
+//! — `AcceptEx`, `DeviceIoControl`, and the HTTP Server API among them — and
+//! those operations simply own their structure directly.
+
+use std::ops::{Deref, DerefMut};
+
+/// A stable, owned buffer that can be read from.
+///
+/// # Safety
+///
+/// * [`stable_ptr`](IoBuf::stable_ptr) must return the same address for as long
+///   as the buffer is owned by an operation, even if the buffer value itself is
+///   moved. This is why `Vec<u8>` qualifies and a fixed-size array does not:
+///   moving an array moves its bytes.
+/// * [`bytes_init`](IoBuf::bytes_init) must not exceed the allocation length.
+pub unsafe trait IoBuf: 'static {
+    /// Address of the first byte. Stable across moves of `self`.
+    fn stable_ptr(&self) -> *const u8;
+
+    /// Number of initialised bytes available to read.
+    fn bytes_init(&self) -> usize;
+}
+
+/// A stable, owned buffer that can be written into.
+///
+/// # Safety
+///
+/// In addition to [`IoBuf`]'s requirements:
+///
+/// * [`stable_mut_ptr`](IoBufMut::stable_mut_ptr) must return the same address
+///   as [`IoBuf::stable_ptr`].
+/// * [`bytes_total`](IoBufMut::bytes_total) must not exceed the allocation
+///   length, since Windows may write that many bytes.
+/// * [`set_init`](IoBufMut::set_init) must make the first `len` bytes readable.
+pub unsafe trait IoBufMut: IoBuf {
+    /// Mutable address of the first byte. Stable across moves of `self`.
+    fn stable_mut_ptr(&mut self) -> *mut u8;
+
+    /// Capacity available for Windows to write into.
+    fn bytes_total(&self) -> usize;
+
+    /// Record how many bytes Windows actually initialised.
+    ///
+    /// # Safety
+    ///
+    /// The first `len` bytes must genuinely have been initialised, and `len`
+    /// must not exceed [`bytes_total`](IoBufMut::bytes_total).
+    unsafe fn set_init(&mut self, len: usize);
+}
+
+unsafe impl IoBuf for Vec<u8> {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+}
+
+unsafe impl IoBufMut for Vec<u8> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.capacity()
+    }
+
+    unsafe fn set_init(&mut self, len: usize) {
+        debug_assert!(len <= self.capacity());
+        unsafe { self.set_len(len) };
+    }
+}
+
+unsafe impl IoBuf for Box<[u8]> {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+}
+
+unsafe impl IoBufMut for Box<[u8]> {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn bytes_total(&self) -> usize {
+        self.len()
+    }
+
+    unsafe fn set_init(&mut self, _len: usize) {
+        // A boxed slice is fully initialised on creation; length cannot change.
+    }
+}
+
+unsafe impl IoBuf for &'static [u8] {
+    fn stable_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len()
+    }
+}
+
+/// The result of an operation, paired with the state handed back to the caller.
+///
+/// Both success and failure return the state, so a failed write does not consume
+/// the buffer that was being written.
+#[derive(Debug)]
+#[must_use = "the operation's state is returned here and would otherwise be dropped"]
+pub struct BufResult<T, S> {
+    /// What the operation produced.
+    pub result: windows::core::Result<T>,
+    /// The operation's state, returned to the caller either way.
+    pub state: S,
+}
+
+impl<T, S> BufResult<T, S> {
+    /// Pair a result with the state it belongs to.
+    pub fn new(result: windows::core::Result<T>, state: S) -> Self {
+        Self { result, state }
+    }
+
+    /// Split into the result and the state.
+    pub fn into_parts(self) -> (windows::core::Result<T>, S) {
+        (self.result, self.state)
+    }
+
+    /// Discard the state and keep only the result.
+    pub fn into_result(self) -> windows::core::Result<T> {
+        self.result
+    }
+
+    /// Apply a function to the state, keeping the result.
+    pub fn map_state<U>(self, f: impl FnOnce(S) -> U) -> BufResult<T, U> {
+        BufResult {
+            result: self.result,
+            state: f(self.state),
+        }
+    }
+}
+
+impl<T, S> Deref for BufResult<T, S> {
+    type Target = windows::core::Result<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
+
+impl<T, S> DerefMut for BufResult<T, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vec_buffer_reports_capacity_and_init() {
+        let mut v: Vec<u8> = Vec::with_capacity(64);
+        assert_eq!(v.bytes_total(), 64);
+        assert_eq!(v.bytes_init(), 0);
+        let ptr = v.stable_mut_ptr();
+        assert!(!ptr.is_null());
+        unsafe { v.set_init(10) };
+        assert_eq!(v.bytes_init(), 10);
+    }
+
+    #[test]
+    fn vec_pointer_is_stable_across_move() {
+        let v: Vec<u8> = Vec::with_capacity(32);
+        let before = v.stable_ptr();
+        let moved = v;
+        // Moving the Vec moves only the three-word header; the heap block,
+        // which is what Windows is given, does not move.
+        assert_eq!(before, moved.stable_ptr());
+    }
+
+    #[test]
+    fn buf_result_returns_state_on_error() {
+        let br: BufResult<usize, Vec<u8>> = BufResult::new(
+            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                -1,
+            ))),
+            vec![1, 2, 3],
+        );
+        let (result, state) = br.into_parts();
+        assert!(result.is_err());
+        assert_eq!(state, vec![1, 2, 3]);
+    }
+}
