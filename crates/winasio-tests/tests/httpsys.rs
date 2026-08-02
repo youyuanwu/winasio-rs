@@ -57,7 +57,7 @@ mod tests {
         let out = queue
             .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, resp)
             .await;
-        if let Err(e) = out.as_result() {
+        if let Err(e) = &out.0 {
             println!("send resp failed: {e:?}");
         }
     }

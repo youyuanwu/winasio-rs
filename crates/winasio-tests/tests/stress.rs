@@ -136,7 +136,7 @@ fn seed_file(handle: HANDLE) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(r) = poll_once(&mut fut) {
-            r.into_result().unwrap();
+            r.into_parts().0.unwrap();
             break;
         }
         proactor.poll(Some(Duration::from_millis(5))).unwrap();
@@ -178,7 +178,7 @@ fn soak_own_port(cfg: &SoakConfig) -> (usize, usize) {
                 buffer: vec![0u8; 32],
             }));
             let out = poll_once(&mut fut).expect("a failed start resolves immediately");
-            assert!(out.is_err());
+            assert!(out.0.is_err());
             RESOLVED.fetch_add(1, Ordering::Relaxed);
         } else if abandon {
             // Submit and immediately drop, without awaiting.
@@ -251,7 +251,7 @@ fn soak_thread_pool(cfg: &SoakConfig) -> (usize, usize) {
                 buffer: vec![0u8; 32],
             }));
             let out = poll_once(&mut fut).expect("a failed start resolves immediately");
-            assert!(out.is_err());
+            assert!(out.0.is_err());
             RESOLVED.fetch_add(1, Ordering::Relaxed);
         } else if rng.random_bool((cfg.abandon_low + cfg.abandon_high) / 2.0) {
             drop(pool.submit(ReadAt::new(file.handle, 0, Vec::with_capacity(4096))));
@@ -289,7 +289,7 @@ fn seed_via_pool(pool: &ThreadPoolIo, handle: HANDLE) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(r) = poll_once(&mut fut) {
-            r.into_result().unwrap();
+            r.into_parts().0.unwrap();
             break;
         }
         std::thread::sleep(Duration::from_millis(1));

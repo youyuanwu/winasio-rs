@@ -19,7 +19,7 @@ use windows::{
     },
 };
 
-use crate::iocp::{BufResult, Submit, ThreadPoolIo};
+use crate::iocp::{OpResult, Submit, ThreadPoolIo};
 pub use ops::{ReceiveRequest, SendResponse};
 
 static G_HTTP_VERSION: HTTPAPI_VERSION = HTTPAPI_VERSION {
@@ -324,7 +324,7 @@ impl RequestQueue {
         &self,
         requestid: u64,
         flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-    ) -> BufResult<usize, Pin<Box<Request>>> {
+    ) -> OpResult<usize, Pin<Box<Request>>> {
         self.receive_request(requestid, flags)
             .await
             .map_state(|op| {
@@ -339,7 +339,7 @@ impl RequestQueue {
         requestid: u64,
         flags: u32,
         response: Response,
-    ) -> BufResult<usize, Response> {
+    ) -> OpResult<usize, Response> {
         self.send_response(requestid, flags, response)
             .await
             .map_state(|op| {

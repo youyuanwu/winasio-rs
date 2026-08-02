@@ -385,7 +385,7 @@ impl Drop for Proactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iocp::buf::BufResult;
+    use crate::iocp::buf::OpResult;
     use crate::iocp::op::IntoInner;
     use crate::iocp::ops::ReadAt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -474,7 +474,7 @@ mod tests {
             "nothing is tracked when no packet is expected"
         );
 
-        let out: BufResult<usize, InlineOp> = block_on(submitted);
+        let out: OpResult<usize, InlineOp> = block_on(submitted);
         let (result, (buf, seen)) = out.into_inner_parts();
         assert_eq!(result.unwrap(), 17, "the transferred count survives");
         assert_eq!(buf, vec![1, 2, 3], "the buffer comes back");
@@ -506,7 +506,7 @@ mod tests {
         });
         assert_eq!(proactor.pending_count(), 0);
 
-        let out: BufResult<usize, InlineOp> = block_on(submitted);
+        let out: OpResult<usize, InlineOp> = block_on(submitted);
         let (result, (buf, _)) = out.into_inner_parts();
         assert!(result.is_err(), "the failure surfaces");
         assert_eq!(buf, vec![9, 9], "state comes back on failure too");

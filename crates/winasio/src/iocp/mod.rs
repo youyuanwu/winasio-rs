@@ -67,8 +67,12 @@
 //!
 //! # Ownership and cancellation
 //!
-//! Submitting an operation transfers its state to the driver. If the awaiting
-//! future is dropped before completion:
+//! Submitting an operation transfers its state to the driver. An operation
+//! resolves to an [`OpResult`], which carries the result **and** the state that
+//! was handed in — buffer or otherwise — so a failed write does not consume the
+//! buffer it was writing.
+//!
+//! If the awaiting future is dropped before completion:
 //!
 //! * cancellation is requested immediately;
 //! * **the state is not returned to the caller** — the buffer is lost;
@@ -90,7 +94,7 @@ mod proactor;
 mod raw;
 mod threadpool;
 
-pub use buf::{BufResult, IoBuf, IoBufMut};
+pub use buf::{IoBuf, IoBufMut, OpResult};
 pub use future::Submit;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
 pub use ops::{ReadAt, SendHandle, WaitForHandle, WriteAt};

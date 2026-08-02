@@ -150,7 +150,7 @@ fn zero_byte_read_at_eof_is_a_successful_terminal_outcome() {
         &proactor,
         proactor.submit(WriteAt::new(file.handle, 0, payload)),
     );
-    assert_eq!(w.into_result().unwrap(), n);
+    assert_eq!(w.into_parts().0.unwrap(), n);
 
     let buf: Vec<u8> = Vec::with_capacity(16);
     let r = drive(

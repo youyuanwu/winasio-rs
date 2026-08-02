@@ -61,7 +61,7 @@ fn a_wait_completes_when_the_handle_is_signalled() {
         proactor.poll(Some(Duration::from_millis(5))).unwrap();
         assert!(Instant::now() < deadline, "the wait never completed");
     };
-    done.into_result().expect("the wait succeeds");
+    done.into_parts().0.expect("the wait succeeds");
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn a_signalled_handle_completes_promptly() {
         proactor.poll(Some(Duration::from_millis(5))).unwrap();
         assert!(Instant::now() < deadline, "the wait never completed");
     };
-    done.into_result().unwrap();
+    done.into_parts().0.unwrap();
 }
 
 #[test]
@@ -151,7 +151,7 @@ fn many_waits_can_be_outstanding_at_once() {
     while !pending.is_empty() {
         pending.retain_mut(|w| {
             if let Some(out) = poll_once(w) {
-                out.into_result().expect("each wait succeeds");
+                out.into_parts().0.expect("each wait succeeds");
                 resolved += 1;
                 false
             } else {
