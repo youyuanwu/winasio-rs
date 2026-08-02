@@ -48,6 +48,10 @@ pub enum OpType {
 ///   or into values that may later move, are undefined behaviour.
 /// * `operate` must actually initiate the operation using the `optr` it is given,
 ///   and must not retain `optr` beyond the call.
+/// * If `operate` can return `Poll::Ready(Ok(_))` — completing inline — and the
+///   handle it used does not have `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set,
+///   then [`OpCode::handle`] must return that handle. Otherwise the driver will
+///   release the operation while Windows is still holding a pointer to it.
 /// * `cancel` must request cancellation of the operation started by `operate`
 ///   (normally `CancelIoEx`) and must not free anything.
 /// * The implementor must not assume `cancel` prevents completion. Cancellation
@@ -59,6 +63,20 @@ pub unsafe trait OpCode: 'static {
     /// How this operation completes. Defaults to a true overlapped operation.
     fn op_type(&self) -> OpType {
         OpType::Overlapped
+    }
+
+    /// Whether this operation may complete inline, and on which handle.
+    ///
+    /// The driver needs this to decide, after [`OpCode::operate`] returns
+    /// `Poll::Ready(Ok(_))`, whether a completion packet is *also* coming: that
+    /// depends on whether the handle skips the completion port on success.
+    ///
+    /// Returning `None` means "assume no packet". An operation that can complete
+    /// inline on a handle which does **not** skip the port must return its
+    /// handle here, or the driver will reclaim the operation while Windows still
+    /// holds a pointer to it.
+    fn handle(&self) -> Option<HANDLE> {
+        None
     }
 
     /// Start the operation.
@@ -121,9 +139,19 @@ pub trait IntoInner {
 /// Converts a Win32 success flag into the [`Poll`] result `operate` must return,
 /// treating `ERROR_IO_PENDING` as "started asynchronously".
 ///
-/// Most `operate` implementations end with a call to this.
-pub fn win32_result(started_ok: bool, transferred: usize) -> Poll<Result<usize>> {
+/// On inline success the transferred count is read from the `OVERLAPPED`'s
+/// `InternalHigh` field, which Windows fills in for a synchronously completed
+/// operation. Callers must not perform any other Windows call between the API
+/// they are wrapping and this function, since it inspects the thread's last
+/// error.
+///
+/// # Safety
+///
+/// `optr` must be the pointer that was passed to the wrapped API.
+pub unsafe fn win32_result(started_ok: bool, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
     if started_ok {
+        // Completed inline; Windows recorded the byte count in the OVERLAPPED.
+        let transferred = unsafe { (*optr).InternalHigh };
         return Poll::Ready(Ok(transferred));
     }
     let err = Error::from_thread();

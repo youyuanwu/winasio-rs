@@ -8,19 +8,20 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use windows::core::Result;
 
 use super::buf::BufResult;
 use super::op::OpCode;
-use super::proactor::ProactorInner;
 use super::raw::Key;
 
 /// An in-flight operation.
 ///
 /// Resolves to the operation's result paired with the state it owned.
+///
+/// This is [`Send`] whenever `T` is, so it can be awaited on any runtime. It
+/// deliberately holds no reference to the backend that produced it.
 ///
 /// # Dropping before completion
 ///
@@ -36,18 +37,13 @@ pub struct Submit<T: OpCode> {
     key: Option<Key<T>>,
     /// Result captured when the operation completed inline.
     inline: Option<Result<usize>>,
-    /// Present only for operations tracked by a caller-driven proactor.
-    proactor: Option<Rc<ProactorInner>>,
-    token: usize,
 }
 
 impl<T: OpCode> Submit<T> {
-    pub(crate) fn pending(key: Key<T>, proactor: Option<Rc<ProactorInner>>, token: usize) -> Self {
+    pub(crate) fn pending(key: Key<T>) -> Self {
         Submit {
             key: Some(key),
             inline: None,
-            proactor,
-            token,
         }
     }
 
@@ -55,8 +51,6 @@ impl<T: OpCode> Submit<T> {
         Submit {
             key: Some(key),
             inline: Some(result),
-            proactor: None,
-            token: 0,
         }
     }
 
@@ -69,11 +63,10 @@ impl<T: OpCode> Submit<T> {
         let key = self.key.take().expect("operation resolved twice");
         match key.try_into_op() {
             Ok(op) => BufResult::new(result, op),
-            Err(_shared) => {
-                // The completion path still held a reference. This is
-                // vanishingly rare and only costs the returned state.
-                unreachable!("operation state was still shared at completion")
-            }
+            Err(_still_shared) => unreachable!(
+                "operation state was still shared after completion; the completion \
+                 path releases its reference before waking"
+            ),
         }
     }
 }
@@ -95,12 +88,7 @@ impl<T: OpCode> Future for Submit<T> {
         key.set_waker(cx.waker());
 
         match key.take_result() {
-            Some(result) => {
-                if let Some(p) = this.proactor.as_ref() {
-                    p.forget(this.token);
-                }
-                Poll::Ready(this.finish(result))
-            }
+            Some(result) => Poll::Ready(this.finish(result)),
             None => Poll::Pending,
         }
     }
@@ -116,12 +104,10 @@ impl<T: OpCode> Drop for Submit<T> {
             return;
         }
         if key.abandon() {
-            // Still in flight. Ask Windows to cancel; the completion will
-            // arrive regardless and is what finally releases the allocation.
+            // Still in flight. Ask Windows to cancel; the completion arrives
+            // regardless and is what finally releases the allocation. The
+            // driver removes its bookkeeping entry when that packet lands.
             let _ = key.cancel();
-        }
-        if let Some(p) = self.proactor.as_ref() {
-            p.forget(self.token);
         }
         // Dropping `key` releases only this reference. The kernel's leaked
         // reference keeps the allocation alive until the completion lands.

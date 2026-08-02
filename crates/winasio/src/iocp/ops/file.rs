@@ -65,6 +65,10 @@ impl<B: IoBufMut> IntoInner for ReadAt<B> {
 }
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
+    fn handle(&self) -> Option<HANDLE> {
+        Some(self.handle.0)
+    }
+
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Offsets live in the OVERLAPPED the caller gave us, which is inside
         // this operation's own allocation.
@@ -81,7 +85,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr, total) };
 
         let ok = unsafe { ReadFile(self.handle.0, Some(slice), None, Some(optr)) }.is_ok();
-        win32_result(ok, 0)
+        unsafe { win32_result(ok, optr) }
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
@@ -90,8 +94,11 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
 
     unsafe fn on_complete(&mut self, result: &Result<usize>) {
         if let Ok(transferred) = result {
+            // Clamp rather than assert: this runs inside the completion path,
+            // where a panic would unwind through a callback.
+            let n = (*transferred).min(self.buffer.bytes_total());
             // SAFETY: Windows reported writing this many bytes into the buffer.
-            unsafe { self.buffer.set_init(*transferred) };
+            unsafe { self.buffer.set_init(n) };
         }
     }
 }
@@ -123,6 +130,10 @@ impl<B: IoBuf> IntoInner for WriteAt<B> {
 }
 
 unsafe impl<B: IoBuf + Send> OpCode for WriteAt<B> {
+    fn handle(&self) -> Option<HANDLE> {
+        Some(self.handle.0)
+    }
+
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         unsafe {
             (*optr).Anonymous.Anonymous.Offset = self.offset as u32;
@@ -136,7 +147,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteAt<B> {
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
         let ok = unsafe { WriteFile(self.handle.0, Some(slice), None, Some(optr)) }.is_ok();
-        win32_result(ok, 0)
+        unsafe { win32_result(ok, optr) }
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {

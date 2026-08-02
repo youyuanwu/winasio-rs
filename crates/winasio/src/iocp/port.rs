@@ -111,6 +111,8 @@ impl CompletionPort {
         Ok(CompletionPort { handle })
     }
 
+    /// The raw port handle. Needed by the thread-pool backend in a later phase.
+    #[allow(dead_code)]
     pub(crate) fn raw(&self) -> HANDLE {
         self.handle
     }

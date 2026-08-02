@@ -219,10 +219,12 @@ unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize
         Ordering::Acquire,
     ) {
         Ok(_) => {
-            // Release the lock before waking: an executor that polls inline on
-            // the waking thread would otherwise re-enter `set_waker` and
-            // deadlock on this non-reentrant mutex.
+            // Take the waker out of the lock, then release *our* reference,
+            // and only then wake. An executor that polls inline on this thread
+            // would otherwise find the allocation still shared and be unable to
+            // reclaim the operation state.
             let waker = arc.waker.lock().unwrap().take();
+            drop(arc);
             if let Some(waker) = waker {
                 waker.wake();
             }
@@ -240,7 +242,6 @@ unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize
             arc.state.store(OpState::Terminal as u32, Ordering::Release);
         }
     }
-    // `arc` drops here, releasing the kernel's reference.
 }
 
 /// An owning handle to an operation allocation.
@@ -325,6 +326,20 @@ impl<T: OpCode> Key<T> {
         self.inner.op.lock().unwrap().op_type()
     }
 
+    /// The handle this operation targets, if it reports one.
+    pub(crate) fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        self.inner.op.lock().unwrap().handle()
+    }
+
+    /// Run the operation's completion hook for a result produced inline.
+    ///
+    /// The completion path does this itself; this is for the synchronous case,
+    /// where no packet is delivered.
+    pub(crate) fn on_complete_inline(&self, result: &Result<usize>) {
+        let mut op = self.inner.op.lock().unwrap();
+        unsafe { op.on_complete(result) };
+    }
+
     /// Install the waker to be signalled on completion.
     pub(crate) fn set_waker(&self, waker: &Waker) {
         let mut slot = self.inner.waker.lock().unwrap();
@@ -400,6 +415,14 @@ impl<T: OpCode> Clone for Key<T> {
         Key {
             inner: Arc::clone(&self.inner),
         }
+    }
+}
+
+#[cfg(test)]
+impl<T: OpCode> Key<T> {
+    /// How many references exist. Test support only.
+    fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 }
 
@@ -748,6 +771,29 @@ mod tests {
             live_operations(),
             before,
             "every allocation must be released exactly once"
+        );
+    }
+
+    #[test]
+    fn completion_releases_its_reference_before_waking() {
+        // The future's `finish` unwraps the allocation to hand back the
+        // operation state. If the completion path still held a reference when
+        // it woke, an executor polling inline would find the allocation shared
+        // and be unable to unwrap it.
+        let key = Key::new(noop(4));
+        let optr = key.leak();
+        assert_eq!(key.strong_count(), 2, "future + kernel");
+
+        unsafe { dispatch_completion(optr, Ok(4)) };
+
+        assert_eq!(
+            key.strong_count(),
+            1,
+            "the completion path must release its reference before waking"
+        );
+        assert!(
+            key.clone().take_result().is_some(),
+            "and the result must be available"
         );
     }
 
