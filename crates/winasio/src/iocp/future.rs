@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use windows::core::Result;
 
-use super::buf::BufResult;
+use super::buf::OpResult;
 use super::op::OpCode;
 use super::raw::Key;
 
@@ -61,7 +61,7 @@ impl<T: OpCode> Submit<T> {
 }
 
 impl<T: OpCode> Future for Submit<T> {
-    type Output = BufResult<usize, T>;
+    type Output = OpResult<usize, T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -69,7 +69,7 @@ impl<T: OpCode> Future for Submit<T> {
         if let Some(result) = this.inline.take() {
             let key = this.key.take().expect("resolved once");
             // Nothing is in flight, so the state can be taken directly.
-            return Poll::Ready(BufResult::new(result, key.take_op_inline()));
+            return Poll::Ready(OpResult(result, key.take_op_inline()));
         }
 
         let key = this.key.as_ref().expect("polled after completion");
@@ -84,7 +84,7 @@ impl<T: OpCode> Future for Submit<T> {
         match key.take_completion() {
             Some((result, op)) => {
                 this.key = None;
-                Poll::Ready(BufResult::new(result, op))
+                Poll::Ready(OpResult(result, op))
             }
             None => Poll::Pending,
         }

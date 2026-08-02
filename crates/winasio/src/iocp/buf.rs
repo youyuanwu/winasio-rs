@@ -122,69 +122,48 @@ unsafe impl IoBuf for &'static [u8] {
     }
 }
 
-/// The result of an operation, paired with the state handed back to the caller.
+/// An operation's result, paired with the state that was handed in.
 ///
-/// Both success and failure return the state, so a failed write does not consume
-/// the buffer that was being written.
+/// The state comes back whether the operation succeeded or failed, so a failed
+/// write does not consume the buffer it was writing.
+///
+/// The state is a buffer only sometimes — a wait carries none, and the HTTP
+/// Server API operations carry a kernel-filled structure — which is why this is
+/// named for the operation rather than the buffer.
+///
+/// Both fields are public, so destructuring is the idiomatic access:
+///
+/// ```
+/// # use winasio::iocp::OpResult;
+/// let outcome: OpResult<usize, Vec<u8>> = OpResult(Ok(3), vec![1, 2, 3]);
+/// let OpResult(result, state) = outcome;
+/// assert_eq!(result.unwrap(), 3);
+/// assert_eq!(state, vec![1, 2, 3]);
+/// ```
 #[derive(Debug)]
 #[must_use = "the operation's state is returned here and would otherwise be dropped"]
-pub struct BufResult<T, S> {
-    /// What the operation produced.
-    pub result: windows::core::Result<T>,
-    /// The operation's state, returned to the caller either way.
-    pub state: S,
-}
+pub struct OpResult<T, S>(pub windows::core::Result<T>, pub S);
 
-impl<T, S> BufResult<T, S> {
-    /// Pair a result with the state it belongs to.
-    pub fn new(result: windows::core::Result<T>, state: S) -> Self {
-        Self { result, state }
-    }
-
+impl<T, S> OpResult<T, S> {
     /// Split into the result and the state.
     pub fn into_parts(self) -> (windows::core::Result<T>, S) {
-        (self.result, self.state)
-    }
-
-    /// Discard the state and keep only the result.
-    pub fn into_result(self) -> windows::core::Result<T> {
-        self.result
+        (self.0, self.1)
     }
 
     /// Apply a function to the state, keeping the result.
-    pub fn map_state<U>(self, f: impl FnOnce(S) -> U) -> BufResult<T, U> {
-        BufResult {
-            result: self.result,
-            state: f(self.state),
-        }
-    }
-
-    /// Borrow the result without consuming the pairing.
-    pub fn as_result(&self) -> &windows::core::Result<T> {
-        &self.result
-    }
-
-    /// Whether the operation succeeded.
-    pub fn is_ok(&self) -> bool {
-        self.result.is_ok()
-    }
-
-    /// Whether the operation failed.
-    pub fn is_err(&self) -> bool {
-        self.result.is_err()
+    pub fn map_state<U>(self, f: impl FnOnce(S) -> U) -> OpResult<T, U> {
+        OpResult(self.0, f(self.1))
     }
 }
 
-impl<T, S: crate::iocp::op::IntoInner> BufResult<T, S> {
+impl<T, S: crate::iocp::op::IntoInner> OpResult<T, S> {
     /// Split into the result and the operation's *meaningful* value — usually
     /// the buffer — rather than the operation struct itself.
+    ///
+    /// Destructuring cannot do this, because it applies
+    /// [`IntoInner`](crate::iocp::IntoInner).
     pub fn into_inner_parts(self) -> (windows::core::Result<T>, S::Inner) {
-        (self.result, self.state.into_inner())
-    }
-
-    /// Discard the result and keep the operation's meaningful value.
-    pub fn into_inner_state(self) -> S::Inner {
-        self.state.into_inner()
+        (self.0, self.1.into_inner())
     }
 }
 
@@ -214,15 +193,22 @@ mod tests {
     }
 
     #[test]
-    fn buf_result_returns_state_on_error() {
-        let br: BufResult<usize, Vec<u8>> = BufResult::new(
+    fn op_result_returns_state_on_error() {
+        let outcome: OpResult<usize, Vec<u8>> = OpResult(
             Err(windows::core::Error::from_hresult(windows::core::HRESULT(
                 -1,
             ))),
             vec![1, 2, 3],
         );
-        let (result, state) = br.into_parts();
+        let (result, state) = outcome.into_parts();
         assert!(result.is_err());
         assert_eq!(state, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn op_result_destructures_directly() {
+        let OpResult(result, state) = OpResult(Ok(7usize), vec![9u8]);
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(state, vec![9]);
     }
 }
