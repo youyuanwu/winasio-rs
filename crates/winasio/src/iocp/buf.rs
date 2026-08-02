@@ -11,7 +11,7 @@
 //! — `AcceptEx`, `DeviceIoControl`, and the HTTP Server API among them — and
 //! those operations simply own their structure directly.
 
-use std::ops::{Deref, DerefMut};
+use std::fmt::Debug;
 
 /// A stable, owned buffer that can be read from.
 ///
@@ -43,6 +43,9 @@ pub unsafe trait IoBuf: 'static {
 /// * [`set_init`](IoBufMut::set_init) must make the first `len` bytes readable.
 pub unsafe trait IoBufMut: IoBuf {
     /// Mutable address of the first byte. Stable across moves of `self`.
+    ///
+    /// A zero-capacity buffer may return a non-null but non-dereferenceable
+    /// pointer; callers must respect [`bytes_total`](IoBufMut::bytes_total).
     fn stable_mut_ptr(&mut self) -> *mut u8;
 
     /// Capacity available for Windows to write into.
@@ -77,7 +80,10 @@ unsafe impl IoBufMut for Vec<u8> {
     }
 
     unsafe fn set_init(&mut self, len: usize) {
-        debug_assert!(len <= self.capacity());
+        assert!(
+            len <= self.capacity(),
+            "set_init past capacity is immediate undefined behaviour"
+        );
         unsafe { self.set_len(len) };
     }
 }
@@ -152,19 +158,20 @@ impl<T, S> BufResult<T, S> {
             state: f(self.state),
         }
     }
-}
 
-impl<T, S> Deref for BufResult<T, S> {
-    type Target = windows::core::Result<T>;
-
-    fn deref(&self) -> &Self::Target {
+    /// Borrow the result without consuming the pairing.
+    pub fn as_result(&self) -> &windows::core::Result<T> {
         &self.result
     }
-}
 
-impl<T, S> DerefMut for BufResult<T, S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.result
+    /// Whether the operation succeeded.
+    pub fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// Whether the operation failed.
+    pub fn is_err(&self) -> bool {
+        self.result.is_err()
     }
 }
 

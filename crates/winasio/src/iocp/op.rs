@@ -92,10 +92,14 @@ pub unsafe trait OpCode: 'static {
     /// Lets an operation read back fields Windows filled in — transferred
     /// lengths, address sizes, flags — while it still has `&mut self`.
     ///
+    /// Called **at most once**: an operation that completes inline from
+    /// [`OpCode::operate`] never produces a completion packet, so this does not
+    /// run for it.
+    ///
     /// # Safety
     ///
-    /// Called exactly once, from the completion path, before the state is
-    /// released or returned.
+    /// Called only from the completion path, before the state is released or
+    /// returned.
     unsafe fn on_complete(&mut self, result: &Result<usize>) {
         let _ = result;
     }

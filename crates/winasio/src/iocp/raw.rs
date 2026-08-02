@@ -25,10 +25,25 @@
 //! hands back *is* the allocation's address. The completion path recovers the
 //! operation by pointer arithmetic; there is no lookup table.
 //!
-//! Fields Windows or a completion callback may write are wrapped in
-//! [`UnsafeCell`], because they are mutated while the allocation is shared
-//! through an [`Arc`]. Code in this module must never construct a `&RawOp<T>`
-//! that spans them.
+//! # Interior mutability
+//!
+//! The allocation is shared through an [`Arc`], yet Windows writes the
+//! `OVERLAPPED` and the operation itself is mutated by `operate`, `cancel`, and
+//! `on_complete`. Those fields therefore live behind [`UnsafeCell`] or a lock;
+//! forming an ordinary `&`/`&mut` to their *contents* outside the exclusivity
+//! windows documented on each accessor is undefined behaviour.
+//!
+//! The operation is guarded by a [`Mutex`] rather than a bare `UnsafeCell`
+//! because `cancel` (called from the future's `Drop`) and `on_complete` (called
+//! from the completion) genuinely can run concurrently. The lock is uncontended
+//! in the common case and is dwarfed by the syscall it accompanies.
+//!
+//! # Publication order
+//!
+//! The completion result is written to its slot **before** the state is
+//! advanced to [`OpState::Completed`]. A thread that observes `Completed` is
+//! therefore guaranteed a written result. Doing this in the other order is a
+//! data race that hands uninitialised memory to the caller.
 
 // The driver in `proactor.rs` and `threadpool.rs` is the only consumer of this
 // module. Until those land, the unit tests are the sole callers, so the
@@ -36,7 +51,7 @@
 #![allow(dead_code)]
 
 use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -44,25 +59,29 @@ use std::task::Waker;
 use windows::core::Result;
 use windows::Win32::System::IO::OVERLAPPED;
 
-use super::op::OpCode;
+use super::op::{OpCode, OpType};
 
-/// Distinguishes our completion packets from anything else that may arrive on a
-/// completion port, including packets posted by unrelated code.
+/// Guards against acting on a packet whose memory has been corrupted or
+/// mis-attributed. Defence in depth: the driver establishes ownership from the
+/// completion key first.
 const OP_MAGIC: u32 = 0x5741_5349; // "WASI"
 
-/// Operation lifecycle. One `AtomicU32`, advanced by compare-exchange, so the
-/// terminal transition happens exactly once no matter how completion and
-/// cancellation interleave.
+/// Operation lifecycle.
+///
+/// Advanced by compare-exchange so the terminal transition happens exactly once
+/// however completion and cancellation interleave. The state never passes
+/// through [`OpState::Completed`] unless a result has already been written.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpState {
     /// In flight; the future is still interested.
     Submitted = 0,
-    /// The future was dropped. A completion is still expected.
+    /// The future was dropped. A completion is still expected, and its result
+    /// will be discarded rather than stored.
     Abandoned = 1,
-    /// A result has been stored and the waker signalled.
+    /// A result has been written and is available to the future.
     Completed = 2,
-    /// The result has been taken by the future, or discarded after abandonment.
+    /// The result has been taken, or discarded after abandonment.
     Terminal = 3,
 }
 
@@ -80,14 +99,15 @@ impl OpState {
 /// Type-erased operations the completion path performs without knowing `T`.
 pub(crate) struct OpVTable {
     /// Store the result, run `on_complete`, and wake the future if any.
-    pub(crate) complete: unsafe fn(*mut OVERLAPPED, Result<usize>),
-    /// Reclaim the leaked reference without completing (used to unwind a
-    /// submission that never actually started).
-    pub(crate) reclaim: unsafe fn(*mut OVERLAPPED),
+    complete: unsafe fn(*mut OVERLAPPED, Result<usize>),
 }
 
-/// Fixed-layout prefix that follows `OVERLAPPED`, letting the completion path
+/// Fixed-layout prefix following `OVERLAPPED`, letting the completion path
 /// dispatch without knowing `T`.
+///
+/// Its offset within [`RawOp`] does not depend on `T`: `#[repr(C)]` places it
+/// at `size_of::<OVERLAPPED>()` rounded up to its own alignment, and the two
+/// alignments coincide on every supported target. The unit tests assert this.
 #[repr(C)]
 pub(crate) struct ErasedHeader {
     magic: u32,
@@ -101,17 +121,18 @@ pub(crate) struct RawOp<T> {
     overlapped: UnsafeCell<OVERLAPPED>,
     header: ErasedHeader,
     state: AtomicU32,
+    /// Only readable once `state` reads [`OpState::Completed`].
     result: UnsafeCell<MaybeUninit<Result<usize>>>,
     waker: Mutex<Option<Waker>>,
-    op: UnsafeCell<T>,
+    /// Locked by `operate`, `cancel`, and `on_complete`, which can race.
+    op: Mutex<T>,
 }
 
-// SAFETY: `OVERLAPPED` contains raw pointers, which makes `RawOp<T>` `!Send` and
-// `!Sync` by inference for every `T`. That inference is too conservative here:
-// the kernel owns the `OVERLAPPED` exclusively between submission and
-// completion, and this crate never aliases it. Access to `op` is serialised by
-// the state machine — `operate` runs before the operation is in flight, and
-// `on_complete` runs only on the single thread that wins the terminal CAS.
+// SAFETY: `OVERLAPPED` contains raw pointers, which makes `RawOp<T>` `!Send`
+// and `!Sync` by inference for every `T`. That inference is too conservative
+// here: the kernel owns the `OVERLAPPED` exclusively between submission and
+// completion and this crate never aliases it, the operation is behind a
+// `Mutex`, and every other mutable field is guarded by the state machine.
 // Bounding on `T: Send` keeps the thread-pool backend's requirement meaningful;
 // a blanket impl would silently erase it.
 unsafe impl<T: Send> Send for RawOp<T> {}
@@ -145,7 +166,8 @@ pub use counter::live_operations;
 
 impl<T> Drop for RawOp<T> {
     fn drop(&mut self) {
-        // If a result was stored but never taken, drop it.
+        // A result that was written but never taken must still be dropped.
+        // `Completed` is the only state in which the slot holds a live value.
         if OpState::from_u32(self.state.load(Ordering::Acquire)) == OpState::Completed {
             unsafe { (*self.result.get()).assume_init_drop() };
         }
@@ -154,67 +176,71 @@ impl<T> Drop for RawOp<T> {
     }
 }
 
-impl<T: OpCode> RawOp<T> {
-    fn vtable() -> &'static OpVTable {
-        trait HasVTable {
-            const VTABLE: OpVTable;
-        }
-        impl<T: OpCode> HasVTable for T {
-            const VTABLE: OpVTable = OpVTable {
-                complete: complete_erased::<T>,
-                reclaim: reclaim_erased::<T>,
-            };
-        }
-        &<T as HasVTable>::VTABLE
+fn vtable_of<T: OpCode>() -> &'static OpVTable {
+    trait HasVTable {
+        const VTABLE: OpVTable;
     }
+    impl<T: OpCode> HasVTable for T {
+        const VTABLE: OpVTable = OpVTable {
+            complete: complete_erased::<T>,
+        };
+    }
+    &<T as HasVTable>::VTABLE
 }
 
-/// Store a completion result and wake the future, if it is still waiting.
+/// Store a completion result and wake the future, if one is still waiting.
 ///
 /// # Safety
 ///
-/// `optr` must have come from [`Key::into_raw`] for an operation of type `T`,
-/// and the leaked reference it represents is consumed here.
+/// `optr` must be a pointer produced by [`Key::leak`] for an operation of type
+/// `T` whose leaked reference has not yet been reclaimed. That reference is
+/// consumed here.
 unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize>) {
-    // Reclaim the reference the kernel held.
+    // Reclaim the reference the kernel held. The allocation cannot be freed
+    // before this function returns, because we now own a strong count.
     let arc: Arc<RawOp<T>> = unsafe { Arc::from_raw(optr as *const RawOp<T>) };
 
-    // Let the operation read back anything Windows filled in. Sole access:
-    // the operation is no longer in flight and only this thread reaches here.
-    unsafe { (*arc.op.get()).on_complete(&result) };
+    // Let the operation read back whatever Windows filled in. The lock makes
+    // this exclusive with respect to a concurrent `cancel` from the future's
+    // `Drop`, which is the one call that can genuinely race us.
+    {
+        let mut op = arc.op.lock().unwrap();
+        unsafe { op.on_complete(&result) };
+    }
 
-    // Claim the terminal transition. Whether the future is still interested
-    // decides if we store the result or discard it.
-    let previous = arc.state.swap(OpState::Completed as u32, Ordering::AcqRel);
-    match OpState::from_u32(previous) {
-        OpState::Submitted => {
-            unsafe { (*arc.result.get()).write(result) };
-            // Publish before waking.
-            if let Some(waker) = arc.waker.lock().unwrap().take() {
+    // Write the result *before* publishing `Completed`. Any thread that
+    // observes `Completed` is then guaranteed to find a written value.
+    unsafe { (*arc.result.get()).write(result) };
+
+    match arc.state.compare_exchange(
+        OpState::Submitted as u32,
+        OpState::Completed as u32,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {
+            // Release the lock before waking: an executor that polls inline on
+            // the waking thread would otherwise re-enter `set_waker` and
+            // deadlock on this non-reentrant mutex.
+            let waker = arc.waker.lock().unwrap().take();
+            if let Some(waker) = waker {
                 waker.wake();
             }
         }
-        OpState::Abandoned => {
-            // Nobody is waiting. Drop the result and mark it taken so `Drop`
-            // does not try to drop it again.
-            drop(result);
+        Err(previous) => {
+            debug_assert_eq!(
+                OpState::from_u32(previous),
+                OpState::Abandoned,
+                "an operation completed twice"
+            );
+            // Nobody is waiting. Take the value straight back out and drop it,
+            // so the state never advertises a result that will not be read.
+            let discarded = unsafe { (*arc.result.get()).assume_init_read() };
+            drop(discarded);
             arc.state.store(OpState::Terminal as u32, Ordering::Release);
-        }
-        OpState::Completed | OpState::Terminal => {
-            debug_assert!(false, "operation completed twice");
-            drop(result);
         }
     }
     // `arc` drops here, releasing the kernel's reference.
-}
-
-/// Reclaim a leaked reference for an operation that never started.
-///
-/// # Safety
-///
-/// Same contract as [`complete_erased`].
-unsafe fn reclaim_erased<T: OpCode>(optr: *mut OVERLAPPED) {
-    drop(unsafe { Arc::from_raw(optr as *const RawOp<T>) });
 }
 
 /// An owning handle to an operation allocation.
@@ -233,20 +259,23 @@ impl<T: OpCode> Key<T> {
                 overlapped: UnsafeCell::new(OVERLAPPED::default()),
                 header: ErasedHeader {
                     magic: OP_MAGIC,
-                    vtable: RawOp::<T>::vtable(),
+                    vtable: vtable_of::<T>(),
                 },
                 state: AtomicU32::new(OpState::Submitted as u32),
                 result: UnsafeCell::new(MaybeUninit::uninit()),
                 waker: Mutex::new(None),
-                op: UnsafeCell::new(op),
+                op: Mutex::new(op),
             }),
         }
     }
 
-    /// The pointer Windows is given. Identical to the allocation's address,
-    /// because `OVERLAPPED` is the first field of a `#[repr(C)]` struct.
+    /// The pointer Windows is given.
+    ///
+    /// Derived from the allocation base so it carries provenance over the whole
+    /// `RawOp`, which the completion path relies on when it reaches fields
+    /// beyond the `OVERLAPPED`.
     pub(crate) fn overlapped_ptr(&self) -> *mut OVERLAPPED {
-        self.inner.overlapped.get()
+        Arc::as_ptr(&self.inner) as *mut OVERLAPPED
     }
 
     /// Leak one reference for the kernel to hold.
@@ -255,8 +284,7 @@ impl<T: OpCode> Key<T> {
     /// can fire before the initiating call returns, and would otherwise try to
     /// reclaim a reference that does not exist yet.
     pub(crate) fn leak(&self) -> *mut OVERLAPPED {
-        let cloned = Arc::clone(&self.inner);
-        Arc::into_raw(cloned) as *mut OVERLAPPED
+        Arc::into_raw(Arc::clone(&self.inner)) as *mut OVERLAPPED
     }
 
     /// Reclaim a reference leaked by [`Key::leak`] for an operation that never
@@ -267,7 +295,7 @@ impl<T: OpCode> Key<T> {
     /// `optr` must be the value returned by a matching [`Key::leak`], and the
     /// operation must not have completed.
     pub(crate) unsafe fn unleak(optr: *mut OVERLAPPED) {
-        unsafe { reclaim_erased::<T>(optr) };
+        drop(unsafe { Arc::from_raw(optr as *const RawOp<T>) });
     }
 
     /// Run the operation's start routine.
@@ -277,22 +305,24 @@ impl<T: OpCode> Key<T> {
     /// Must be called at most once, before the operation is in flight.
     pub(crate) unsafe fn operate(&self) -> std::task::Poll<Result<usize>> {
         let optr = self.overlapped_ptr();
-        unsafe { (*self.inner.op.get()).operate(optr) }
+        let mut op = self.inner.op.lock().unwrap();
+        unsafe { op.operate(optr) }
     }
 
     /// Ask the operation to cancel itself.
     ///
-    /// # Safety
-    ///
-    /// Only valid while the operation is in flight.
-    pub(crate) unsafe fn cancel(&self) -> Result<()> {
+    /// Safe to call concurrently with a completion: the operation lock keeps the
+    /// two from aliasing, and cancelling an already-finished operation is a
+    /// no-op at the Windows level.
+    pub(crate) fn cancel(&self) -> Result<()> {
         let optr = self.overlapped_ptr();
-        unsafe { (*self.inner.op.get()).cancel(optr) }
+        let mut op = self.inner.op.lock().unwrap();
+        unsafe { op.cancel(optr) }
     }
 
     /// Read the operation's declared type.
-    pub(crate) fn op_type(&self) -> super::op::OpType {
-        unsafe { (*self.inner.op.get()).op_type() }
+    pub(crate) fn op_type(&self) -> OpType {
+        self.inner.op.lock().unwrap().op_type()
     }
 
     /// Install the waker to be signalled on completion.
@@ -304,25 +334,27 @@ impl<T: OpCode> Key<T> {
         }
     }
 
-    /// Take the completion result, if one has been stored.
+    /// Take the completion result, if one has been written.
     pub(crate) fn take_result(&self) -> Option<Result<usize>> {
-        let swapped = self.inner.state.compare_exchange(
-            OpState::Completed as u32,
-            OpState::Terminal as u32,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if swapped.is_ok() {
-            Some(unsafe { (*self.inner.result.get()).assume_init_read() })
-        } else {
-            None
-        }
+        self.inner
+            .state
+            .compare_exchange(
+                OpState::Completed as u32,
+                OpState::Terminal as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            // SAFETY: the CAS succeeded, so the state was `Completed`, which is
+            // only published after the result has been written. The CAS also
+            // guarantees no other thread can take it.
+            .map(|_| unsafe { (*self.inner.result.get()).assume_init_read() })
     }
 
     /// Mark the operation abandoned because the future was dropped.
     ///
-    /// Returns `true` if the operation was still in flight, meaning a
-    /// completion is still expected and cancellation should be requested.
+    /// Returns `true` if it was still in flight, meaning a completion is still
+    /// expected and cancellation is worth requesting.
     pub(crate) fn abandon(&self) -> bool {
         self.inner
             .state
@@ -337,19 +369,29 @@ impl<T: OpCode> Key<T> {
 
     /// Consume the key and yield the operation, if this is the last reference.
     pub(crate) fn try_into_op(self) -> std::result::Result<T, Self> {
-        match Arc::try_unwrap(self.inner) {
-            Ok(raw) => {
-                // Prevent `Drop` from running against a partially moved value.
-                let raw = std::mem::ManuallyDrop::new(raw);
-                if OpState::from_u32(raw.state.load(Ordering::Acquire)) == OpState::Completed {
-                    unsafe { (*raw.result.get()).assume_init_drop() };
-                }
-                #[cfg(any(test, feature = "test-util"))]
-                counter::dec();
-                Ok(unsafe { std::ptr::read(raw.op.get()) })
-            }
-            Err(inner) => Err(Key { inner }),
+        let raw = match Arc::try_unwrap(self.inner) {
+            Ok(raw) => raw,
+            Err(inner) => return Err(Key { inner }),
+        };
+
+        // `Arc::try_unwrap` proved uniqueness, so nothing else can observe this
+        // allocation. Suppress the `Drop` impl and dispose of each field by
+        // hand, because `op` must be moved out rather than dropped.
+        let raw = ManuallyDrop::new(raw);
+
+        if OpState::from_u32(raw.state.load(Ordering::Acquire)) == OpState::Completed {
+            unsafe { (*raw.result.get()).assume_init_drop() };
         }
+
+        // SAFETY: unique ownership; each field is read or dropped exactly once.
+        // `overlapped`, `header` and `state` are plain data with no drop glue.
+        let op = unsafe { std::ptr::read(&raw.op) };
+        unsafe { std::ptr::drop_in_place(&raw.waker as *const _ as *mut Mutex<Option<Waker>>) };
+
+        #[cfg(any(test, feature = "test-util"))]
+        counter::dec();
+
+        Ok(op.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -361,47 +403,58 @@ impl<T: OpCode> Clone for Key<T> {
     }
 }
 
-/// Deliver a completion to whichever operation owns `optr`.
+/// Deliver a completion to the operation that owns `optr`.
 ///
-/// Returns `false` if the pointer is not one of ours, which happens for packets
-/// posted by unrelated code sharing the port.
+/// Returns `false` if the packet does not carry our magic tag, which indicates
+/// corruption or a mis-attributed packet rather than a routine occurrence.
 ///
 /// # Safety
 ///
-/// `optr` must either be null, or point at an [`ErasedHeader`]-bearing
-/// allocation produced by [`Key::leak`].
+/// The caller must already have established that this packet belongs to this
+/// crate — the driver does so from the completion key it set when associating
+/// the handle. `optr` must be a pointer produced by [`Key::leak`] whose leaked
+/// reference has not been reclaimed.
+///
+/// The magic check performed here is defence in depth against corruption, not a
+/// validity oracle: reading it requires `optr` to already point at a live
+/// [`RawOp`] allocation.
 pub(crate) unsafe fn dispatch_completion(optr: *mut OVERLAPPED, result: Result<usize>) -> bool {
     if optr.is_null() {
         return false;
     }
-    let header = unsafe { header_of(optr) };
-    if header.magic != OP_MAGIC {
+    // SAFETY: the caller guarantees `optr` points at one of our allocations, so
+    // the header is in bounds.
+    let header = unsafe { read_header(optr) };
+    if header.0 != OP_MAGIC {
         return false;
     }
-    unsafe { (header.vtable.complete)(optr, result) };
+    unsafe { (header.1.complete)(optr, result) };
     true
 }
 
-/// Locate the erased header that follows `OVERLAPPED` in the allocation.
+/// Read the erased header that follows `OVERLAPPED`.
+///
+/// Returns the raw fields rather than a reference, so no borrow with an
+/// unconstrained lifetime is ever materialised.
 ///
 /// # Safety
 ///
 /// `optr` must point at a live [`RawOp`] allocation.
-unsafe fn header_of<'a>(optr: *mut OVERLAPPED) -> &'a ErasedHeader {
-    // The header sits immediately after `OVERLAPPED`, at an offset that does not
-    // depend on `T` because `#[repr(C)]` lays out fields in declaration order.
+unsafe fn read_header(optr: *mut OVERLAPPED) -> (u32, &'static OpVTable) {
     let base = optr as *const u8;
-    let offset = std::mem::size_of::<OVERLAPPED>();
-    unsafe { &*(base.add(offset) as *const ErasedHeader) }
+    let header = unsafe { base.add(std::mem::size_of::<OVERLAPPED>()) } as *const ErasedHeader;
+    let magic = unsafe { std::ptr::read(std::ptr::addr_of!((*header).magic)) };
+    let vtable = unsafe { std::ptr::read(std::ptr::addr_of!((*header).vtable)) };
+    (magic, vtable)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::task::Poll;
 
     struct NoopOp {
-        _tag: u32,
         _buf: Vec<u8>,
     }
 
@@ -421,13 +474,48 @@ mod tests {
         }
     }
 
+    /// Records that erased dispatch reached the right monomorphisation.
+    static REACHED: AtomicBool = AtomicBool::new(false);
+    static REACHED_LEN: AtomicU32 = AtomicU32::new(0);
+
+    struct ObservingOp;
+
+    unsafe impl OpCode for ObservingOp {
+        unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+            Poll::Pending
+        }
+        unsafe fn on_complete(&mut self, result: &Result<usize>) {
+            REACHED.store(true, Ordering::SeqCst);
+            if let Ok(n) = result {
+                REACHED_LEN.store(*n as u32, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn noop(len: usize) -> NoopOp {
+        NoopOp {
+            _buf: vec![0u8; len],
+        }
+    }
+
     fn assert_send<T: Send>() {}
+
+    /// `live_operations` is process-global, so tests that assert on it must not
+    /// observe each other's allocations. Cargo runs tests in parallel by
+    /// default, so they take this lock.
+    ///
+    /// Phase 4's soak has the same constraint.
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
+    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn raw_op_is_send_when_op_is_send() {
-        // Load-bearing: without the explicit `unsafe impl`s above, `OVERLAPPED`'s
-        // raw pointers make this fail to compile for every `T`, which would make
-        // `Submit<T>` unspawnable on a multi-threaded runtime.
+        // Load-bearing: without the explicit `unsafe impl`s, `OVERLAPPED`'s raw
+        // pointers make this fail to compile for every `T`, which would leave
+        // the submission future unspawnable on a multi-threaded runtime.
         assert_send::<RawOp<NoopOp>>();
         assert_send::<Key<NoopOp>>();
         assert_send::<Arc<RawOp<NoopOp>>>();
@@ -435,58 +523,54 @@ mod tests {
 
     #[test]
     fn overlapped_is_at_offset_zero() {
-        let key = Key::new(NoopOp {
-            _tag: 7,
-            _buf: vec![0u8; 8],
-        });
-        let alloc = Arc::as_ptr(&key.inner) as usize;
-        let ovl = key.overlapped_ptr() as usize;
-        assert_eq!(alloc, ovl, "OVERLAPPED must be at offset 0 of RawOp<T>");
+        assert_eq!(std::mem::offset_of!(RawOp<NoopOp>, overlapped), 0);
+        assert_eq!(std::mem::offset_of!(RawOp<BigOp>, overlapped), 0);
+
+        let key = Key::new(noop(8));
+        assert_eq!(
+            Arc::as_ptr(&key.inner) as usize,
+            key.overlapped_ptr() as usize,
+            "the kernel's pointer must be the allocation address"
+        );
     }
 
     #[test]
     fn erased_header_offset_is_type_independent() {
-        let small = Key::new(NoopOp {
-            _tag: 1,
-            _buf: Vec::new(),
-        });
-        let big = Key::new(BigOp { _pad: [0u8; 512] });
-
+        // The completion path reaches the header by adding this exact offset to
+        // a pointer it received from Windows, without knowing `T`.
         let expected = std::mem::size_of::<OVERLAPPED>();
-        for (base, ovl) in [
-            (
-                Arc::as_ptr(&small.inner) as usize,
-                small.overlapped_ptr() as usize,
-            ),
-            (
-                Arc::as_ptr(&big.inner) as usize,
-                big.overlapped_ptr() as usize,
-            ),
-        ] {
-            assert_eq!(base, ovl);
-        }
+        assert_eq!(std::mem::offset_of!(RawOp<NoopOp>, header), expected);
+        assert_eq!(std::mem::offset_of!(RawOp<BigOp>, header), expected);
+        assert_eq!(std::mem::offset_of!(RawOp<ObservingOp>, header), expected);
+    }
 
-        // The header must be readable at the same offset for both types.
-        let h1 = unsafe { header_of(small.overlapped_ptr()) };
-        let h2 = unsafe { header_of(big.overlapped_ptr()) };
-        assert_eq!(h1.magic, OP_MAGIC);
-        assert_eq!(h2.magic, OP_MAGIC);
-        assert_eq!(expected, std::mem::size_of::<OVERLAPPED>());
+    #[test]
+    fn erased_dispatch_reaches_the_right_type() {
+        REACHED.store(false, Ordering::SeqCst);
+        REACHED_LEN.store(0, Ordering::SeqCst);
+
+        let key = Key::new(ObservingOp);
+        let optr = key.leak();
+        assert!(unsafe { dispatch_completion(optr, Ok(4242)) });
+
+        assert!(
+            REACHED.load(Ordering::SeqCst),
+            "on_complete must run on the concrete type"
+        );
+        assert_eq!(REACHED_LEN.load(Ordering::SeqCst), 4242);
+        assert_eq!(key.take_result().unwrap().unwrap(), 4242);
     }
 
     #[test]
     fn leak_and_complete_frees_exactly_once() {
+        let _guard = counter_guard();
         let before = live_operations();
-        let key = Key::new(NoopOp {
-            _tag: 3,
-            _buf: vec![1, 2, 3],
-        });
+        let key = Key::new(noop(3));
         assert_eq!(live_operations(), before + 1);
 
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(3)) };
 
-        // The future still holds its reference, so the result is available.
         assert_eq!(key.take_result().unwrap().unwrap(), 3);
         drop(key);
         assert_eq!(live_operations(), before, "allocation must be released");
@@ -494,11 +578,9 @@ mod tests {
 
     #[test]
     fn abandoned_operation_survives_until_completion() {
+        let _guard = counter_guard();
         let before = live_operations();
-        let key = Key::new(NoopOp {
-            _tag: 4,
-            _buf: vec![9; 64],
-        });
+        let key = Key::new(noop(64));
         let optr = key.leak();
 
         assert!(key.abandon(), "first abandon wins");
@@ -506,7 +588,7 @@ mod tests {
         assert_eq!(
             live_operations(),
             before + 1,
-            "kernel reference must keep it alive"
+            "the kernel reference must keep it alive"
         );
 
         unsafe { dispatch_completion(optr, Ok(0)) };
@@ -518,38 +600,155 @@ mod tests {
     }
 
     #[test]
+    fn completed_but_never_taken_is_dropped_once() {
+        let _guard = counter_guard();
+        let before = live_operations();
+        let key = Key::new(noop(1));
+        let optr = key.leak();
+        unsafe { dispatch_completion(optr, Ok(7)) };
+        // Never call take_result: `Drop` must dispose of the stored result.
+        drop(key);
+        assert_eq!(live_operations(), before);
+    }
+
+    #[test]
     fn foreign_pointer_is_rejected() {
-        let mut stray = OVERLAPPED::default();
-        let ok = unsafe { dispatch_completion(std::ptr::addr_of_mut!(stray), Ok(0)) };
-        assert!(!ok, "a packet without our magic must be ignored");
+        // Embed the OVERLAPPED in a larger zeroed allocation so the header probe
+        // stays in bounds, and poison the following bytes so the test does not
+        // pass merely because adjacent memory happened to be zero.
+        #[repr(C)]
+        struct Foreign {
+            overlapped: OVERLAPPED,
+            poison: [u8; 64],
+        }
+        let mut foreign = Foreign {
+            overlapped: OVERLAPPED::default(),
+            poison: [0xAB; 64],
+        };
+        let ok = unsafe { dispatch_completion(std::ptr::addr_of_mut!(foreign.overlapped), Ok(0)) };
+        assert!(!ok, "a packet without our magic must be rejected");
 
         let ok = unsafe { dispatch_completion(std::ptr::null_mut(), Ok(0)) };
-        assert!(!ok, "a null pointer must be ignored");
+        assert!(!ok, "a null pointer must be rejected");
     }
 
     #[test]
     fn take_result_is_exactly_once() {
-        let key = Key::new(NoopOp {
-            _tag: 5,
-            _buf: Vec::new(),
-        });
+        let key = Key::new(noop(0));
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(11)) };
         assert_eq!(key.take_result().unwrap().unwrap(), 11);
-        assert!(key.take_result().is_none(), "result must be taken once");
+        assert!(key.take_result().is_none(), "the result is taken once");
     }
 
     #[test]
     fn unstarted_operation_can_be_reclaimed() {
+        let _guard = counter_guard();
         let before = live_operations();
-        let key = Key::new(NoopOp {
-            _tag: 6,
-            _buf: Vec::new(),
-        });
+        let key = Key::new(noop(0));
         let optr = key.leak();
         unsafe { Key::<NoopOp>::unleak(optr) };
         drop(key);
         assert_eq!(live_operations(), before);
+    }
+
+    #[test]
+    fn try_into_op_returns_state_and_releases_the_allocation() {
+        let _guard = counter_guard();
+        let before = live_operations();
+        let key = Key::new(noop(16));
+
+        // Install a waker so the field is non-empty; it must still be released.
+        let waker = futures_noop_waker();
+        key.set_waker(&waker);
+
+        let op = key.try_into_op().unwrap_or_else(|_| panic!("unique"));
+        assert_eq!(op._buf.len(), 16);
+        assert_eq!(live_operations(), before, "allocation must be released");
+    }
+
+    #[test]
+    fn try_into_op_after_completion_drops_the_result() {
+        let _guard = counter_guard();
+        let before = live_operations();
+        let key = Key::new(noop(2));
+        let optr = key.leak();
+        unsafe { dispatch_completion(optr, Ok(2)) };
+        // Result written but deliberately not taken.
+        let op = key.try_into_op().unwrap_or_else(|_| panic!("unique"));
+        assert_eq!(op._buf.len(), 2);
+        assert_eq!(live_operations(), before);
+    }
+
+    #[test]
+    fn try_into_op_fails_while_shared() {
+        let key = Key::new(noop(1));
+        let clone = key.clone();
+        assert!(
+            key.try_into_op().is_err(),
+            "shared keys cannot be unwrapped"
+        );
+        drop(clone);
+    }
+
+    #[test]
+    fn waker_is_signalled_on_completion() {
+        use std::sync::atomic::AtomicBool;
+        static WOKEN: AtomicBool = AtomicBool::new(false);
+        WOKEN.store(false, Ordering::SeqCst);
+
+        let waker = counting_waker(&WOKEN);
+        let key = Key::new(noop(0));
+        key.set_waker(&waker);
+
+        let optr = key.leak();
+        unsafe { dispatch_completion(optr, Ok(1)) };
+        assert!(WOKEN.load(Ordering::SeqCst), "the waker must be signalled");
+    }
+
+    #[test]
+    fn abandoned_completion_does_not_wake() {
+        use std::sync::atomic::AtomicBool;
+        static WOKEN: AtomicBool = AtomicBool::new(false);
+        WOKEN.store(false, Ordering::SeqCst);
+
+        let waker = counting_waker(&WOKEN);
+        let key = Key::new(noop(0));
+        key.set_waker(&waker);
+        let optr = key.leak();
+
+        assert!(key.abandon());
+        unsafe { dispatch_completion(optr, Ok(1)) };
+        assert!(
+            !WOKEN.load(Ordering::SeqCst),
+            "an abandoned operation has nobody to wake"
+        );
+        assert!(key.take_result().is_none(), "its result is discarded");
+    }
+
+    #[test]
+    fn concurrent_abandon_and_complete_release_exactly_once() {
+        // Exercises the interleaving the state machine exists to make safe.
+        let _guard = counter_guard();
+        let before = live_operations();
+        for _ in 0..2_000 {
+            let key = Key::new(noop(8));
+            let optr = key.leak();
+            let moved = key.clone();
+            let h = std::thread::spawn(move || {
+                if moved.abandon() {
+                    let _ = moved.cancel();
+                }
+            });
+            unsafe { dispatch_completion(optr, Ok(8)) };
+            h.join().unwrap();
+            drop(key);
+        }
+        assert_eq!(
+            live_operations(),
+            before,
+            "every allocation must be released exactly once"
+        );
     }
 
     #[test]
@@ -561,6 +760,40 @@ mod tests {
             OpState::Terminal,
         ] {
             assert_eq!(OpState::from_u32(s as u32), s);
+        }
+    }
+
+    // --- test wakers -------------------------------------------------------
+
+    fn futures_noop_waker() -> Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn counting_waker(flag: &'static AtomicBool) -> Waker {
+        use std::task::{RawWaker, RawWakerVTable};
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        unsafe fn wake(p: *const ()) {
+            unsafe { (*(p as *const AtomicBool)).store(true, Ordering::SeqCst) };
+        }
+        unsafe fn wake_by_ref(p: *const ()) {
+            unsafe { wake(p) };
+        }
+        unsafe fn drop_fn(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                flag as *const AtomicBool as *const (),
+                &VTABLE,
+            ))
         }
     }
 }
