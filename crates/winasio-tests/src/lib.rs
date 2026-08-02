@@ -4,4 +4,4 @@
 // license information.
 // ------------------------------------------------------------
 
-//! Test only crate. Integration tests for [`winasio`] live in `tests/`.
+//! Test only crate. Integration tests for the `winasio` crate live in `tests/`.
