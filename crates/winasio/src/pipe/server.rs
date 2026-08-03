@@ -32,7 +32,7 @@ use windows::Win32::System::Pipes::{
 use crate::fs::SetupError;
 use crate::iocp::{ConnectPipe, Handle, OpResult, Registrar, Submitter};
 
-use super::connected::{drop_inner, Inner};
+use super::connected::{drop_inner, Inner, InnerGuard};
 use super::name::local_pipe_path;
 use super::NamedPipe;
 
@@ -183,19 +183,25 @@ impl<S: Submitter> NamedPipeServer<S> {
     ///
     /// If a client connected before this call, the returned future resolves
     /// successfully without waiting for a completion packet.
+    ///
+    /// Dropping the returned future before it resolves cancels the accept and
+    /// tears the instance down in the documented order; as with every operation
+    /// in this crate, nothing is handed back in that case.
     pub fn connect(mut self) -> impl Future<Output = Result<NamedPipe<S>>> {
         let inner = self.take_inner();
         let submitted = inner
             .submitter
             .submit(ConnectPipe::new(inner.handle.clone()));
+        // Parked in the future: if the caller drops it before completion, the
+        // guard restores the teardown ordering an implicit field drop would skip.
+        let mut guard = InnerGuard::new(inner);
         async move {
             let OpResult(result, _op) = submitted.await;
             match result {
-                Ok(_) => Ok(NamedPipe::from_inner(inner)),
-                Err(e) => {
-                    drop_inner(inner);
-                    Err(e)
-                }
+                // Taking the state disarms the guard.
+                Ok(_) => Ok(NamedPipe::from_inner(guard.take())),
+                // Left armed: the guard tears the instance down on the way out.
+                Err(e) => Err(e),
             }
         }
     }

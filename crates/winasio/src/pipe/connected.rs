@@ -40,6 +40,35 @@ pub(crate) fn drop_inner<S>(inner: Inner<S>) {
     drop(handle);
 }
 
+/// Keeps [`drop_inner`]'s ordering when state is parked inside a future.
+///
+/// A typestate transition moves the state into the future that will produce the
+/// next state, so for the duration of that future nothing else owns it. If the
+/// caller drops the future before it resolves, the state must still be torn down
+/// in the documented order — dropping the fields implicitly would skip the
+/// cancellation step and release the handle reference in declaration order
+/// instead of last. Taking the state out disarms the guard.
+pub(crate) struct InnerGuard<S>(Option<Inner<S>>);
+
+impl<S> InnerGuard<S> {
+    pub(crate) fn new(inner: Inner<S>) -> Self {
+        InnerGuard(Some(inner))
+    }
+
+    /// Take the state, disarming the guard.
+    pub(crate) fn take(&mut self) -> Inner<S> {
+        self.0.take().expect("pipe state is present")
+    }
+}
+
+impl<S> Drop for InnerGuard<S> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            drop_inner(inner);
+        }
+    }
+}
+
 /// A connected named-pipe endpoint.
 pub struct NamedPipe<S: Submitter> {
     pub(crate) inner: Option<Inner<S>>,

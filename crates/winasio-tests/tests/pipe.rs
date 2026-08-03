@@ -362,3 +362,61 @@ fn access_direction_builders_are_available() {
     assert_eq!(got, b"direction");
     drop((server, client));
 }
+
+#[test]
+fn dropping_a_connect_future_tears_the_instance_down_in_order() {
+    // `connect(self)` parks the instance's state inside the returned future.
+    // Dropping that future before a client arrives must still run the
+    // documented teardown -- cancel, drop the submitter, release the handle
+    // reference last -- rather than letting the fields drop implicitly, which
+    // would skip the cancellation and free the handle in declaration order.
+    //
+    // Observed through the pipe name rather than the operation counter: the
+    // counter is process-global and other tests in this binary run in parallel,
+    // but the name can only become free again once the handle is genuinely
+    // closed, which cannot happen while the accept is still outstanding.
+    let name = common::unique_pipe_name("dropping_a_connect_future");
+    let server = ServerOptions::new(&name)
+        .first_instance(true)
+        .create(&ThreadPool)
+        .expect("create server instance");
+
+    let mut accept = Box::pin(server.connect());
+
+    // No client will ever arrive, so the accept is genuinely outstanding.
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(accept.as_mut().poll(&mut cx), Poll::Pending),
+        "the accept must be pending before the drop is exercised"
+    );
+
+    // While it is outstanding the name is taken: a first-instance create must
+    // fail, which is what makes the success after the drop meaningful.
+    assert!(
+        ServerOptions::new(&name)
+            .first_instance(true)
+            .create(&ThreadPool)
+            .is_err(),
+        "the name must be held while the instance is alive"
+    );
+
+    drop(accept);
+
+    // The cancellation the guard issues is what releases the handle; without it
+    // the accept would stay outstanding and the name held until process exit.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if ServerOptions::new(&name)
+            .first_instance(true)
+            .create(&ThreadPool)
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dropping the accept future must cancel and close the handle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
