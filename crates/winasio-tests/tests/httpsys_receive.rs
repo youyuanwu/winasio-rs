@@ -64,6 +64,11 @@ fn accessors_report_the_request_and_survive_being_moved() {
 
     // Pre-parsed components are wide, so these are borrowed UTF-16.
     assert!(!request.full_url_wide().is_empty());
+    let full = request.full_url_lossy();
+    assert!(
+        full.starts_with("http://localhost:") && full.ends_with("/recv/path?q=1"),
+        "the full URL should be the reconstructed absolute form, got {full:?}"
+    );
     assert!(request.path_lossy().contains("/recv/path"));
     assert!(request.host_lossy().contains("localhost"));
     assert_eq!(request.query_lossy(), "?q=1");
@@ -206,26 +211,71 @@ fn rejecting_an_over_large_request_clears_the_queue() {
 
     let err = block_on(server.queue().receive()).expect_err("should not fit");
     let stuck = match err {
-        ReceiveError::TooLarge { id, retries, .. } => {
+        ReceiveError::TooLarge {
+            id,
+            retries,
+            discarded,
+            ..
+        } => {
             assert_eq!(retries, 0, "retrying was disabled");
             assert_ne!(id.get(), 0, "the identifier must be recoverable");
+            assert!(discarded, "the library must clear the request itself");
             id
         }
         other => panic!("expected TooLarge, got {other:?}"),
     };
 
-    // Still queued: without rejecting, the same request comes back forever.
-    block_on(server.queue().reject(stuck)).expect("reject");
-
-    // A second, small request must now be the one delivered.
+    // A second, small request must now be the one delivered -- with no
+    // intervention from the caller, which is what makes a livelock impossible.
     server.client_request("GET", "reject/small", &[], &[]);
-    let next = block_on(server.queue().receive()).expect("receive after reject");
+    let next = block_on(server.queue().receive()).expect("receive after the discard");
     assert_ne!(
         next.id(),
         stuck,
-        "the rejected request must not be delivered again"
+        "the discarded request must not be delivered again"
     );
     assert!(next.target().unwrap().contains("/reject/small"));
+}
+
+/// SC-024's remaining branch: a header value that is not valid UTF-8 is
+/// reported as not-text, while its bytes come back unchanged.
+#[test]
+fn a_non_utf8_header_value_is_bytes_but_not_text() {
+    let server = match Server::start(PORT + 5, "bytes", ReceiveConfig::default()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    // 0xFF is never valid UTF-8. Written straight onto the wire, since a `&str`
+    // could not carry it.
+    let raw = b"GET /bytes/x HTTP/1.1\r\nHost: localhost\r\nX-Raw: a\xFFb\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    let port = server.port();
+    let client = std::thread::spawn(move || {
+        use std::io::Write;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.write_all(raw).ok()?;
+        s.flush().ok()?;
+        Some(())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let request = block_on(server.queue().receive()).expect("receive");
+
+    let bytes = request
+        .unknown_header("X-Raw")
+        .expect("the header should be present");
+    assert_eq!(
+        bytes, b"a\xFFb",
+        "the original bytes must survive unchanged"
+    );
+    assert!(
+        std::str::from_utf8(bytes).is_err(),
+        "this value is deliberately not UTF-8"
+    );
+
+    // The target itself is valid UTF-8 here, so the text accessor still works.
+    assert!(request.target().is_some());
+    let _ = client.join();
 }
 
 /// An extension method is reported as unrecognised, with its literal text.

@@ -61,21 +61,32 @@ impl Default for ReceiveConfig {
 /// padded with 4096 bytes needed 5696 bytes of buffer in total.
 const GROWTH_FACTOR: usize = 16;
 
+/// The largest receive buffer the retry loop will ask for.
+///
+/// Without a ceiling, a caller who raised [`ReceiveConfig::max_retries`] would
+/// drive the capacity up by a factor of sixteen each time until the allocation
+/// aborted the process. Far above anything the operating system will deliver.
+const MAX_CAPACITY: usize = 64 * 1024 * 1024;
+
 /// Why a receive did not produce a request.
 #[derive(Debug)]
 pub enum ReceiveError {
     /// The request did not fit, and the retry bound is exhausted.
     ///
-    /// The request is still queued. Reject it with
-    /// [`RequestQueue::reject`] -- otherwise the next receive returns the very
-    /// same request and the accept loop livelocks.
+    /// **The request has already been discarded**, so the next receive returns a
+    /// different one. That happens inside the library deliberately: leaving it
+    /// queued would mean an accept loop that logged the error and continued
+    /// would receive the very same request forever, spinning a core. Making that
+    /// impossible is worth more than the chance to answer with a status code.
     TooLarge {
-        /// The offending request, so it can be rejected.
+        /// The offending request, for logging. It is no longer queued.
         id: RequestId,
         /// The largest buffer that was tried.
         attempted_capacity: usize,
         /// How many retries were performed.
         retries: u32,
+        /// Whether discarding it actually succeeded.
+        discarded: bool,
     },
     /// Anything else -- a closed queue, a cancelled operation, a real failure.
     Failed(Error),
@@ -88,9 +99,16 @@ impl std::fmt::Display for ReceiveError {
                 id,
                 attempted_capacity,
                 retries,
+                discarded,
             } => write!(
                 f,
-                "request {id:?} did not fit in {attempted_capacity} bytes after {retries} retries; reject it to clear the queue"
+                "request {id:?} did not fit in {attempted_capacity} bytes after {retries} \
+                 retries and was {}",
+                if *discarded {
+                    "discarded"
+                } else {
+                    "left queued (discarding it failed)"
+                }
             ),
             ReceiveError::Failed(e) => write!(f, "receive failed: {e}"),
         }
@@ -280,15 +298,24 @@ impl RequestQueue {
                     // fit, so the identifier is available to target the retry.
                     let recovered = op.recovered_id();
                     if retries >= self.config.max_retries {
+                        // Discard it here rather than leaving it to the caller.
+                        // A queued request that cannot be delivered would be
+                        // returned by every subsequent receive, so any accept
+                        // loop that logged and continued would spin forever.
+                        let discarded = self.reject(recovered).await.is_ok();
                         return Err(ReceiveError::TooLarge {
                             id: recovered,
                             attempted_capacity: capacity,
                             retries,
+                            discarded,
                         });
                     }
                     retries += 1;
                     target = recovered;
-                    capacity = capacity.saturating_mul(GROWTH_FACTOR);
+                    // Growth is blind: the size HTTP.sys needs is not
+                    // recoverable asynchronously. Capped so a high retry bound
+                    // cannot drive the allocation to an out-of-memory abort.
+                    capacity = capacity.saturating_mul(GROWTH_FACTOR).min(MAX_CAPACITY);
                 }
                 Err(e) => return Err(ReceiveError::Failed(e)),
             }
@@ -401,9 +428,13 @@ impl RequestQueue {
     pub async fn read_body_to_end(&self, id: RequestId, chunk: usize) -> Result<Vec<u8>> {
         let chunk = chunk.max(1);
         let mut collected: Vec<u8> = Vec::new();
+        // Reused across iterations: the read returns the buffer, so allocating a
+        // fresh one each time would cost an allocation per chunk for nothing.
+        let mut buffer: Vec<u8> = Vec::with_capacity(chunk);
         loop {
-            let buffer: Vec<u8> = Vec::with_capacity(chunk);
-            let OpResult(result, buffer) = self.read_body(id, buffer).await;
+            buffer.clear();
+            let OpResult(result, returned) = self.read_body(id, buffer).await;
+            buffer = returned;
             let n = result?;
             if n == 0 {
                 return Ok(collected);

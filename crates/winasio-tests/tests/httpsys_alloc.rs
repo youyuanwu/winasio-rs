@@ -156,6 +156,67 @@ fn build_constant_reply() -> Response {
     r
 }
 
+/// The documented increments beyond the nominal path.
+///
+/// FR-027 states what an inline-capacity spill adds. That figure is measured
+/// here rather than asserted in prose -- it was originally documented as one and
+/// is actually two, because the reply's overflow storage and the contiguous
+/// descriptor array HTTP.sys requires are separate allocations.
+#[test]
+fn the_documented_increments_are_accurate() {
+    let server = match Server::start(PORT + 2, "increments", ReceiveConfig::default()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Warm-up passes, discarded.
+    serve_with_reply(&server, 2);
+    serve_with_reply(&server, 12);
+
+    let inline = serve_with_reply(&server, 2);
+    let spilled = serve_with_reply(&server, 12);
+
+    println!(
+        "inline={inline} spilled={spilled} increment={}",
+        spilled - inline
+    );
+
+    assert_eq!(inline, 3, "the nominal path is three allocations");
+    assert_eq!(
+        spilled - inline,
+        2,
+        "exceeding INLINE_UNKNOWN_HEADERS costs two: the overflow storage and \
+         the contiguous descriptor array. FR-027 and the module documentation \
+         must state two, not one"
+    );
+}
+
+/// Serve one request, replying with `headers` unrecognised headers.
+fn serve_with_reply(server: &Server, headers: usize) -> usize {
+    let client = server.request("GET", "increments", &[], &[]);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let names: [&'static [u8]; 12] = [
+        b"X-A", b"X-B", b"X-C", b"X-D", b"X-E", b"X-F", b"X-G", b"X-H", b"X-I", b"X-J", b"X-K",
+        b"X-L",
+    ];
+
+    let (_, allocations) = measure(|| {
+        let request = block_on(server.queue().receive()).expect("receive");
+        let mut reply = Response::new(200);
+        for name in names.iter().take(headers) {
+            reply.add_header(*name, &b"v"[..]);
+        }
+        reply.add_body(&b"ok"[..]);
+        block_on(server.queue().send(request.id(), reply))
+            .0
+            .expect("send");
+    });
+
+    let _ = client.join();
+    allocations
+}
+
 /// SC-018: an end-to-end serve stays within FR-027's budget, and the count does
 /// not grow with the number of headers read and set, nor with body size at a
 /// fixed number of body operations.

@@ -98,17 +98,23 @@ fn constant_and_owned_replies_are_equivalent() {
         .expect("send");
     let (status_b, headers_b, body_b) = parse_response(&client.join().unwrap().unwrap());
 
-    assert_eq!(status_a, status_b);
-    assert_eq!(body_a, body_b);
-    let pick = |hs: &Vec<(String, String)>, n: &str| {
-        hs.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(n))
-            .map(|(_, v)| v.clone())
+    assert_eq!(status_a, status_b, "status lines must match");
+    assert_eq!(body_a, body_b, "bodies must match");
+
+    // Byte-identical apart from headers the operating system generates itself.
+    let normalise = |hs: &[(String, String)]| {
+        let mut v: Vec<(String, String)> = hs
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("Date"))
+            .map(|(k, val)| (k.to_ascii_lowercase(), val.clone()))
+            .collect();
+        v.sort();
+        v
     };
-    assert_eq!(pick(&headers_a, "X-Kind"), pick(&headers_b, "X-Kind"));
     assert_eq!(
-        pick(&headers_a, "Content-Type"),
-        pick(&headers_b, "Content-Type")
+        normalise(&headers_a),
+        normalise(&headers_b),
+        "every header must match; only Date may differ, because HTTP.sys sets it"
     );
 }
 

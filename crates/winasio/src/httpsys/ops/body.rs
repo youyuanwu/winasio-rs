@@ -57,9 +57,21 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
         // Record how much Windows actually wrote, so the buffer comes back with
         // a correct length rather than its original capacity.
         if let Ok(transferred) = result {
-            let n = (*transferred).min(self.buffer.bytes_total());
-            // SAFETY: Windows initialised exactly this many bytes.
-            unsafe { self.buffer.set_init(n) };
+            let capacity = self.buffer.bytes_total();
+            // Deliberately not clamped. `set_init`'s contract is that the first
+            // `len` bytes were *genuinely written*, and for a `Vec<u8>` it is
+            // `set_len` over uninitialised capacity. Clamping an over-report to
+            // the capacity would satisfy the bounds check while publishing
+            // uninitialised heap bytes through a safe `&[u8]`. An over-report
+            // means something is badly wrong, so report nothing instead.
+            debug_assert!(
+                *transferred <= capacity,
+                "completion reported {transferred} bytes for a {capacity}-byte buffer"
+            );
+            if *transferred <= capacity {
+                // SAFETY: Windows initialised exactly this many bytes.
+                unsafe { self.buffer.set_init(*transferred) };
+            }
         }
     }
 

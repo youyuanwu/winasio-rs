@@ -25,12 +25,17 @@ mod example {
 const PORT: u16 = 12356;
 const EXAMPLE_PORT: u16 = 12367;
 
-/// SC-001: the example server really serves, and contains no `unsafe` of its
-/// own beyond the executor it ships for the sake of depending on no runtime.
+/// SC-001: the example server really serves, and contains no `unsafe` at all.
+///
+/// The example is checked for `unsafe` textually below, so this is not merely a
+/// claim in a comment.
 #[test]
 fn the_example_server_serves_requests() {
     // Serve exactly three requests, then stop.
-    let server = std::thread::spawn(|| example::run_server(EXAMPLE_PORT, "example", 3));
+    let server = std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(example::run_server(EXAMPLE_PORT, "example", 3))
+    });
 
     // Give the listener time to bind. If it cannot (no URL reservation), the
     // client requests simply fail and the test skips.
@@ -68,6 +73,23 @@ fn the_example_server_serves_requests() {
     assert!(status.contains("405"), "got {status:?}");
 
     server.join().expect("example thread").expect("example ran");
+}
+
+/// SC-001's other half: the example contains no `unsafe` whatsoever.
+///
+/// Asserted textually rather than trusted, because the whole point of the
+/// criterion is that a complete server needs none.
+#[test]
+fn the_example_server_contains_no_unsafe() {
+    let source = include_str!("../examples/httpsys_server.rs");
+    for (n, line) in source.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        assert!(
+            !code.contains("unsafe"),
+            "examples/httpsys_server.rs:{} uses `unsafe`: {line}",
+            n + 1
+        );
+    }
 }
 
 /// A full request/response cycle over the public API, with no `unsafe` anywhere

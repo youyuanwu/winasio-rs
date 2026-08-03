@@ -66,7 +66,12 @@ unsafe impl OpCode for SendResponse {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Every pointer inside the reply is derived here, from `&mut self`,
         // which already sits at the operation's final address.
-        let raw = unsafe { self.response.build() };
+        let raw = match unsafe { self.response.build() } {
+            Ok(raw) => raw,
+            // A value too long for the API's length fields. Reported rather
+            // than truncated, so output cannot be silently corrupted.
+            Err(e) => return Poll::Ready(Err(e)),
+        };
         let code = unsafe {
             HttpSendHttpResponse(
                 self.queue.0,
@@ -140,12 +145,22 @@ unsafe impl<B: IoBuf + Send> OpCode for SendBody<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+        let len = match u32::try_from(self.buffer.bytes_init()) {
+            Ok(len) => len,
+            Err(_) => {
+                return Poll::Ready(Err(windows::core::Error::new(
+                    windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult(),
+                    "body chunk exceeds the u32 length the HTTP Server API accepts",
+                )))
+            }
+        };
+
         // Derived from `&mut self`; the descriptor lives in this operation.
         self.chunk = HTTP_DATA_CHUNK {
             DataChunkType: HttpDataChunkFromMemory,
             ..Default::default()
         };
-        self.chunk.Anonymous.FromMemory.BufferLength = self.buffer.bytes_init() as u32;
+        self.chunk.Anonymous.FromMemory.BufferLength = len;
         self.chunk.Anonymous.FromMemory.pBuffer =
             self.buffer.stable_ptr() as *mut core::ffi::c_void;
 

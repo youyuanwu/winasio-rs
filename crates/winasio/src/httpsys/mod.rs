@@ -77,13 +77,14 @@
 //!   [`OpResult`](crate::iocp::OpResult), which carries the outcome *and* the
 //!   reply or buffer that was handed in -- on failure as well as success.
 //!
-//! * **Over-large requests are retried, then must be rejected.** A request whose
+//! * **Over-large requests are retried, then discarded.** A request whose
 //!   metadata exceeds the configured capacity is retried at a larger size, up to
-//!   [`ReceiveConfig::max_retries`]. Beyond that it surfaces as
-//!   [`ReceiveError::TooLarge`], and the caller **must** call
-//!   [`RequestQueue::reject`] with the identifier it carries. The request stays
-//!   queued otherwise, so an accept loop that merely logged the error would
-//!   receive the same request forever.
+//!   [`ReceiveConfig::max_retries`]. Beyond that the library **discards it** and
+//!   reports [`ReceiveError::TooLarge`]. Discarding happens here rather than in
+//!   your code deliberately: a queued request that cannot be delivered would be
+//!   returned by every subsequent receive, so an accept loop that logged the
+//!   error and continued would spin forever. [`RequestQueue::reject`] remains
+//!   available for discarding a request you have already received.
 //!
 //! * **Closing is how a server stops.** [`RequestQueue::close`] takes `&self`,
 //!   so a queue shared as an `Arc` can be shut down while workers are blocked in
@@ -106,7 +107,9 @@
 //!
 //! Beyond that: a receive retry adds two, each body operation adds one, and a
 //! reply exceeding [`INLINE_UNKNOWN_HEADERS`] unrecognised headers or
-//! [`INLINE_CHUNKS`] body chunks adds one for the spilled array.
+//! [`INLINE_CHUNKS`] body chunks adds **two** for that kind — the overflow
+//! storage, plus the contiguous descriptor array the operating system requires.
+//! These figures are measured by the test suite, not merely asserted here.
 
 mod error;
 mod header;

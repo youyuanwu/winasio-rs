@@ -345,13 +345,18 @@ impl Request {
     ///
     /// [`unknown_headers`]: Request::unknown_headers
     pub fn unknown_header(&self, name: &str) -> Option<&[u8]> {
+        let wanted = name.as_bytes();
         self.unknown_headers().find_map(|(n, v)| {
-            let matches = n
-                .iter()
-                .zip(name.as_bytes())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b));
-            (matches && n.len() == name.len()).then_some(v)
+            // Length first: it rejects most candidates without comparing bytes.
+            (n.len() == wanted.len()
+                && n.iter().zip(wanted).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+            .then_some(v)
         })
+    }
+
+    /// An unrecognised header as text, if present and valid UTF-8.
+    pub fn unknown_header_str(&self, name: &str) -> Option<&str> {
+        std::str::from_utf8(self.unknown_header(name)?).ok()
     }
 
     /// Whether HTTP.sys reported that more body data exists.

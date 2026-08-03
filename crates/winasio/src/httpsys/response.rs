@@ -8,6 +8,8 @@
 
 use std::borrow::Cow;
 
+use windows::core::{Error, Result};
+use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows::Win32::Networking::HttpServer::{
     HttpDataChunkFromMemory, HTTP_DATA_CHUNK, HTTP_KNOWN_HEADER, HTTP_RESPONSE_V2,
     HTTP_UNKNOWN_HEADER,
@@ -203,24 +205,30 @@ impl Response {
 
     /// Build the structure HTTP.sys reads, deriving every pointer from `self`.
     ///
+    /// Fails rather than truncating if any value exceeds what the API's length
+    /// fields can express. The lengths are `u16` for headers and the reason
+    /// phrase, so a 64 KiB header value would otherwise wrap silently and emit
+    /// corrupt output -- a poor property for a boundary that reports every other
+    /// failure as a value.
+    ///
     /// # Safety
     ///
     /// The returned pointer is valid only while `self` neither moves nor is
     /// modified. Callers must be inside an operation whose address is already
     /// final -- see the type documentation.
-    pub(crate) unsafe fn build(&mut self) -> *const HTTP_RESPONSE_V2 {
+    pub(crate) unsafe fn build(&mut self) -> Result<*const HTTP_RESPONSE_V2> {
         self.raw = HTTP_RESPONSE_V2::default();
         self.raw.Base.StatusCode = self.status;
 
         if !self.reason.is_empty() {
-            self.raw.Base.ReasonLength = self.reason.len() as u16;
+            self.raw.Base.ReasonLength = len_u16(&self.reason, "reason phrase")?;
             self.raw.Base.pReason = windows::core::PCSTR(self.reason.as_ptr());
         }
 
         for (index, value) in self.known.iter().enumerate() {
             if let Some(v) = value {
                 self.raw.Base.Headers.KnownHeaders[index] = HTTP_KNOWN_HEADER {
-                    RawValueLength: v.len() as u16,
+                    RawValueLength: len_u16(v, "header value")?,
                     pRawValue: windows::core::PCSTR(v.as_ptr()),
                 };
             }
@@ -228,6 +236,12 @@ impl Response {
 
         let unknown_total = self.unknown.total();
         if unknown_total > 0 {
+            // Validate before writing any pointer, so a failure leaves nothing
+            // half-built behind.
+            for (name, value) in self.unknown.iter() {
+                len_u16(name, "header name")?;
+                len_u16(value, "header value")?;
+            }
             // Windows needs one contiguous array. Within the inline capacity it
             // is filled in place; beyond it, a heap array is allocated -- the
             // documented cost of spilling.
@@ -259,6 +273,9 @@ impl Response {
 
         let chunk_total = self.chunks.total();
         if chunk_total > 0 {
+            for body in self.chunks.iter() {
+                len_u32(body, "body chunk")?;
+            }
             if chunk_total <= INLINE_CHUNKS {
                 for (slot, body) in self.chunks_raw.iter_mut().zip(self.chunks.iter()) {
                     *slot = memory_chunk(body);
@@ -271,33 +288,21 @@ impl Response {
             self.raw.Base.EntityChunkCount = chunk_total as u16;
         }
 
-        &self.raw
+        Ok(&self.raw)
     }
 
     /// Drop every pointer from the raw mirror.
     ///
     /// Called as the reply leaves its operation. The operation's storage is
     /// moved out on completion, so the pointers recorded during `build` no
-    /// longer describe anything -- and this value is handed back to the caller
-    /// even when the send failed, with an `unsafe` accessor that would otherwise
-    /// expose them.
+    /// longer describe anything, and a reply handed back after a failed send
+    /// must not carry them.
     pub(crate) fn invalidate(&mut self) {
         self.raw = HTTP_RESPONSE_V2::default();
         self.unknown_raw = [HTTP_UNKNOWN_HEADER::default(); INLINE_UNKNOWN_HEADERS];
         self.chunks_raw = [HTTP_DATA_CHUNK::default(); INLINE_CHUNKS];
         self.unknown_raw_spill = Vec::new();
         self.chunks_raw_spill = Vec::new();
-    }
-
-    /// The raw reply structure, for callers needing something outside this API.
-    ///
-    /// # Safety
-    ///
-    /// Meaningful only between a [`build`](Response::build) and the end of the
-    /// operation that performed it. Outside that window every pointer in it has
-    /// been cleared.
-    pub unsafe fn raw(&self) -> &HTTP_RESPONSE_V2 {
-        &self.raw
     }
 }
 
@@ -310,6 +315,32 @@ fn memory_chunk(body: &[u8]) -> HTTP_DATA_CHUNK {
     chunk.Anonymous.FromMemory.BufferLength = body.len() as u32;
     chunk.Anonymous.FromMemory.pBuffer = body.as_ptr() as *mut core::ffi::c_void;
     chunk
+}
+
+/// The API stores header and reason lengths as `u16`.
+fn len_u16(value: &[u8], what: &str) -> Result<u16> {
+    u16::try_from(value.len()).map_err(|_| {
+        Error::new(
+            ERROR_INVALID_PARAMETER.to_hresult(),
+            format!(
+                "{what} is {} bytes; the HTTP Server API stores this length as u16",
+                value.len()
+            ),
+        )
+    })
+}
+
+/// Body chunk lengths are `u32`.
+fn len_u32(value: &[u8], what: &str) -> Result<u32> {
+    u32::try_from(value.len()).map_err(|_| {
+        Error::new(
+            ERROR_INVALID_PARAMETER.to_hresult(),
+            format!(
+                "{what} is {} bytes; the HTTP Server API stores this length as u32",
+                value.len()
+            ),
+        )
+    })
 }
 
 impl std::fmt::Debug for Response {
@@ -381,7 +412,7 @@ mod tests {
             .add_body(&b"hello"[..]);
 
         unsafe {
-            let raw = r.build();
+            let raw = r.build().expect("lengths fit");
             assert_eq!((*raw).Base.StatusCode, 204);
             assert_eq!((*raw).Base.ReasonLength, 10);
             assert!(!(*raw).Base.pReason.is_null());
@@ -392,15 +423,16 @@ mod tests {
         }
 
         r.invalidate();
-        unsafe {
-            let raw = r.raw();
-            assert_eq!(raw.Base.StatusCode, 0);
-            assert!(raw.Base.pReason.is_null());
-            assert_eq!(raw.Base.Headers.UnknownHeaderCount, 0);
-            assert!(raw.Base.Headers.pUnknownHeaders.is_null());
-            assert_eq!(raw.Base.EntityChunkCount, 0);
-            assert!(raw.Base.pEntityChunks.is_null());
-        }
+        // The mirror is cleared, so nothing stale can be handed to the kernel on
+        // a re-send. Checked through the private field, since there is
+        // deliberately no public accessor: a `Response` outside an operation
+        // never has meaningful pointers.
+        assert_eq!(r.raw.Base.StatusCode, 0);
+        assert!(r.raw.Base.pReason.is_null());
+        assert_eq!(r.raw.Base.Headers.UnknownHeaderCount, 0);
+        assert!(r.raw.Base.Headers.pUnknownHeaders.is_null());
+        assert_eq!(r.raw.Base.EntityChunkCount, 0);
+        assert!(r.raw.Base.pEntityChunks.is_null());
 
         // The logical state survives, so the reply can be inspected and re-sent.
         assert_eq!(r.status(), 204);
@@ -408,15 +440,43 @@ mod tests {
         assert_eq!(r.body_len(), 5);
     }
 
+    /// A value too long for the API's `u16` length field must be reported, not
+    /// silently truncated — 65 536 bytes would otherwise wrap to a length of 0.
+    #[test]
+    fn an_oversized_header_value_is_an_error_not_a_truncation() {
+        let mut r = Response::new(200);
+        let huge = vec![b'x'; u16::MAX as usize + 1];
+        r.set_header(ResponseHeader::ETAG, huge);
+
+        let err = unsafe { r.build() }.expect_err("must not truncate");
+        assert!(
+            format!("{err}").contains("u16"),
+            "the error should explain why: {err}"
+        );
+
+        // A value at the limit is fine.
+        let mut ok = Response::new(200);
+        ok.set_header(ResponseHeader::ETAG, vec![b'x'; u16::MAX as usize]);
+        assert!(unsafe { ok.build() }.is_ok());
+    }
+
+    /// The same guard applies to unrecognised header names and values.
+    #[test]
+    fn an_oversized_unknown_header_is_an_error() {
+        let mut r = Response::new(200);
+        r.add_header(&b"X-Big"[..], vec![b'x'; u16::MAX as usize + 1]);
+        assert!(unsafe { r.build() }.is_err());
+    }
+
     /// Rebuilding after a move must pick up the new address.
     #[test]
     fn rebuilding_after_a_move_is_consistent() {
         let mut r = Response::new(200);
         r.add_body(&b"body"[..]);
-        unsafe { r.build() };
+        unsafe { r.build() }.expect("lengths fit");
 
         let mut moved = r;
-        let raw = unsafe { moved.build() };
+        let raw = unsafe { moved.build() }.expect("lengths fit");
         // The chunk descriptor must point at the (heap) body, and the chunk
         // array at the moved value's own inline storage.
         unsafe {

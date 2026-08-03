@@ -91,25 +91,27 @@ pub struct Server {
 impl Server {
     /// Bind `http://localhost:<port>/<path>/` and return a ready listener.
     ///
-    /// Returns `None` when the URL cannot be bound -- typically because the
-    /// caller lacks a URL reservation -- so tests skip rather than fail on a
-    /// machine that cannot host a listener.
+    /// Returns `None` **only** when the URL itself cannot be bound -- typically
+    /// because the caller lacks a URL reservation -- so tests skip on a machine
+    /// that cannot host a listener. Every other step panics on failure: those
+    /// are the setup requirements under test, and silently turning a regression
+    /// in them into a skipped test would make most criteria vacuous.
     pub fn start(port: u16, path: &str, config: ReceiveConfig) -> Option<Server> {
-        let http = HttpInitializer::new().ok()?;
-        let session = Box::new(ServerSession::new().ok()?);
+        let http = HttpInitializer::new().expect("HttpInitializer::new");
+        let session = Box::new(ServerSession::new().expect("ServerSession::new"));
 
         // SAFETY: the session is boxed, so its address is stable, and `Binding`
         // drops the group before the session. The lifetime is erased only so the
         // two can be stored together.
         let session_ref: &'static ServerSession = unsafe { &*(&*session as *const ServerSession) };
-        let group = UrlGroup::new(session_ref).ok()?;
+        let group = UrlGroup::new(session_ref).expect("UrlGroup::new");
 
-        let queue = RequestQueue::with_config(config).ok()?;
-        queue.bind_url_group(&group).ok()?;
+        let queue = RequestQueue::with_config(config).expect("RequestQueue::with_config");
+        queue.bind_url_group(&group).expect("bind_url_group");
 
         let url = HSTRING::from(format!("http://localhost:{port}/{path}/"));
         if let Err(e) = group.add_url(&url) {
-            eprintln!("skipping: cannot bind {url}: {e}");
+            eprintln!("skipping: cannot bind {url}: {e} (a URL reservation may be needed)");
             return None;
         }
 

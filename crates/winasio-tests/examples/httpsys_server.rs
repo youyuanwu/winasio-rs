@@ -8,20 +8,18 @@
 //
 // Run it directly:
 //
-// ```text
-// cargo run -p winasio-tests --example httpsys_server
-// ```
+//     cargo run -p winasio-tests --example httpsys_server
 //
 // then `curl http://localhost:12367/example/anything`.
 //
 // The crate deliberately leaves the accept loop to the caller, so this is what
 // one looks like. It is also compiled and executed by the test suite, which is
 // what keeps it honest.
+//
+// `winasio` itself depends on no async runtime; this example picks tokio purely
+// to have something to await on.
 
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use windows::core::{Result, HSTRING};
 
@@ -32,9 +30,9 @@ use winasio::httpsys::{
 
 /// Serve `count` requests, then stop. Pass `usize::MAX` to serve forever.
 ///
-/// There is no `unsafe` anywhere in this function: reading the request and
-/// composing the reply are entirely safe operations.
-pub fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
+/// There is no `unsafe` anywhere in this file: setting a listener up, reading a
+/// request and composing a reply are all safe operations.
+pub async fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
     let _http = HttpInitializer::new()?;
     let session = ServerSession::new()?;
     let group = UrlGroup::new(&session)?;
@@ -47,13 +45,13 @@ pub fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
 
     let mut served = 0usize;
     while served < count {
-        let request = match block_on(queue.receive()) {
+        let request = match queue.receive().await {
             Ok(r) => r,
-            // Did not fit even after retrying. Clear it, or the next receive
-            // would return the very same request forever.
+            // Did not fit even after retrying. The library has already discarded
+            // it, so simply carrying on is safe -- there is nothing left queued
+            // to spin on.
             Err(ReceiveError::TooLarge { id, .. }) => {
-                eprintln!("rejecting an over-large request");
-                let _ = block_on(queue.reject(id));
+                eprintln!("discarded an over-large request ({id:?})");
                 continue;
             }
             // The queue was closed, or the operation was cancelled.
@@ -74,7 +72,10 @@ pub fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
 
         // Read a body, if there is one.
         let body = if request.has_more_body() {
-            block_on(queue.read_body_to_end(request.id(), 64 * 1024)).unwrap_or_default()
+            queue
+                .read_body_to_end(request.id(), 64 * 1024)
+                .await
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -106,7 +107,7 @@ pub fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
         }
 
         // The reply comes back whether or not the send succeeded.
-        let outcome = block_on(queue.send(request.id(), reply));
+        let outcome = queue.send(request.id(), reply).await;
         if let Err(e) = outcome.0 {
             eprintln!("send failed: {e}");
         }
@@ -118,38 +119,10 @@ pub fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
     Ok(())
 }
 
-/// A minimal executor, so the example depends on no async runtime.
-pub fn block_on<F: Future>(fut: F) -> F::Output {
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |d| RawWaker::new(d, &VTABLE),
-        |d| unsafe { (*(d as *const AtomicBool)).store(true, Ordering::SeqCst) },
-        |d| unsafe { (*(d as *const AtomicBool)).store(true, Ordering::SeqCst) },
-        |_| {},
-    );
-
-    let flag = AtomicBool::new(true);
-    let raw = RawWaker::new(&flag as *const AtomicBool as *const (), &VTABLE);
-    // SAFETY: the vtable only touches the `AtomicBool`, which outlives the waker
-    // because the future is driven to completion before this returns.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = Context::from_waker(&waker);
-    let mut fut = fut;
-    // SAFETY: `fut` lives on this stack frame and is never moved again.
-    let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
-
-    loop {
-        if flag.swap(false, Ordering::SeqCst) {
-            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-                return v;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
 #[allow(dead_code)]
-fn main() {
-    if let Err(e) = run_server(12367, "example", usize::MAX) {
+#[tokio::main]
+async fn main() {
+    if let Err(e) = run_server(12367, "example", usize::MAX).await {
         eprintln!("server failed: {e}");
         std::process::exit(1);
     }

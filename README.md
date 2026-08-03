@@ -72,10 +72,11 @@ Three things are worth knowing:
   each side — `Cookie` and `Retry-After` are both 25. `RequestHeader` and
   `ResponseHeader` cannot be interchanged, and the compiler enforces it.
 - **An over-large request must be rejected, not just logged.** Requests are
-  retried at a larger buffer automatically; past the retry bound you get
-  `ReceiveError::TooLarge` carrying the id, and must call `reject`. The request
-  stays queued otherwise, so a loop that only logged the error would spin on it
-  forever.
+  retried at a larger buffer automatically; past the retry bound the library
+  discards the request itself and reports `ReceiveError::TooLarge`. Discarding is
+  not left to the caller, because a queued request that cannot be delivered would
+  be returned by every subsequent receive — so a loop that only logged the error
+  would spin on it forever.
 
 See the [example server](./crates/winasio-tests/examples/httpsys_server.rs) for
 complete, runnable code.
