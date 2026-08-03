@@ -204,6 +204,16 @@ where
                 return TransferResult::failure(buffer, transferred, TransferError::ClosedPeer);
             }
             Ok(ReadOutcome::Bytes(n) | ReadOutcome::MoreData(n)) => {
+                // Defence in depth: clamp to what was actually asked for before
+                // using this as the next window's offset. The operation clamps
+                // before `set_init`, so a platform over-report cannot publish
+                // uninitialised bytes there -- but this offset feeds the *next*
+                // `TailBuf`, and an unclamped value would move the window past
+                // the initialised region and expose those bytes through a safe
+                // slice. Windows cannot currently report more than the requested
+                // length, so this is unreachable; it is cheap insurance against
+                // that ever changing.
+                let n = n.min(target - transferred);
                 transferred += n;
                 T::advance_position(&mut position, n);
             }

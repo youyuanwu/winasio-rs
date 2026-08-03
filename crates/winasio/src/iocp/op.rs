@@ -115,11 +115,15 @@ pub unsafe trait OpCode: 'static {
     /// Lets an operation read back fields Windows filled in — transferred
     /// lengths, address sizes, flags — while it still has `&mut self`.
     ///
-    /// Called **at most once**, from whichever path resolved the operation:
-    /// the completion packet, or the inline path when [`OpCode::operate`]
-    /// finished synchronously and no packet will follow. An operation that must
-    /// classify a condition the platform can report either way therefore needs
-    /// no separate inline hook.
+    /// Runs on whichever path resolved the operation: the completion packet, or
+    /// the inline path when [`OpCode::operate`] finished synchronously and no
+    /// packet will follow. An operation that must classify a condition the
+    /// platform can report either way therefore needs no separate inline hook.
+    ///
+    /// **Not guaranteed to run exactly once.** An operation that classifies its
+    /// own inline result inside `operate` will also see the driver's inline
+    /// call, so implementations must be idempotent rather than assuming a
+    /// single invocation.
     ///
     /// # Safety
     ///
