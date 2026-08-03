@@ -155,8 +155,10 @@ impl<S: Submitter> NamedPipe<S> {
     /// Fill the buffer's full capacity from the pipe.
     ///
     /// A closed peer before the capacity is filled is reported as
-    /// [`crate::io::TransferError::UnexpectedEof`], with the partially filled
-    /// buffer and transferred count returned in the result.
+    /// [`crate::io::TransferError::ClosedPeer`], with the partially filled
+    /// buffer and transferred count returned in the result. A stream that
+    /// simply ends without a peer closing — which a pipe cannot do, but a file
+    /// can — reports [`crate::io::TransferError::UnexpectedEof`] instead.
     ///
     /// If the returned future is dropped before resolving, bytes already
     /// transferred from the peer are not undone, and neither the buffer nor the

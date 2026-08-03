@@ -150,8 +150,10 @@ pub unsafe trait OpCode: 'static {
     /// against any buffer length: an implementation that uses it to publish
     /// initialised bytes must clamp it to its own capacity first.
     ///
-    /// Called under the same conditions as [`OpCode::on_complete`] — at most
-    /// once, from either the completion path or the inline path.
+    /// Called under the same conditions as [`OpCode::on_complete`], and with
+    /// the same caveat: it is **not** guaranteed to run exactly once, because
+    /// an operation that classifies its own inline result inside `operate` also
+    /// sees the driver's inline call. Implementations must be idempotent.
     ///
     /// # Safety
     ///
