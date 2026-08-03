@@ -4,184 +4,171 @@
 // license information.
 // ------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
+//! End-to-end HTTP.sys coverage, and the example server.
+//!
+//! Covers SC-001: a complete server -- set up, receive, interpret, reply -- is
+//! written with no `unsafe` in its own code, and is executed here rather than
+//! merely compiled. `cargo test --all-targets` builds `examples/` but does not
+//! run them, so the example is included and driven directly.
 
-    use std::sync::Arc;
+mod common;
 
-    use tokio::sync::oneshot::{self};
-    use windows::{
-        core::HSTRING,
-        Win32::Networking::{
-            HttpServer::{HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY, HTTP_SEND_RESPONSE_FLAG_DISCONNECT},
-            WinHttp::{WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_OPEN_REQUEST_FLAGS},
-        },
+use common::{block_on, parse_response, send_raw, Server};
+use winasio::httpsys::{Method, ReceiveConfig, Response, ResponseHeader};
+
+/// The example server, compiled into this test binary so it can be run.
+#[allow(dead_code)]
+mod example {
+    include!("../examples/httpsys_server.rs");
+}
+
+const PORT: u16 = 12356;
+const EXAMPLE_PORT: u16 = 12367;
+
+/// SC-001: the example server really serves, and contains no `unsafe` at all.
+///
+/// The example is checked for `unsafe` textually below, so this is not merely a
+/// claim in a comment.
+#[test]
+fn the_example_server_serves_requests() {
+    // Serve exactly three requests, then stop.
+    let server = std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(example::run_server(EXAMPLE_PORT, "example", 3))
+    });
+
+    // Give the listener time to bind. If it cannot (no URL reservation), the
+    // client requests simply fail and the test skips.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let get = send_raw(EXAMPLE_PORT, "GET", "example/hello", &[], &[]);
+    let Some(get) = get else {
+        eprintln!("skipping: the example could not bind {EXAMPLE_PORT}");
+        return;
     };
+    let (status, headers, body) = parse_response(&get);
+    assert!(status.contains("200"), "got {status:?}");
+    assert!(
+        String::from_utf8_lossy(&body).contains("/example/hello"),
+        "body was {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("X-Powered-By") && v == "winasio"),
+        "the example's own header should be present"
+    );
 
-    use std::pin::Pin;
-    use winasio::{
-        httpsys::{HttpInitializer, Request, RequestQueue, Response, ServerSession, UrlGroup},
-        winhttp::HSession,
-    };
+    let post = send_raw(EXAMPLE_PORT, "POST", "example/data", &[], b"twelve bytes").unwrap();
+    let (_, _, body) = parse_response(&post);
+    assert!(
+        String::from_utf8_lossy(&body).contains("received 12 bytes"),
+        "the example should read the body, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
 
-    /// Reads the raw URL back out of a received request.
-    ///
-    /// This deliberately follows a pointer that HTTP.sys wrote into the
-    /// request's own inline buffer. If the request had been moved after
-    /// completion, this would read freed or relocated memory -- which is why
-    /// it comes back pinned.
-    fn raw_url_of(req: &Request) -> String {
-        let base = &req.raw_ref().Base;
-        if base.pRawUrl.is_null() || base.RawUrlLength == 0 {
-            return String::new();
-        }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(base.pRawUrl.0, base.RawUrlLength as usize) };
-        String::from_utf8_lossy(bytes).into_owned()
-    }
+    let odd = send_raw(EXAMPLE_PORT, "DELETE", "example/x", &[], &[]).unwrap();
+    let (status, _, _) = parse_response(&odd);
+    assert!(status.contains("405"), "got {status:?}");
 
-    async fn handle_request(queue: Arc<RequestQueue>, req: Pin<Box<Request>>) {
-        let id = req.raw_ref().Base.RequestId;
+    server.join().expect("example thread").expect("example ran");
+}
 
-        // Follow a kernel-written pointer after the request was handed back.
-        let url = raw_url_of(&req);
+/// SC-001's other half: the example contains no `unsafe` whatsoever.
+///
+/// Asserted textually rather than trusted, because the whole point of the
+/// criterion is that a complete server needs none.
+#[test]
+fn the_example_server_contains_no_unsafe() {
+    let source = include_str!("../examples/httpsys_server.rs");
+    for (n, line) in source.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
         assert!(
-            url.contains("winhttpapitest"),
-            "the pinned request's URL pointer must still be valid, got {url:?}"
+            !code.contains("unsafe"),
+            "examples/httpsys_server.rs:{} uses `unsafe`: {line}",
+            n + 1
         );
-
-        let mut resp = Response::default();
-        resp.add_body_chunk(String::from("hello world"));
-
-        println!("run_test_server send_response");
-        let out = queue
-            .async_send_response(id, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, resp)
-            .await;
-        if let Err(e) = &out.0 {
-            println!("send resp failed: {e:?}");
-        }
     }
+}
 
-    async fn run_test_server(queue: Arc<RequestQueue>) {
-        println!("run_test_server begin");
-        loop {
-            println!("run_test_server receive_request");
-            // The task can be cancelled here when the queue shuts down.
-            let out = queue
-                .async_receive_request(0, HTTP_RECEIVE_REQUEST_FLAG_COPY_BODY)
-                .await;
-            let (result, req) = out.into_parts();
-            if let Err(e) = result {
-                println!("receive request failed: {e:?}");
-                continue;
-            }
-            let queue_cp = queue.clone();
-            // Detached, not joinable.
-            let _h = tokio::spawn(async move {
-                handle_request(queue_cp, req).await;
-            });
-        }
-    }
+/// A full request/response cycle over the public API, with no `unsafe` anywhere
+/// in this test -- which is the point. The API this replaces required the caller
+/// to dereference a kernel-written pointer by hand just to read the URL.
+#[test]
+fn a_complete_cycle_uses_only_safe_code() {
+    let server = match Server::start(PORT, "e2e", ReceiveConfig::default()) {
+        Some(s) => s,
+        None => return,
+    };
 
-    /// The pinning guarantee is only real if `Request` opts out of `Unpin`.
-    ///
-    /// Were it `Unpin`, safe code could call `Pin::into_inner` on the returned
-    /// request and move it out, dangling every pointer HTTP.sys wrote into its
-    /// inline buffer. This would compile if that protection were lost.
-    #[test]
-    fn request_is_not_unpin() {
-        trait AmbiguousIfUnpin<A> {
-            fn some_item(&self) {}
-        }
-        struct Token;
-        impl<T: ?Sized> AmbiguousIfUnpin<()> for T {}
-        impl<T: ?Sized + Unpin> AmbiguousIfUnpin<Token> for T {}
+    let client = server.request(
+        "POST",
+        "e2e/resource?x=1",
+        &[("X-Request-Id", "abc"), ("Content-Type", "text/plain")],
+        b"request body",
+    );
 
-        // Resolves unambiguously only when `Request` is NOT `Unpin`.
-        <Request as AmbiguousIfUnpin<_>>::some_item(&Request::default());
-    }
+    let request = block_on(server.queue().receive()).expect("receive");
 
-    #[test]
-    fn server_test() {
-        let (tx, rx) = oneshot::channel::<()>();
+    assert_eq!(request.method(), Method::Post);
+    assert!(request.target().unwrap().contains("/e2e/resource"));
+    assert_eq!(request.query_lossy(), "?x=1");
+    assert_eq!(request.unknown_header("X-Request-Id"), Some(&b"abc"[..]));
+    assert_eq!(request.version(), (1, 1));
+    assert!(request.peer_address().is_some());
 
-        let th = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                HttpInitializer::default();
+    let body = block_on(server.queue().read_body_to_end(request.id(), 4096)).expect("body");
+    assert_eq!(body, b"request body");
 
-                let session = ServerSession::default();
+    let mut reply = Response::new(201);
+    reply
+        .set_reason(&b"Created"[..])
+        .set_header(ResponseHeader::CONTENT_TYPE, &b"text/plain"[..])
+        .set_header(ResponseHeader::LOCATION, &b"/e2e/resource/1"[..])
+        .add_header(&b"X-Request-Id"[..], b"abc".to_vec())
+        .add_body(&b"created\n"[..]);
 
-                let url_group = UrlGroup::new(&session);
-                url_group
-                    .add_url(HSTRING::from("http://localhost:12356/winhttpapitest/"))
-                    .unwrap();
+    block_on(server.queue().send(request.id(), reply))
+        .0
+        .expect("send");
 
-                let request_queue = Arc::new(RequestQueue::new().unwrap());
-                request_queue.bind_url_group(&url_group).unwrap();
+    let (status, headers, body) = parse_response(&client.join().unwrap().expect("a reply"));
+    assert!(status.contains("201"), "got {status:?}");
+    assert!(status.contains("Created"));
+    assert_eq!(body, b"created\n");
 
-                tokio::select! {
-                  _ = rx =>{
-                    println!("Shutdown signal received.")
-                  }
-                  _ = async{
-                    run_test_server(request_queue.clone()).await
-                  } => {}
-                }
-                println!("queue handle out of scope.");
-                // rely on drop to close
-                // request_queue.close();
-            });
-        });
+    let find = |n: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(find("Location"), Some("/e2e/resource/1"));
+    assert_eq!(find("X-Request-Id"), Some("abc"));
+    assert_eq!(find("Content-Type"), Some("text/plain"));
+}
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        // send a basic request using winhttp
-        {
-            let session = HSession::new(
-                HSTRING::from("Rust2"),
-                WINHTTP_ACCESS_TYPE_NO_PROXY,
-                HSTRING::new(),
-                HSTRING::new(),
-                0,
-            )
-            .unwrap();
+/// A serve loop keeps working across many sequential requests, which is the
+/// shape every real caller will write.
+#[test]
+fn a_serve_loop_handles_many_requests_in_sequence() {
+    let server = match Server::start(PORT + 1, "loop", ReceiveConfig::default()) {
+        Some(s) => s,
+        None => return,
+    };
 
-            let conn = session.connect(HSTRING::from("localhost"), 12356).unwrap();
+    for i in 0..25u32 {
+        let client = server.request("GET", &format!("loop/{i}"), &[], &[]);
+        let request = block_on(server.queue().receive()).expect("receive");
 
-            let req = conn
-                .open_request(
-                    HSTRING::from("GET"),
-                    HSTRING::from("winhttpapitest"),
-                    HSTRING::from("HTTP/1.1"),
-                    HSTRING::new(),
-                    Some(vec![HSTRING::from("application/json")]),
-                    WINHTTP_OPEN_REQUEST_FLAGS(0), // not use WINHTTP_FLAG_SECURE
-                )
-                .unwrap();
+        let mut reply = Response::new(200);
+        reply.add_body(request.raw_target().to_vec());
+        block_on(server.queue().send(request.id(), reply))
+            .0
+            .expect("send");
 
-            req.send(HSTRING::new(), &[], 0, 0).unwrap();
-
-            req.receieve_response().unwrap();
-
-            loop {
-                let mut len = 0;
-                req.query_data_available(Some(&mut len)).unwrap();
-                if len == 0 {
-                    break;
-                }
-                let mut buffer: Vec<u8> = vec![0; len as usize];
-                let mut lpdwnumberofbytesread: u32 = 0;
-                req.read_data(buffer.as_mut_slice(), len, Some(&mut lpdwnumberofbytesread))
-                    .unwrap();
-
-                let s = String::from_utf8_lossy(&buffer);
-                print!("{}", s);
-            }
-            println!();
-        }
-
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        tx.send(()).unwrap();
-        th.join().unwrap();
+        let (_, _, body) = parse_response(&client.join().unwrap().expect("a reply"));
+        assert_eq!(String::from_utf8_lossy(&body), format!("/loop/{i}"));
     }
 }

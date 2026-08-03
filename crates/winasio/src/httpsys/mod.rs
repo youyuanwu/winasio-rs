@@ -1,370 +1,148 @@
-pub mod ops;
+// ------------------------------------------------------------
+// Copyright 2023 Youyuan Wu
+// Licensed under the MIT License (MIT). See License.txt in the repo root for
+// license information.
+// ------------------------------------------------------------
 
-use std::marker::PhantomPinned;
-use std::pin::Pin;
+//! A safe, asynchronous wrapper over the Windows HTTP Server API (HTTP.sys).
+//!
+//! This is a building block, not a framework. It gives you everything needed to
+//! interpret a request, read its body, compose a reply and send it, and leaves
+//! the accept loop to you. Operations are built on [`crate::iocp`], so nothing
+//! here depends on a particular async runtime.
+//!
+//! # A minimal server
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use windows::core::HSTRING;
+//! use winasio::httpsys::{
+//!     HttpInitializer, RequestQueue, Response, ResponseHeader, ServerSession, UrlGroup,
+//! };
+//!
+//! # async fn run() -> windows::core::Result<()> {
+//! let _http = HttpInitializer::new()?;
+//! let session = ServerSession::new()?;
+//! let group = UrlGroup::new(&session)?;
+//!
+//! let queue = Arc::new(RequestQueue::new()?);
+//! queue.bind_url_group(&group)?;
+//! group.add_url(&HSTRING::from("http://localhost:8080/demo/"))?;
+//!
+//! while let Ok(request) = queue.receive().await {
+//!     // Borrowed from the request's own buffer; no allocation.
+//!     let target = request.target().unwrap_or_default().to_owned();
+//!
+//!     let mut reply = Response::new(200);
+//!     reply
+//!         .set_header(ResponseHeader::CONTENT_TYPE, &b"text/plain"[..])
+//!         .add_body(format!("you asked for {target}").into_bytes());
+//!
+//!     queue.send(request.id(), reply).await.0?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A complete, runnable version lives in the test crate's
+//! `examples/httpsys_server.rs`.
+//!
+//! # Invariants and obligations
+//!
+//! * **A received [`Request`] is an ordinary value.** HTTP.sys writes the URL,
+//!   headers and addresses into the tail of a buffer and stores pointers to that
+//!   tail in the header at its start. Because the buffer is a heap allocation of
+//!   its own, moving a `Request` moves a pointer rather than the bytes, so those
+//!   pointers stay valid. No `Pin` is involved.
+//!
+//! * **Accessors borrow, they do not copy.** [`Request::raw_target`],
+//!   [`Request::header`] and the rest return slices into the request's buffer,
+//!   tied to its lifetime. Reading a request allocates nothing.
+//!
+//!   The one exception is the operating system's pre-parsed URL components,
+//!   which it supplies as UTF-16. Those are available borrowed as `&[u16]` --
+//!   [`Request::path_wide`] and friends -- or converted with the `*_lossy`
+//!   forms, which do allocate.
+//!
+//! * **Request and reply header names are different types.** HTTP.sys numbers
+//!   the two sets differently, and every identifier from 20 to 29 means a
+//!   *different header* on each side. [`RequestHeader`] and [`ResponseHeader`]
+//!   are therefore not interchangeable, and the compiler enforces it.
+//!
+//! * **A reply may be built and moved freely before it is sent.** Every pointer
+//!   inside it is derived at send time, once the operation has reached its final
+//!   address. Values that are compile-time constants cost no allocation.
+//!
+//! * **State comes back.** Sends and body operations resolve to an
+//!   [`OpResult`](crate::iocp::OpResult), which carries the outcome *and* the
+//!   reply or buffer that was handed in -- on failure as well as success.
+//!
+//! * **Over-large requests are retried, then discarded.** A request whose
+//!   metadata exceeds the configured capacity is retried at a larger size, up to
+//!   [`ReceiveConfig::max_retries`]. Beyond that the library **discards it** and
+//!   reports [`ReceiveError::TooLarge`]. Discarding happens here rather than in
+//!   your code deliberately: a queued request that cannot be delivered would be
+//!   returned by every subsequent receive, so an accept loop that logged the
+//!   error and continued would spin forever. [`RequestQueue::reject`] remains
+//!   available for discarding a request you have already received.
+//!
+//! * **Closing is how a server stops.** [`RequestQueue::close`] takes `&self`,
+//!   so a queue shared as an `Arc` can be shut down while workers are blocked in
+//!   [`RequestQueue::receive`]; their receives then resolve with an error.
+//!   Closing cancels and drains outstanding operations before releasing the
+//!   handle.
+//!
+//! * **Caller obligations the API does not enforce.** The operating system
+//!   forbids two sends running concurrently on the *same* request identifier, so
+//!   a request is best owned end to end by whoever received it. Serving
+//!   *different* requests from many threads at once is fine. The operating
+//!   system also appends its own product token to whatever `Server` header the
+//!   application sets, so that header is not observed verbatim by a client.
+//!
+//! # Allocation budget
+//!
+//! Serving one request end to end costs **three** allocations: the receive
+//! operation's record, the request's metadata buffer, and the send operation's
+//! record. That figure does not change with the number of headers read or set.
+//!
+//! Beyond that: a receive retry adds two, each body operation adds one, and a
+//! reply exceeding [`INLINE_UNKNOWN_HEADERS`] unrecognised headers or
+//! [`INLINE_CHUNKS`] body chunks adds **two** for that kind — the overflow
+//! storage, plus the contiguous descriptor array the operating system requires.
+//! These figures are measured by the test suite, not merely asserted here.
 
-use windows::{
-    core::{Error, HRESULT, HSTRING},
-    Win32::{
-        Foundation::HANDLE,
-        Networking::HttpServer::{
-            HttpAddUrlToUrlGroup, HttpCloseRequestQueue, HttpCloseServerSession, HttpCloseUrlGroup,
-            HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup,
-            HttpDataChunkFromMemory, HttpInitialize, HttpServerBindingProperty,
-            HttpSetUrlGroupProperty, HttpTerminate, HTTPAPI_VERSION, HTTP_BINDING_INFO,
-            HTTP_DATA_CHUNK, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER,
-            HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_V2, HTTP_RESPONSE_V2,
-            HTTP_SERVER_PROPERTY,
-        },
-    },
-};
+mod error;
+mod header;
+mod init;
+mod ops;
+mod queue;
+mod request;
+mod response;
+mod session;
 
-use crate::iocp::{OpResult, Submit, ThreadPoolIo};
-pub use ops::{ReceiveRequest, SendResponse};
+pub use header::{RequestHeader, ResponseHeader};
+pub use init::HttpInitializer;
+pub use ops::body::ReceiveBody;
+pub use ops::cancel::CancelRequest;
+pub use ops::receive::ReceiveRequest;
+pub use ops::send::{SendBody, SendResponse};
+pub use queue::{ReceiveConfig, ReceiveError, RequestQueue};
+pub use request::{Method, Request, RequestId, UnknownHeaders, MIN_CAPACITY};
+pub use response::{Response, Value, INLINE_CHUNKS, INLINE_UNKNOWN_HEADERS};
+pub use session::{ServerSession, UrlGroup};
 
-static G_HTTP_VERSION: HTTPAPI_VERSION = HTTPAPI_VERSION {
-    HttpApiMajorVersion: 2,
-    HttpApiMinorVersion: 0,
-};
-
-pub struct HttpInitializer {}
-
-impl HttpInitializer {
-    pub fn default() {
-        let ec = unsafe {
-            HttpInitialize(
-                G_HTTP_VERSION,
-                HTTP_INITIALIZE_SERVER | HTTP_INITIALIZE_CONFIG,
-                None,
-            )
-        };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-    }
-
-    // pub fn create_request_queue() -> Result<HANDLE, Error> {
-    //     let mut h: HANDLE = HANDLE::default();
-    //     let ec = unsafe {
-    //         HttpCreateRequestQueue(G_HTTP_VERSION, None, None, 0, std::ptr::addr_of_mut!(h))
-    //     };
-    //     let err = Error::from(HRESULT(ec.try_into().unwrap()));
-    //     if err.code().is_err() {
-    //         Err(err)
-    //     } else {
-    //         assert!(!h.is_invalid());
-    //         Ok(h)
-    //     }
-    // }
-}
-
-impl Drop for HttpInitializer {
-    fn drop(&mut self) {
-        let ec = unsafe { HttpTerminate(HTTP_INITIALIZE_SERVER | HTTP_INITIALIZE_CONFIG, None) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-    }
-}
-
-pub struct ServerSession {
-    id: u64,
-}
-
-impl ServerSession {
-    pub fn new() -> ServerSession {
-        let mut id: u64 = 0;
-        let ec =
-            unsafe { HttpCreateServerSession(G_HTTP_VERSION, std::ptr::addr_of_mut!(id), None) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-        ServerSession { id }
-    }
-}
-impl Default for ServerSession {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for ServerSession {
-    fn drop(&mut self) {
-        let ec = unsafe { HttpCloseServerSession(self.id) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-    }
-}
-
-pub struct UrlGroup<'a> {
-    // session can only be deleted after urlgroup deallocates
-    _session: &'a ServerSession,
-    id: u64,
-}
-
-impl UrlGroup<'_> {
-    pub fn new(session: &ServerSession) -> UrlGroup<'_> {
-        let mut id: u64 = 0;
-        let ec = unsafe { HttpCreateUrlGroup(session.id, std::ptr::addr_of_mut!(id), None) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-        UrlGroup {
-            _session: session,
-            id,
-        }
-    }
-
-    unsafe fn set_property(
-        &self,
-        property: HTTP_SERVER_PROPERTY,
-        propertyinformation: *const ::core::ffi::c_void,
-        propertyinformationlength: u32,
-    ) -> Result<(), Error> {
-        let ec = unsafe {
-            HttpSetUrlGroupProperty(
-                self.id,
-                property,
-                propertyinformation,
-                propertyinformationlength,
-            )
-        };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        err.code().ok()
-    }
-
-    pub fn set_binding_info(&self, info: &HTTP_BINDING_INFO) -> Result<(), Error> {
-        let info_ptr: *const HTTP_BINDING_INFO = info;
-        unsafe {
-            self.set_property(
-                HttpServerBindingProperty,
-                info_ptr as *const std::ffi::c_void,
-                std::mem::size_of::<HTTP_BINDING_INFO>() as u32,
-            )
-        }
-    }
-
-    pub fn add_url(&self, url: HSTRING) -> Result<(), Error> {
-        let ec = unsafe { HttpAddUrlToUrlGroup(self.id, &url, 0, None) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        err.code().ok()
-    }
-}
-
-impl Drop for UrlGroup<'_> {
-    fn drop(&mut self) {
-        let ec = unsafe { HttpCloseUrlGroup(self.id) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-    }
-}
-
-/// A received HTTP request.
+/// The element the request buffer is allocated as.
 ///
-/// HTTP.sys treats this whole struct as one buffer: it writes the URL, headers
-/// and entity metadata into `buff` and stores pointers to that region inside
-/// `raw`. Moving the value would dangle every one of those pointers, so a
-/// received request is only ever handed back as `Pin<Box<Request>>`.
-///
-/// The [`PhantomPinned`] is what makes that guarantee real. Without it the type
-/// would be [`Unpin`], and safe code could call `Pin::into_inner` to move the
-/// value straight back out.
-#[repr(C)]
-pub struct Request {
-    raw: HTTP_REQUEST_V2,
-    // additional buffer
-    buff: [u8; 1024],
-    /// Opts out of `Unpin`; see the type docs.
-    _pin: PhantomPinned,
-}
+/// Its alignment must cover `HTTP_REQUEST_V2`'s; see [`Request`].
+pub(crate) type BufferUnit = u64;
 
-impl Default for Request {
-    fn default() -> Request {
-        Request {
-            raw: HTTP_REQUEST_V2::default(),
-            buff: [0; 1024],
-            _pin: PhantomPinned,
-        }
-    }
-}
-
-impl Request {
-    /// Mutable access to the parsed header.
-    ///
-    /// # Safety
-    ///
-    /// After a request has been received, `raw` holds pointers into this
-    /// allocation's inline buffer. Overwriting them -- for instance with
-    /// `mem::replace` or `HTTP_REQUEST_V2::default()` -- leaves
-    /// [`Request::raw_ref`] consumers dereferencing arbitrary values.
-    ///
-    /// Callers must not invalidate those pointers.
-    pub unsafe fn raw_mut(&mut self) -> &mut HTTP_REQUEST_V2 {
-        &mut self.raw
-    }
-
-    /// Read-only view of the parsed request.
-    ///
-    /// Fields such as `pRawUrl` and the header arrays point into this same
-    /// allocation, which is why a received request is handed back pinned.
-    pub fn raw_ref(&self) -> &HTTP_REQUEST_V2 {
-        &self.raw
-    }
-
-    /// Pointer to the embedded header, for handing to HTTP.sys.
-    pub(crate) fn raw_ptr(&mut self) -> *mut HTTP_REQUEST_V2 {
-        &mut self.raw
-    }
-
-    pub fn size() -> u32 {
-        std::mem::size_of::<Request>() as u32
-    }
-}
-// request should be safe
-unsafe impl Send for Request {}
-unsafe impl Sync for Request {}
-
-// respose wrapper
-#[derive(Default)]
-#[repr(C)]
-pub struct Response {
-    raw: HTTP_RESPONSE_V2,
-    data_chunks: Box<HTTP_DATA_CHUNK>,
-    strings: String,
-}
-// resp should be safe
-unsafe impl Send for Response {}
-unsafe impl Sync for Response {}
-
-impl Response {
-    pub fn raw(&self) -> *const HTTP_RESPONSE_V2 {
-        &self.raw
-    }
-
-    // only support 1 chunk for now.
-    pub fn add_body_chunk(&mut self, data: String) {
-        self.strings = data;
-
-        let mut chunk = Box::<HTTP_DATA_CHUNK>::default();
-        chunk.DataChunkType = HttpDataChunkFromMemory;
-        chunk.Anonymous.FromMemory.BufferLength = self.strings.len() as u32;
-        chunk.Anonymous.FromMemory.pBuffer = self.strings.as_mut_ptr() as *mut std::ffi::c_void;
-
-        self.raw.Base.EntityChunkCount = 1;
-        self.raw.Base.pEntityChunks = &mut *chunk;
-
-        self.data_chunks = chunk;
-    }
-}
-
-pub struct RequestQueue {
-    h: HANDLE,
-    /// Completions are delivered by the Win32 thread pool.
-    ///
-    /// A request queue is shared across tasks on a multi-threaded runtime, so
-    /// the caller-driven `Proactor` -- which is `!Send` and needs someone to
-    /// poll it -- would not fit.
-    io: Option<ThreadPoolIo>,
-}
-
-// resp should be safe
-unsafe impl Send for RequestQueue {}
-unsafe impl Sync for RequestQueue {}
-
-impl RequestQueue {
-    pub fn new() -> Result<RequestQueue, Error> {
-        let mut h: HANDLE = HANDLE::default();
-        let ec = unsafe {
-            HttpCreateRequestQueue(G_HTTP_VERSION, None, None, None, std::ptr::addr_of_mut!(h))
-        };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        if err.code().is_err() {
-            Err(err)
-        } else {
-            assert!(!h.is_invalid());
-            let io = ThreadPoolIo::new(h).map_err(Error::from)?;
-            Ok(RequestQueue { h, io: Some(io) })
-        }
-    }
-
-    pub fn bind_url_group(&self, url_group: &UrlGroup) -> Result<(), Error> {
-        let info = HTTP_BINDING_INFO {
-            Flags: windows::Win32::Networking::HttpServer::HTTP_PROPERTY_FLAGS { _bitfield: 1 },
-            RequestQueueHandle: self.h,
-        };
-        url_group.set_binding_info(&info)
-    }
-
-    /// Receive the next request.
-    ///
-    /// The request is returned pinned: HTTP.sys writes pointers into its own
-    /// inline buffer, so moving it out would leave them dangling.
-    pub fn receive_request(
-        &self,
-        requestid: u64,
-        flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-    ) -> Submit<ReceiveRequest> {
-        self.io
-            .as_ref()
-            .expect("request queue is open")
-            .submit(ReceiveRequest::new(self.h, requestid, flags))
-    }
-
-    /// Send a response, taking ownership of it for the operation's duration.
-    pub fn send_response(
-        &self,
-        requestid: u64,
-        flags: u32,
-        response: Response,
-    ) -> Submit<SendResponse> {
-        self.io
-            .as_ref()
-            .expect("request queue is open")
-            .submit(SendResponse::new(self.h, requestid, flags, response))
-    }
-
-    /// Await the next request, returning it with the transferred byte count.
-    pub async fn async_receive_request(
-        &self,
-        requestid: u64,
-        flags: HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
-    ) -> OpResult<usize, Pin<Box<Request>>> {
-        self.receive_request(requestid, flags)
-            .await
-            .map_state(|op| {
-                use crate::iocp::IntoInner;
-                op.into_inner()
-            })
-    }
-
-    /// Await sending a response, getting it back afterwards.
-    pub async fn async_send_response(
-        &self,
-        requestid: u64,
-        flags: u32,
-        response: Response,
-    ) -> OpResult<usize, Response> {
-        self.send_response(requestid, flags, response)
-            .await
-            .map_state(|op| {
-                use crate::iocp::IntoInner;
-                op.into_inner()
-            })
-    }
-
-    pub fn close(&mut self) {
-        if self.h.is_invalid() {
-            return;
-        }
-        // Release the thread-pool registration first: it cancels and drains
-        // outstanding operations, so the kernel is no longer holding pointers
-        // into them when the handle closes.
-        self.io = None;
-        let ec = unsafe { HttpCloseRequestQueue(self.h) };
-        let err = Error::from(HRESULT(ec.try_into().unwrap()));
-        assert_eq!(err, Error::empty());
-        self.h = HANDLE::default();
-    }
-}
-
-impl Drop for RequestQueue {
-    fn drop(&mut self) {
-        self.close()
-    }
-}
+// `align_of::<HTTP_REQUEST_V2>()` is 8 on x86_64, measured during development.
+// This turns any future divergence -- a new architecture, or a bindings change
+// -- into a build failure rather than silent undefined behaviour. Misalignment
+// is reported by the operating system as `ERROR_NOACCESS`, but forming an
+// under-aligned pointer to the structure is undefined behaviour regardless.
+const _: () = assert!(
+    std::mem::align_of::<BufferUnit>()
+        >= std::mem::align_of::<windows::Win32::Networking::HttpServer::HTTP_REQUEST_V2>(),
+    "the request buffer's element type is not aligned enough for HTTP_REQUEST_V2"
+);

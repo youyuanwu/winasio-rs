@@ -537,6 +537,19 @@ unsafe fn read_header(optr: *mut OVERLAPPED) -> (u32, &'static OpVTable) {
     (magic, vtable)
 }
 
+/// Serialises tests that observe the process-global operation counter.
+///
+/// `live_operations` counts every operation in the process, and cargo runs tests
+/// in parallel, so a test asserting on it must not observe another test's
+/// allocations. Crucially this is **not** confined to this module: any test
+/// anywhere in the crate that submits an operation bumps the same counter, so it
+/// must take this lock too.
+#[cfg(test)]
+pub(crate) fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+    COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,16 +614,7 @@ mod tests {
 
     fn assert_send<T: Send>() {}
 
-    /// `live_operations` is process-global, so tests that assert on it must not
-    /// observe each other's allocations. Cargo runs tests in parallel by
-    /// default, so they take this lock.
-    ///
-    /// Phase 4's soak has the same constraint.
-    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
-
-    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use super::counter_guard;
 
     #[test]
     fn raw_op_is_send_when_op_is_send() {
@@ -624,6 +628,9 @@ mod tests {
 
     #[test]
     fn overlapped_is_at_offset_zero() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         assert_eq!(std::mem::offset_of!(RawOp<NoopOp>, overlapped), 0);
         assert_eq!(std::mem::offset_of!(RawOp<BigOp>, overlapped), 0);
 
@@ -647,6 +654,9 @@ mod tests {
 
     #[test]
     fn erased_dispatch_reaches_the_right_type() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         REACHED.store(false, Ordering::SeqCst);
         REACHED_LEN.store(0, Ordering::SeqCst);
 
@@ -735,6 +745,9 @@ mod tests {
 
     #[test]
     fn take_result_is_exactly_once() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         let key = Key::new(noop(0));
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(11)) };
@@ -804,6 +817,9 @@ mod tests {
 
     #[test]
     fn waker_is_signalled_on_completion() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         use std::sync::atomic::AtomicBool;
         static WOKEN: AtomicBool = AtomicBool::new(false);
         WOKEN.store(false, Ordering::SeqCst);
@@ -819,6 +835,9 @@ mod tests {
 
     #[test]
     fn abandoned_completion_does_not_wake() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         use std::sync::atomic::AtomicBool;
         static WOKEN: AtomicBool = AtomicBool::new(false);
         WOKEN.store(false, Ordering::SeqCst);
@@ -864,6 +883,9 @@ mod tests {
 
     #[test]
     fn completion_releases_its_reference_before_waking() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         // The future's `finish` unwraps the allocation to hand back the
         // operation state. If the completion path still held a reference when
         // it woke, an executor polling inline would find the allocation shared

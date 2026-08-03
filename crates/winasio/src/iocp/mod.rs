@@ -104,3 +104,8 @@ pub use threadpool::ThreadPoolIo;
 
 #[cfg(any(test, feature = "test-util"))]
 pub use raw::live_operations;
+
+/// Serialises tests anywhere in the crate that create operations, so they do not
+/// perturb assertions on the process-global counter.
+#[cfg(test)]
+pub(crate) use raw::counter_guard;
