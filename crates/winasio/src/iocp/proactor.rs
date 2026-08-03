@@ -23,13 +23,10 @@ use super::op::OpCode;
 use super::port::{
     entry_result, entry_transferred, CompletionPort, RegistrationError, KEY_OPERATION, KEY_WAKEUP,
 };
-use super::raw::{dispatch_completion_with, Key};
+use super::raw::{dispatch_completion_with, ErasedCancel, Key};
 
 /// How many completions to retrieve per wait.
 const BATCH: usize = 64;
-
-/// Cancels an in-flight operation at shutdown.
-type CancelFn = Box<dyn Fn()>;
 
 /// A completion port plus the operations in flight on it.
 ///
@@ -81,7 +78,7 @@ struct ProactorInner {
     port: Arc<CompletionPort>,
     /// Operations in flight, so shutdown can cancel them. Only touched from the
     /// owning thread; completion callbacks never reach it.
-    pending: RefCell<HashMap<usize, CancelFn>>,
+    pending: RefCell<HashMap<usize, ErasedCancel>>,
     /// Per handle: does an inline success skip the completion port?
     skips_on_success: RefCell<HashMap<isize, bool>>,
 }
@@ -182,13 +179,10 @@ impl Proactor {
     }
 
     fn track<T: OpCode>(&self, optr: *mut OVERLAPPED, key: &Key<T>) {
-        let cancel_key = key.clone();
-        self.inner.pending.borrow_mut().insert(
-            optr as usize,
-            Box::new(move || {
-                let _ = cancel_key.cancel();
-            }),
-        );
+        self.inner
+            .pending
+            .borrow_mut()
+            .insert(optr as usize, key.erased_cancel());
     }
 
     /// Whether a completion packet will follow an inline success.
@@ -303,7 +297,9 @@ impl ProactorInner {
 
         // Collect first, so no `RefCell` borrow is live while a waker runs —
         // an inline executor could otherwise re-enter this proactor.
-        let mut ready: Vec<(*mut OVERLAPPED, Result<usize>, usize)> = Vec::new();
+        let mut ready: [Option<(*mut OVERLAPPED, Result<usize>, usize)>; BATCH] =
+            std::array::from_fn(|_| None);
+        let mut ready_count = 0usize;
         {
             let mut pending = self.pending.borrow_mut();
             for entry in entries.iter().take(count) {
@@ -319,12 +315,14 @@ impl ProactorInner {
                     continue;
                 }
                 pending.remove(&(optr as usize));
-                ready.push((optr, entry_result(entry), entry_transferred(entry)));
+                ready[ready_count] = Some((optr, entry_result(entry), entry_transferred(entry)));
+                ready_count += 1;
             }
         }
 
         let mut delivered = 0usize;
-        for (optr, result, transferred) in ready {
+        for ready in ready.into_iter().take(ready_count) {
+            let (optr, result, transferred) = ready.expect("ready slot is populated");
             // SAFETY: the completion key established that this packet is ours,
             // so `optr` refers to a live operation allocation whose leaked
             // reference has not been reclaimed.
@@ -346,10 +344,11 @@ impl ProactorInner {
     /// completion, so this terminates.
     fn shutdown(&self) {
         // Take the closures out before calling them, so no borrow is live.
-        let cancels: Vec<CancelFn> = self.pending.borrow_mut().drain().map(|(_, c)| c).collect();
+        let cancels: Vec<ErasedCancel> =
+            self.pending.borrow_mut().drain().map(|(_, c)| c).collect();
         let outstanding = cancels.len();
         for cancel in &cancels {
-            cancel();
+            let _ = cancel.cancel();
         }
         if outstanding == 0 {
             return;

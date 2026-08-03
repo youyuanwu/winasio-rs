@@ -23,3 +23,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "httpsys"
 harness = false
+
+[[bench]]
+name = "fs_pipe"
+harness = false

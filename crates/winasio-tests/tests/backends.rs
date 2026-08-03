@@ -10,11 +10,18 @@
 //! whichever backend delivers its completion. Every case below therefore has a
 //! `_own_port` and a `_thread_pool` variant driven by the same body.
 
+mod common;
+
+use std::rc::Rc;
 use std::time::Duration;
 
-use winasio::iocp::{live_operations, Proactor, ReadAt, RegistrationError, ThreadPoolIo, WriteAt};
+use winasio::iocp::{
+    live_operations, OpResult, Proactor, ReadAt, RegistrationError, ThreadPool, ThreadPoolIo,
+    WriteAt,
+};
+use winasio::pipe::{ClientOptions, NamedPipe, ReadOutcome, ServerOptions};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_OPERATION_ABORTED, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, GetTempFileNameW, GetTempPathW, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_SHARE_NONE,
@@ -832,4 +839,148 @@ fn thread_pool_handles_skip_the_port_on_inline_success() {
         io.skips_on_success(),
         "inline-success operations depend on this"
     );
+}
+
+fn pipe_pair_own_port(
+    test_name: &str,
+) -> (
+    Rc<Proactor>,
+    NamedPipe<Rc<Proactor>>,
+    NamedPipe<Rc<Proactor>>,
+) {
+    let name = common::unique_pipe_name(test_name);
+    let proactor = Rc::new(Proactor::new().expect("proactor"));
+    let server = ServerOptions::new(&name)
+        .create(&proactor)
+        .expect("create server");
+    let accept = server.connect();
+    let client = ClientOptions::new(&name)
+        .connect(&proactor)
+        .expect("connect client");
+    let server = drive_own_port(&proactor, accept).expect("accept client");
+    (proactor, server, client)
+}
+
+fn pipe_pair_thread_pool(test_name: &str) -> (NamedPipe<ThreadPoolIo>, NamedPipe<ThreadPoolIo>) {
+    let name = common::unique_pipe_name(test_name);
+    let server = ServerOptions::new(&name)
+        .create(&ThreadPool)
+        .expect("create server");
+    let accept = server.connect();
+    let client = ClientOptions::new(&name)
+        .connect(&ThreadPool)
+        .expect("connect client");
+    let server = drive_thread_pool(accept).expect("accept client");
+    (server, client)
+}
+
+fn wait_for_pipe_counter_baseline(proactor: Option<&Proactor>, baseline: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while live_operations() > baseline && std::time::Instant::now() < deadline {
+        if let Some(proactor) = proactor {
+            let _ = proactor.poll(Some(Duration::from_millis(5)));
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert_eq!(
+        live_operations(),
+        baseline,
+        "pipe operation records must return to their pre-test baseline"
+    );
+}
+
+fn assert_pipe_cancelled(result: windows::core::Result<ReadOutcome>) {
+    match result {
+        Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
+        other => panic!("expected cancelled in-flight pipe read, got {other:?}"),
+    }
+}
+
+#[test]
+fn pipe_exchange_own_port_registrar() {
+    let _guard = counter_guard();
+    let (proactor, server, client) = pipe_pair_own_port("backend_pipe_exchange_own_port");
+
+    let OpResult(written, returned) = drive_own_port(&proactor, client.write(b"request".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = drive_own_port(&proactor, server.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+
+    let OpResult(written, returned) = drive_own_port(&proactor, server.write(b"response".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = drive_own_port(&proactor, client.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+}
+
+#[test]
+fn pipe_exchange_thread_pool_registrar() {
+    let _guard = counter_guard();
+    let (server, client) = pipe_pair_thread_pool("backend_pipe_exchange_thread_pool");
+
+    let OpResult(written, returned) = drive_thread_pool(client.write(b"request".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = drive_thread_pool(server.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+
+    let OpResult(written, returned) = drive_thread_pool(server.write(b"response".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = drive_thread_pool(client.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+}
+
+#[test]
+fn pipe_teardown_with_in_flight_read_own_port_registrar() {
+    let _guard = counter_guard();
+    let baseline = live_operations();
+    let (proactor, server, _client) = pipe_pair_own_port("backend_pipe_teardown_own_port");
+
+    let mut read = Box::pin(server.read(Vec::with_capacity(64)));
+    assert!(
+        poll_once(&mut read).is_none(),
+        "pipe read must be in flight before teardown"
+    );
+    assert!(live_operations() > baseline);
+
+    let started = std::time::Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "dropping a caller-driven pipe owner must be bounded"
+    );
+
+    let OpResult(result, buffer) = drive_own_port(&proactor, read);
+    assert_pipe_cancelled(result);
+    assert!(buffer.capacity() >= 64);
+    wait_for_pipe_counter_baseline(Some(&proactor), baseline);
+}
+
+#[test]
+fn pipe_teardown_with_in_flight_read_thread_pool_registrar() {
+    let _guard = counter_guard();
+    let baseline = live_operations();
+    let (server, _client) = pipe_pair_thread_pool("backend_pipe_teardown_thread_pool");
+
+    let mut read = Box::pin(server.read(Vec::with_capacity(64)));
+    assert!(
+        poll_once(&mut read).is_none(),
+        "pipe read must be in flight before teardown"
+    );
+    assert!(live_operations() > baseline);
+
+    let started = std::time::Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "dropping a thread-pool pipe owner must be bounded"
+    );
+
+    let OpResult(result, buffer) = drive_thread_pool(read);
+    assert_pipe_cancelled(result);
+    assert!(buffer.capacity() >= 64);
+    wait_for_pipe_counter_baseline(None, baseline);
 }

@@ -299,6 +299,62 @@ pub(crate) struct Key<T: OpCode> {
     inner: Arc<RawOp<T>>,
 }
 
+pub(crate) struct ErasedCancel {
+    ptr: *const (),
+    vtable: &'static ErasedCancelVTable,
+}
+
+struct ErasedCancelVTable {
+    cancel: unsafe fn(*const ()) -> Result<()>,
+    drop_ref: unsafe fn(*const ()),
+}
+
+impl ErasedCancel {
+    pub(crate) fn cancel(&self) -> Result<()> {
+        // SAFETY: `ptr` was produced by `Key::erased_cancel` for this vtable.
+        unsafe { (self.vtable.cancel)(self.ptr) }
+    }
+}
+
+impl Drop for ErasedCancel {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` is the strong reference owned by this value.
+        unsafe { (self.vtable.drop_ref)(self.ptr) };
+    }
+}
+
+fn erased_cancel_vtable_of<T: OpCode>() -> &'static ErasedCancelVTable {
+    trait HasVTable {
+        const VTABLE: ErasedCancelVTable;
+    }
+    impl<T: OpCode> HasVTable for T {
+        const VTABLE: ErasedCancelVTable = ErasedCancelVTable {
+            cancel: cancel_erased::<T>,
+            drop_ref: drop_erased::<T>,
+        };
+    }
+    &<T as HasVTable>::VTABLE
+}
+
+unsafe fn cancel_erased<T: OpCode>(ptr: *const ()) -> Result<()> {
+    // SAFETY: `ptr` is a strong `Arc<RawOp<T>>` reference created by
+    // `Key::erased_cancel`. `ManuallyDrop` lets us borrow it without consuming
+    // the pending table's reference.
+    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const RawOp<T>) });
+    let optr = Arc::as_ptr(&arc) as *mut OVERLAPPED;
+    let mut guard = arc.op.lock().unwrap();
+    match guard.as_mut() {
+        // SAFETY: `optr` is this operation's own OVERLAPPED pointer.
+        Some(op) => unsafe { op.cancel(optr) },
+        None => Ok(()),
+    }
+}
+
+unsafe fn drop_erased<T: OpCode>(ptr: *const ()) {
+    // SAFETY: `ptr` is the strong reference owned by `ErasedCancel`.
+    drop(unsafe { Arc::from_raw(ptr as *const RawOp<T>) });
+}
+
 impl<T: OpCode> Key<T> {
     /// Allocate an operation.
     pub(crate) fn new(op: T) -> Self {
@@ -341,6 +397,14 @@ impl<T: OpCode> Key<T> {
         let raw = Arc::into_raw(Arc::clone(&self.inner)) as *mut OVERLAPPED;
         live::insert(raw as usize);
         raw
+    }
+
+    /// Clone a type-erased reference that can cancel this operation.
+    pub(crate) fn erased_cancel(&self) -> ErasedCancel {
+        ErasedCancel {
+            ptr: Arc::into_raw(Arc::clone(&self.inner)) as *const (),
+            vtable: erased_cancel_vtable_of::<T>(),
+        }
     }
 
     /// Reclaim a reference leaked by [`Key::leak`] for an operation that never
