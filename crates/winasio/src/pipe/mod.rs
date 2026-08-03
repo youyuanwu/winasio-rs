@@ -32,17 +32,28 @@
 //! * **The handle outlives operations created here.** A [`NamedPipe`] and every
 //!   read or write it submits each hold a shared [`crate::iocp::Handle`].
 //!   Dropping the owner cannot close a handle that one of its operations may
-//!   still cancel through.
+//!   still cancel through. This guarantee is deliberately bounded: operations a
+//!   caller builds independently from [`NamedPipe::handle`] are outside it, must
+//!   not outlive the `NamedPipe`, and are also cancelled by the pipe's drop
+//!   because drop cancels all I/O on the handle.
 //! * **Dropped operation futures are not cancel-safe.** Dropping a read, write,
-//!   or connect future before it resolves requests cancellation, but the state
-//!   owned by that operation is not returned. Await the future if you need the
-//!   buffer back.
+//!   connect, or helper future before it resolves requests cancellation. Bytes
+//!   already transferred are not undone, and the state owned by that operation
+//!   — buffer and transferred count included — is not returned. Await the future
+//!   if you need the buffer back.
 //! * **Teardown is backend-specific.** Dropping a thread-pool-backed pipe first
 //!   requests cancellation, then drops the per-handle registration token, which
 //!   drains callbacks, and only then releases the owner's handle reference. A
 //!   caller-driven pipe requests cancellation and returns without driving the
 //!   proactor; the caller must keep their own proactor reference alive and keep
-//!   polling it until outstanding records are reclaimed.
+//!   polling it until outstanding records are reclaimed. If the pipe holds the
+//!   last proactor reference, dropping that reference may drain and block.
+//! * **Allocation budget.** A warmed single read or write with a caller-supplied
+//!   buffer allocates exactly once on the thread-pool backend, for the operation
+//!   record. The caller-driven backend allocates at most twice once warmed: the
+//!   operation record plus amortised pending-operation bookkeeping.
+//!   [`NamedPipe::read_to_end`] allocates for each submitted operation plus
+//!   growth of its accumulator, and no per-iteration scratch buffer.
 //!
 //! # Typestate
 //!
