@@ -198,6 +198,9 @@ pub fn send_raw(
     for (name, value) in headers {
         req.push_str(&format!("{name}: {value}\r\n"));
     }
+    // Without this the connection is kept alive and `read_to_end` below blocks
+    // until the read timeout, which makes every test wall-clock bound.
+    req.push_str("Connection: close\r\n");
     req.push_str(&format!("Content-Length: {}\r\n", body.len()));
     req.push_str("\r\n");
 
@@ -210,6 +213,17 @@ pub fn send_raw(
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     Some(response)
+}
+
+/// Serialises tests that observe process-global state.
+///
+/// `live_operations()` counts every operation in the process, and cargo runs the
+/// tests in a binary concurrently, so a test asserting on it must hold this.
+pub fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Split a raw HTTP reply into its status line, headers and body.

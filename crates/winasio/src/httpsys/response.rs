@@ -228,56 +228,47 @@ impl Response {
 
         let unknown_total = self.unknown.total();
         if unknown_total > 0 {
-            // One contiguous array is required, so a spilled reply pays for a
-            // temporary here -- the documented cost of exceeding the inline
-            // capacity.
-            let entries: Vec<HTTP_UNKNOWN_HEADER> = self
-                .unknown
-                .iter()
-                .map(|(name, value)| HTTP_UNKNOWN_HEADER {
-                    NameLength: name.len() as u16,
-                    RawValueLength: value.len() as u16,
-                    pName: windows::core::PCSTR(name.as_ptr()),
-                    pRawValue: windows::core::PCSTR(value.as_ptr()),
-                })
-                .collect();
-
-            let ptr = if unknown_total <= INLINE_UNKNOWN_HEADERS {
-                self.unknown_raw[..unknown_total].copy_from_slice(&entries);
-                self.unknown_raw.as_mut_ptr()
+            // Windows needs one contiguous array. Within the inline capacity it
+            // is filled in place; beyond it, a heap array is allocated -- the
+            // documented cost of spilling.
+            if unknown_total <= INLINE_UNKNOWN_HEADERS {
+                for (slot, (name, value)) in self.unknown_raw.iter_mut().zip(self.unknown.iter()) {
+                    *slot = HTTP_UNKNOWN_HEADER {
+                        NameLength: name.len() as u16,
+                        RawValueLength: value.len() as u16,
+                        pName: windows::core::PCSTR(name.as_ptr()),
+                        pRawValue: windows::core::PCSTR(value.as_ptr()),
+                    };
+                }
+                self.raw.Base.Headers.pUnknownHeaders = self.unknown_raw.as_mut_ptr();
             } else {
-                self.unknown_raw_spill = entries;
-                self.unknown_raw_spill.as_mut_ptr()
-            };
+                self.unknown_raw_spill = self
+                    .unknown
+                    .iter()
+                    .map(|(name, value)| HTTP_UNKNOWN_HEADER {
+                        NameLength: name.len() as u16,
+                        RawValueLength: value.len() as u16,
+                        pName: windows::core::PCSTR(name.as_ptr()),
+                        pRawValue: windows::core::PCSTR(value.as_ptr()),
+                    })
+                    .collect();
+                self.raw.Base.Headers.pUnknownHeaders = self.unknown_raw_spill.as_mut_ptr();
+            }
             self.raw.Base.Headers.UnknownHeaderCount = unknown_total as u16;
-            self.raw.Base.Headers.pUnknownHeaders = ptr;
         }
 
         let chunk_total = self.chunks.total();
         if chunk_total > 0 {
-            let entries: Vec<HTTP_DATA_CHUNK> = self
-                .chunks
-                .iter()
-                .map(|body| {
-                    let mut chunk = HTTP_DATA_CHUNK {
-                        DataChunkType: HttpDataChunkFromMemory,
-                        ..Default::default()
-                    };
-                    chunk.Anonymous.FromMemory.BufferLength = body.len() as u32;
-                    chunk.Anonymous.FromMemory.pBuffer = body.as_ptr() as *mut core::ffi::c_void;
-                    chunk
-                })
-                .collect();
-
-            let ptr = if chunk_total <= INLINE_CHUNKS {
-                self.chunks_raw[..chunk_total].copy_from_slice(&entries);
-                self.chunks_raw.as_mut_ptr()
+            if chunk_total <= INLINE_CHUNKS {
+                for (slot, body) in self.chunks_raw.iter_mut().zip(self.chunks.iter()) {
+                    *slot = memory_chunk(body);
+                }
+                self.raw.Base.pEntityChunks = self.chunks_raw.as_mut_ptr();
             } else {
-                self.chunks_raw_spill = entries;
-                self.chunks_raw_spill.as_mut_ptr()
-            };
+                self.chunks_raw_spill = self.chunks.iter().map(|b| memory_chunk(b)).collect();
+                self.raw.Base.pEntityChunks = self.chunks_raw_spill.as_mut_ptr();
+            }
             self.raw.Base.EntityChunkCount = chunk_total as u16;
-            self.raw.Base.pEntityChunks = ptr;
         }
 
         &self.raw
@@ -308,6 +299,17 @@ impl Response {
     pub unsafe fn raw(&self) -> &HTTP_RESPONSE_V2 {
         &self.raw
     }
+}
+
+/// Describe an in-memory body chunk.
+fn memory_chunk(body: &[u8]) -> HTTP_DATA_CHUNK {
+    let mut chunk = HTTP_DATA_CHUNK {
+        DataChunkType: HttpDataChunkFromMemory,
+        ..Default::default()
+    };
+    chunk.Anonymous.FromMemory.BufferLength = body.len() as u32;
+    chunk.Anonymous.FromMemory.pBuffer = body.as_ptr() as *mut core::ffi::c_void;
+    chunk
 }
 
 impl std::fmt::Debug for Response {

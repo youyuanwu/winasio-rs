@@ -132,7 +132,7 @@ fn dropping_the_initializer_shuts_the_subsystem_down() {
 fn closing_a_queue_twice_succeeds() {
     let _guard = serial();
     let _http = HttpInitializer::new().expect("initialise");
-    let mut queue = RequestQueue::new().expect("queue");
+    let queue = RequestQueue::new().expect("queue");
     queue.close().expect("first close");
     queue.close().expect("second close is a no-op");
 }
@@ -142,7 +142,7 @@ fn closing_a_queue_twice_succeeds() {
 fn dropping_a_closed_queue_is_fine() {
     let _guard = serial();
     let _http = HttpInitializer::new().expect("initialise");
-    let mut queue = RequestQueue::new().expect("queue");
+    let queue = RequestQueue::new().expect("queue");
     queue.close().expect("close");
     drop(queue);
 }

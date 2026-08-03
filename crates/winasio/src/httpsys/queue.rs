@@ -6,7 +6,9 @@
 
 //! The request queue -- the listener requests arrive on and replies go out on.
 
+use std::sync::RwLock;
 use windows::core::{Error, Result};
+
 use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 use windows::Win32::Networking::HttpServer::{
     HttpCloseRequestQueue, HttpCreateRequestQueue, HttpServerBindingProperty, HTTP_BINDING_INFO,
@@ -111,19 +113,39 @@ impl From<Error> for ReceiveError {
 ///
 /// Closing is idempotent and reports failure as a value; dropping closes and
 /// discards any error, because a panic in `Drop` aborts during unwinding.
-pub struct RequestQueue {
+/// The parts that exist only while the queue is open.
+struct Open {
     handle: HANDLE,
-    /// `None` once closed. Dropping the registration cancels and drains
-    /// outstanding operations, which is why it is released *before* the handle.
-    io: Option<ThreadPoolIo>,
+    /// Dropping the registration cancels and drains outstanding operations,
+    /// which is why it is released *before* the handle.
+    io: ThreadPoolIo,
+}
+
+pub struct RequestQueue {
+    /// `None` once closed.
+    ///
+    /// Behind a lock rather than owned outright so that [`close`] can take
+    /// `&self`: a queue is normally shared as an `Arc` across worker tasks, and
+    /// a shutdown that required unique ownership could never run while those
+    /// workers were blocked in [`receive`].
+    ///
+    /// [`close`]: RequestQueue::close
+    /// [`receive`]: RequestQueue::receive
+    open: RwLock<Option<Open>>,
     config: ReceiveConfig,
 }
 
 impl std::fmt::Debug for RequestQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let open = self
+            .open
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|o| o.handle));
         f.debug_struct("RequestQueue")
-            .field("handle", &self.handle)
-            .field("open", &self.io.is_some())
+            .field("handle", &open)
+            .field("open", &open.is_some())
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -156,8 +178,7 @@ impl RequestQueue {
 
         match ThreadPoolIo::new(handle) {
             Ok(io) => Ok(RequestQueue {
-                handle,
-                io: Some(io),
+                open: RwLock::new(Some(Open { handle, io })),
                 config,
             }),
             Err(e) => {
@@ -173,12 +194,27 @@ impl RequestQueue {
         self.config
     }
 
+    /// Whether the queue is still open.
+    pub fn is_open(&self) -> bool {
+        self.with_open(|_| ()).is_ok()
+    }
+
+    /// Run `f` against the open queue, or fail if it has been closed.
+    fn with_open<T>(&self, f: impl FnOnce(&Open) -> T) -> Result<T> {
+        let guard = self.open.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(open) => Ok(f(open)),
+            None => Err(Error::from_hresult(ERROR_INVALID_HANDLE.to_hresult())),
+        }
+    }
+
     /// Direct traffic for `group`'s URLs to this queue.
     pub fn bind_url_group(&self, group: &UrlGroup) -> Result<()> {
+        let handle = self.with_open(|o| o.handle)?;
         let info = HTTP_BINDING_INFO {
             // `Present` bit: the binding is being set rather than cleared.
             Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
-            RequestQueueHandle: self.handle,
+            RequestQueueHandle: handle,
         };
         unsafe {
             group.set_property(
@@ -189,13 +225,6 @@ impl RequestQueue {
         }
     }
 
-    /// The underlying handle, for operations built against this queue.
-    // Consumed by the reply and body operations in later phases.
-    #[allow(dead_code)]
-    pub(crate) fn handle(&self) -> HANDLE {
-        self.handle
-    }
-
     /// Submit an operation, failing rather than panicking once closed.
     ///
     /// On failure the operation is handed back, so callers can return the
@@ -204,8 +233,9 @@ impl RequestQueue {
         &self,
         op: T,
     ) -> std::result::Result<Submit<T>, (Error, T)> {
-        match self.io.as_ref() {
-            Some(io) => Ok(io.submit(op)),
+        let guard = self.open.read().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(open) => Ok(open.io.submit(op)),
             None => Err((Error::from_hresult(ERROR_INVALID_HANDLE.to_hresult()), op)),
         }
     }
@@ -230,8 +260,9 @@ impl RequestQueue {
         let mut retries = 0u32;
 
         loop {
+            let handle = self.with_open(|o| o.handle)?;
             let request = Request::with_capacity(capacity);
-            let op = ReceiveRequest::new(self.handle, target, request);
+            let op = ReceiveRequest::new(handle, target, request);
             let outcome = match self.submit(op) {
                 Ok(fut) => fut.await,
                 Err((e, _)) => return Err(ReceiveError::Failed(e)),
@@ -270,8 +301,9 @@ impl RequestQueue {
     /// [`ReceiveError::TooLarge`]; leaving it queued would make the next receive
     /// return the same request again.
     pub async fn reject(&self, id: RequestId) -> Result<()> {
+        let handle = self.with_open(|o| o.handle)?;
         let fut = self
-            .submit(CancelRequest::new(self.handle, id))
+            .submit(CancelRequest::new(handle, id))
             .map_err(|(e, _)| e)?;
         fut.await.0.map(|_| ())
     }
@@ -305,7 +337,11 @@ impl RequestQueue {
         response: Response,
         more: bool,
     ) -> OpResult<usize, Response> {
-        match self.submit(SendResponse::new(self.handle, id, response, more)) {
+        let handle = match self.with_open(|o| o.handle) {
+            Ok(h) => h,
+            Err(e) => return OpResult(Err(e), response),
+        };
+        match self.submit(SendResponse::new(handle, id, response, more)) {
             Ok(fut) => fut.await.map_state(IntoInner::into_inner),
             // Nothing was submitted, so hand the reply straight back.
             Err((e, op)) => OpResult(Err(e), op.into_inner()),
@@ -321,7 +357,11 @@ impl RequestQueue {
         buffer: B,
         last: bool,
     ) -> OpResult<usize, B> {
-        match self.submit(SendBody::new(self.handle, id, buffer, last)) {
+        let handle = match self.with_open(|o| o.handle) {
+            Ok(h) => h,
+            Err(e) => return OpResult(Err(e), buffer),
+        };
+        match self.submit(SendBody::new(handle, id, buffer, last)) {
             Ok(fut) => fut.await.map_state(IntoInner::into_inner),
             Err((e, op)) => OpResult(Err(e), op.into_inner()),
         }
@@ -336,7 +376,11 @@ impl RequestQueue {
         id: RequestId,
         buffer: B,
     ) -> OpResult<usize, B> {
-        match self.submit(ReceiveBody::new(self.handle, id, buffer)) {
+        let handle = match self.with_open(|o| o.handle) {
+            Ok(h) => h,
+            Err(e) => return OpResult(Err(e), buffer),
+        };
+        match self.submit(ReceiveBody::new(handle, id, buffer)) {
             Ok(fut) => {
                 let OpResult(result, op) = fut.await;
                 // `ERROR_HANDLE_EOF` is how HTTP.sys signals the end of a body.
@@ -370,21 +414,30 @@ impl RequestQueue {
 
     /// Close the queue, draining outstanding operations first.
     ///
+    /// Takes `&self` so a queue shared as an `Arc` can be shut down while worker
+    /// tasks are still blocked in [`receive`](RequestQueue::receive) -- which is
+    /// the only way to stop them, since a receive resolves with an error once
+    /// the queue is gone.
+    ///
     /// Idempotent: closing an already-closed queue succeeds and does nothing.
-    pub fn close(&mut self) -> Result<()> {
-        if self.io.is_none() && self.handle.is_invalid() {
+    pub fn close(&self) -> Result<()> {
+        let taken = {
+            let mut guard = self.open.write().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        let Some(open) = taken else {
             return Ok(());
-        }
-        // Release the registration first. Dropping it cancels and drains
-        // in-flight operations, so the kernel no longer holds pointers into
-        // them by the time the handle goes away.
-        self.io = None;
+        };
 
-        let handle = std::mem::take(&mut self.handle);
-        if handle.is_invalid() {
+        // Release the registration first. Dropping it cancels and drains
+        // in-flight operations, so the kernel no longer holds pointers into them
+        // by the time the handle goes away.
+        drop(open.io);
+
+        if open.handle.is_invalid() {
             return Ok(());
         }
-        check(unsafe { HttpCloseRequestQueue(handle) })
+        check(unsafe { HttpCloseRequestQueue(open.handle) })
     }
 }
 
@@ -427,19 +480,20 @@ mod tests {
     /// public operations do not exist until later phases.
     #[test]
     fn submitting_to_a_closed_queue_is_an_error() {
-        let mut queue = match RequestQueue::new() {
+        let queue = match RequestQueue::new() {
             Ok(q) => q,
             // No HTTP service available; nothing to assert.
             Err(_) => return,
         };
         queue.close().expect("first close succeeds");
         assert!(queue.submit(NeverRuns).is_err());
+        assert!(!queue.is_open());
     }
 
     /// FR-011: closing twice succeeds.
     #[test]
     fn closing_twice_succeeds() {
-        let mut queue = match RequestQueue::new() {
+        let queue = match RequestQueue::new() {
             Ok(q) => q,
             Err(_) => return,
         };
@@ -447,12 +501,25 @@ mod tests {
         queue.close().expect("second close is a no-op");
     }
 
+    /// A shared queue can be closed through an `Arc`, which is what makes
+    /// shutting down a running server possible at all.
+    #[test]
+    fn a_shared_queue_can_be_closed() {
+        let queue = match RequestQueue::new() {
+            Ok(q) => std::sync::Arc::new(q),
+            Err(_) => return,
+        };
+        let other = queue.clone();
+        other.close().expect("close through a shared handle");
+        assert!(!queue.is_open());
+    }
+
     /// SC-004: a queue holding an unusable handle must drop without panicking.
     #[test]
     fn dropping_a_queue_with_an_invalid_handle_does_not_panic() {
+        // No registration, so nothing is cancelled; only the handle close fails.
         let bogus = RequestQueue {
-            handle: HANDLE(usize::MAX as *mut core::ffi::c_void),
-            io: None,
+            open: RwLock::new(None),
             config: ReceiveConfig::default(),
         };
         drop(bogus);
