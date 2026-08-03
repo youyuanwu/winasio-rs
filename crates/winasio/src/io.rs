@@ -209,14 +209,27 @@ where
 {
     let mut transferred = 0;
     loop {
-        let chunk = Vec::with_capacity(HELPER_CHUNK);
-        let OpResult(result, chunk) = io.read_once(position, chunk).await;
+        if buffer.len() == buffer.capacity() {
+            buffer.reserve(HELPER_CHUNK);
+        }
+        let previous_len = buffer.len();
+        let tail = TailBuf::new(buffer, previous_len, HELPER_CHUNK);
+        let OpResult(result, tail) = io.read_once(position, tail).await;
+        buffer = tail.into_inner();
         match result {
-            Ok(ReadOutcome::Bytes(0) | ReadOutcome::Eof | ReadOutcome::ClosedPeer) => {
+            Ok(ReadOutcome::Eof | ReadOutcome::ClosedPeer) => {
                 return TransferResult::success(buffer, transferred);
             }
+            Ok(ReadOutcome::Bytes(0)) => {
+                // This was submitted with non-empty spare capacity, so it is
+                // not a self-induced zero-capacity read that could spin. A
+                // zero byte result is therefore a real zero-length pipe message
+                // and the next iteration awaits another operation. A peer can
+                // keep sending empty messages forever, just as it can keep
+                // sending non-empty data forever, but the helper is not looping
+                // locally without completed I/O.
+            }
             Ok(ReadOutcome::Bytes(n) | ReadOutcome::MoreData(n)) => {
-                buffer.extend_from_slice(&chunk);
                 transferred += n;
                 T::advance_position(&mut position, n);
             }
@@ -289,10 +302,10 @@ unsafe impl<B: IoBufMut> IoBufMut for TailBuf<B> {
     /// The first `len` bytes of this tail must have been initialised by the
     /// completed operation, and `len` must not exceed this tail's total length.
     unsafe fn set_init(&mut self, len: usize) {
-        assert!(len <= self.bytes_total());
-        // SAFETY: `len` was reported for this tail buffer, and the assertion
-        // above proves that publishing `offset + len` stays within the
-        // underlying buffer's total capacity.
+        let len = len.min(self.bytes_total());
+        // SAFETY: `len` was reported for this tail buffer and then clamped to
+        // this tail's writable capacity, so publishing `offset + len` stays
+        // within the underlying buffer's total capacity.
         unsafe { self.inner.set_init(self.offset + len) };
     }
 }

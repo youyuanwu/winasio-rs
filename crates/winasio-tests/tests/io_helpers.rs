@@ -15,7 +15,7 @@ use std::task::{Context, Poll, Waker};
 use winasio::fs::{File, OpenOptions};
 use winasio::io::{TransferError, TransferResult};
 use winasio::iocp::{OpResult, ThreadPool, ThreadPoolIo};
-use winasio::pipe::{ClientOptions, NamedPipe, ReadOutcome, ServerOptions};
+use winasio::pipe::{ClientOptions, NamedPipe, PipeMode, ReadOutcome, ServerOptions};
 
 static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
 
@@ -63,6 +63,19 @@ fn connected_pair(
     let mut accept = Box::pin(server.connect());
     assert_pending(&mut accept);
     let client = ClientOptions::new(name).connect(&ThreadPool).unwrap();
+    let server = common::block_on(accept).unwrap();
+    (server, client)
+}
+
+fn message_pair(name: &str) -> (NamedPipe<ThreadPoolIo>, NamedPipe<ThreadPoolIo>) {
+    let mut server_options = ServerOptions::new(name);
+    server_options.pipe_type(PipeMode::Message);
+    let server = server_options.create(&ThreadPool).unwrap();
+    let mut accept = Box::pin(server.connect());
+    assert_pending(&mut accept);
+    let mut client_options = ClientOptions::new(name);
+    client_options.read_mode(PipeMode::Message);
+    let client = client_options.connect(&ThreadPool).unwrap();
     let server = common::block_on(accept).unwrap();
     (server, client)
 }
@@ -174,6 +187,56 @@ fn read_to_end_returns_multi_operation_stream() {
             }
         }
     }
+}
+
+#[test]
+fn read_to_end_preserves_zero_length_message_and_reads_later_data() {
+    let name = common::unique_pipe_name("read_to_end_zero_message_then_data");
+    let (server, client) = message_pair(&name);
+
+    let OpResult(empty, returned) = common::block_on(server.write(Vec::<u8>::new()));
+    assert_eq!(empty.unwrap(), 0);
+    assert!(returned.is_empty());
+
+    let payload = b"after empty message".to_vec();
+    let OpResult(written, returned) = common::block_on(server.write(payload.clone()));
+    assert_eq!(written.unwrap(), payload.len());
+    assert_eq!(returned, payload);
+    drop(server);
+
+    let result = common::block_on(client.read_to_end(Vec::new()));
+    assert_success(&result, payload.len());
+    assert_eq!(result.buffer, payload);
+}
+
+#[test]
+fn read_to_end_uses_accumulator_spare_capacity_without_chunk_allocations() {
+    let payload = patterned_payload(12 * 1024 + 321);
+    let path = artifact_path("read-to-end-allocations");
+    std::fs::write(&path, &payload).unwrap();
+    let file = open_read(&path);
+
+    let buffer = Vec::with_capacity(payload.len() + 1);
+    let ptr = buffer.as_ptr() as usize;
+    let capacity = buffer.capacity();
+    let result = common::block_on(file.read_to_end(0, buffer));
+    assert_success(&result, payload.len());
+    assert_eq!(result.buffer, payload);
+    assert_eq!(result.buffer.as_ptr() as usize, ptr);
+    assert_eq!(result.buffer.capacity(), capacity);
+
+    let source = include_str!(r"..\..\winasio\src\io.rs");
+    assert!(
+        !source.contains("Vec::with_capacity(HELPER_CHUNK)"),
+        "read_to_end must not allocate a per-iteration chunk"
+    );
+    assert!(
+        !source.contains("extend_from_slice(&chunk)"),
+        "read_to_end must not copy from a temporary chunk"
+    );
+
+    drop(file);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
