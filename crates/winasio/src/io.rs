@@ -184,7 +184,16 @@ where
         let OpResult(result, tail) = io.read_once(position, tail).await;
         buffer = tail.into_inner();
         match result {
-            Ok(ReadOutcome::Bytes(0) | ReadOutcome::Eof | ReadOutcome::ClosedPeer) => {
+            // A zero-length transfer is not end-of-stream. On a message-mode
+            // pipe it is a real, empty message; the caller asked for a specific
+            // number of bytes, so consuming one simply means this iteration
+            // made no progress and the next read continues. Only the outcomes
+            // that genuinely mean "there will be no more data" cut the loop
+            // short. Progress is guaranteed because `TailBuf` always presents
+            // non-empty spare capacity, so `Bytes(0)` reflects the peer, not a
+            // buffer with no room.
+            Ok(ReadOutcome::Bytes(0)) => {}
+            Ok(ReadOutcome::Eof | ReadOutcome::ClosedPeer) => {
                 return TransferResult::failure(buffer, transferred, TransferError::UnexpectedEof);
             }
             Ok(ReadOutcome::Bytes(n) | ReadOutcome::MoreData(n)) => {

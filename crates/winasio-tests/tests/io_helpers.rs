@@ -374,3 +374,28 @@ fn write_all_and_read_exact_return_same_allocation() {
         }
     }
 }
+
+#[test]
+fn read_exact_preserves_zero_length_message_and_reads_later_data() {
+    // A zero-length message is a real message, not end-of-stream. Treating it
+    // as EOF made `read_exact` fail with UnexpectedEof and a transferred count
+    // of zero while the requested bytes were still on their way -- the same
+    // defect `read_to_end` had.
+    let name = common::unique_pipe_name("read_exact_zero_message_then_data");
+    let (server, client) = message_pair(&name);
+
+    let OpResult(empty, returned) = common::block_on(server.write(Vec::<u8>::new()));
+    assert_eq!(empty.unwrap(), 0);
+    assert!(returned.is_empty());
+
+    let payload = b"exactly-this".to_vec();
+    let OpResult(written, returned) = common::block_on(server.write(payload.clone()));
+    assert_eq!(written.unwrap(), payload.len());
+    assert_eq!(returned, payload);
+
+    let result = common::block_on(client.read_exact(Vec::with_capacity(payload.len())));
+    assert_success(&result, payload.len());
+    assert_eq!(result.buffer, payload);
+
+    drop(server);
+}
