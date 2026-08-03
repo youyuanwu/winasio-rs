@@ -342,6 +342,50 @@ fn busy_connect_is_bounded_on_both_backends_and_has_no_wait_call() {
     let proactor_name = common::unique_pipe_name("busy_connect_bounded_proactor");
     assert_busy_is_prompt(&proactor, &proactor_name);
 
-    let client_source = include_str!(r"..\..\winasio\src\pipe\client.rs");
-    assert!(!client_source.contains("WaitNamedPipe"));
+    // The connect path must contain no synchronous wait. Scanning for a bare
+    // mention would be wrong in both directions: it would miss a call in any
+    // file other than the client, and it would trip over the module docs, which
+    // deliberately *name* `WaitNamedPipeW` to explain why the crate refuses to
+    // use it. Scan the whole library for actual use -- an import or a call --
+    // and separately require the rationale to still be documented.
+    const SOURCES: [(&str, &str); 5] = [
+        (
+            "pipe/client.rs",
+            include_str!(r"..\..\winasio\src\pipe\client.rs"),
+        ),
+        (
+            "pipe/server.rs",
+            include_str!(r"..\..\winasio\src\pipe\server.rs"),
+        ),
+        (
+            "pipe/connected.rs",
+            include_str!(r"..\..\winasio\src\pipe\connected.rs"),
+        ),
+        (
+            "pipe/name.rs",
+            include_str!(r"..\..\winasio\src\pipe\name.rs"),
+        ),
+        (
+            "iocp/ops/stream.rs",
+            include_str!(r"..\..\winasio\src\iocp\ops\stream.rs"),
+        ),
+    ];
+    for (name, source) in SOURCES {
+        for line in source.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue; // prose, not use
+            }
+            assert!(
+                !code.contains("WaitNamedPipe"),
+                "{name} uses a synchronous pipe wait; connecting must never block"
+            );
+        }
+    }
+
+    let module_docs = include_str!(r"..\..\winasio\src\pipe\mod.rs");
+    assert!(
+        module_docs.contains("retry with their own runtime's timer"),
+        "the caller-driven retry pattern must stay documented"
+    );
 }
