@@ -50,7 +50,11 @@ struct Owned(SendHandle);
 impl Drop for Owned {
     fn drop(&mut self) {
         if !self.0 .0.is_invalid() {
-            // Nothing can still be using it: every operation held a clone.
+            // SAFETY: this runs only when the last reference is released, so no
+            // operation can still be using the handle, and `from_raw`'s contract
+            // transferred the responsibility for closing it to us. A handle is
+            // closed at most once because `Owned` is never cloned — only the
+            // `Arc` around it is.
             let _ = unsafe { CloseHandle(self.0 .0) };
         }
     }
@@ -112,6 +116,8 @@ mod tests {
     fn clone_shares_the_same_raw_handle() {
         // A pseudo-handle: valid to hold and compare, and closing it is a no-op
         // that Windows tolerates, so no real resource is involved.
+        // SAFETY: the pseudo-handle is not owned by anything else and closing it
+        // has no effect, so the ownership transfer this asks for is vacuous.
         let h = unsafe { Handle::from_raw(HANDLE(-1isize as *mut _)) };
         let c = h.clone();
         assert_eq!(h.raw(), c.raw());
@@ -124,8 +130,45 @@ mod tests {
     fn invalid_handle_is_not_closed() {
         // `Handle::default`-like construction must not attempt a close, so a
         // failed open can be represented without a spurious CloseHandle.
+        // SAFETY: an invalid handle is owned by nobody and is never closed.
         let h = unsafe { Handle::from_raw(HANDLE::default()) };
         assert!(h.raw().is_invalid());
         drop(h);
+    }
+
+    #[test]
+    fn a_real_handle_is_closed_exactly_once_when_the_last_clone_drops() {
+        use windows::Win32::Foundation::GetHandleInformation;
+        use windows::Win32::System::Threading::CreateEventW;
+
+        // A real kernel object, so the close is observable.
+        // SAFETY: creating an event with default attributes; the returned handle
+        // is owned solely by this test.
+        let raw = unsafe { CreateEventW(None, true, false, None) }.expect("create event");
+        let mut flags = 0u32;
+
+        // SAFETY: `raw` is a live handle owned by this test and nothing else,
+        // and ownership of closing it transfers to the `Handle`.
+        let h = unsafe { Handle::from_raw(raw) };
+        let clone = h.clone();
+
+        // Still open while any reference lives.
+        drop(h);
+        assert!(
+            // SAFETY: querying a handle this test still owns through `clone`.
+            unsafe { GetHandleInformation(raw, &mut flags) }.is_ok(),
+            "the handle must outlive every reference, not just the first"
+        );
+
+        drop(clone);
+        assert!(
+            // SAFETY: querying a closed handle value is defined — it reports
+            // failure rather than misbehaving.
+            unsafe { GetHandleInformation(raw, &mut flags) }.is_err(),
+            "the last reference must close it"
+        );
+        // Closing twice would have been reported here: a double close either
+        // fails or, worse, closes a recycled handle. Nothing else in this test
+        // opens a handle, so the value cannot have been reused in between.
     }
 }

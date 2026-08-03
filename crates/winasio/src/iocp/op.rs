@@ -115,14 +115,16 @@ pub unsafe trait OpCode: 'static {
     /// Lets an operation read back fields Windows filled in — transferred
     /// lengths, address sizes, flags — while it still has `&mut self`.
     ///
-    /// Called **at most once**: an operation that completes inline from
-    /// [`OpCode::operate`] never produces a completion packet, so this does not
-    /// run for it.
+    /// Called **at most once**, from whichever path resolved the operation:
+    /// the completion packet, or the inline path when [`OpCode::operate`]
+    /// finished synchronously and no packet will follow. An operation that must
+    /// classify a condition the platform can report either way therefore needs
+    /// no separate inline hook.
     ///
     /// # Safety
     ///
-    /// Called only from the completion path, before the state is released or
-    /// returned.
+    /// Called only while the driver holds exclusive access to the operation,
+    /// before its state is released or returned.
     unsafe fn on_complete(&mut self, result: &Result<usize>) {
         let _ = result;
     }
@@ -144,12 +146,17 @@ pub unsafe trait OpCode: 'static {
     /// against any buffer length: an implementation that uses it to publish
     /// initialised bytes must clamp it to its own capacity first.
     ///
+    /// Called under the same conditions as [`OpCode::on_complete`] — at most
+    /// once, from either the completion path or the inline path.
+    ///
     /// # Safety
     ///
-    /// Called only from the completion path, before the state is released or
-    /// returned.
+    /// Called only while the driver holds exclusive access to the operation,
+    /// before its state is released or returned.
     unsafe fn on_complete_with(&mut self, result: &Result<usize>, transferred: usize) {
         let _ = transferred;
+        // SAFETY: this call inherits this method's own contract — the driver
+        // holds exclusive access and the state has not been released.
         unsafe { self.on_complete(result) }
     }
 }
