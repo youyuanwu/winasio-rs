@@ -12,24 +12,35 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use crate::iocp::{IoBuf, IoBufMut, Registrar};
+use crate::iocp::{IoBuf, IoBufMut, OpResult, Registrar, Submitter};
 use crate::pipe::{ClientOptions, NamedPipe, ServerOptions};
 
-use super::SetupError;
+use super::{File, SetupError};
 
-/// A pending-read pipe pair for teardown tests.
-pub type PendingReadPair<S> = (NamedPipe<S>, PendingReadPeer<S>);
+/// A pending-read file-over-pipe pair for teardown tests.
+pub type PendingReadPair<S> = (File<S>, PendingReadPeer<S>);
 
-/// The client side of a pipe used to keep a server read pending.
-pub struct PendingReadPeer<S: crate::iocp::Submitter> {
-    _client: NamedPipe<S>,
+/// The client side of a pipe used to keep a file-owned server-handle read pending.
+pub struct PendingReadPeer<S: Submitter> {
+    client: NamedPipe<S>,
+}
+
+impl<S: Submitter> PendingReadPeer<S> {
+    /// Write bytes that complete a pending read on the paired file-owned handle.
+    pub fn write<B>(&self, buffer: B) -> impl Future<Output = OpResult<usize, B>>
+    where
+        B: IoBuf + Send,
+    {
+        self.client.write(buffer)
+    }
 }
 
 /// Create a registered handle whose reads remain pending until cancelled.
 ///
-/// The returned pipe is the server end of a byte-mode named pipe. The peer is
-/// kept open but never writes, so a read submitted through the pipe is genuinely
-/// in flight rather than an immediate closed-peer condition.
+/// The returned file owns the server handle of a byte-mode named pipe. The peer
+/// is kept open but writes only when the test asks it to, so a read submitted
+/// through the file is genuinely in flight rather than an immediate closed-peer
+/// condition.
 pub fn pending_read_file<R: Registrar>(
     registrar: &R,
 ) -> Result<PendingReadPair<R::Io>, SetupError> {
@@ -37,7 +48,11 @@ pub fn pending_read_file<R: Registrar>(
     let server = ServerOptions::new(name.clone()).create(registrar)?;
     let client = ClientOptions::new(name).connect(registrar)?;
     let server = expect_ready(server.connect())?.map_err(SetupError::from_windows)?;
-    Ok((server, PendingReadPeer { _client: client }))
+    let (handle, submitter) = server.into_file_parts();
+    Ok((
+        File::from_parts(handle, submitter),
+        PendingReadPeer { client },
+    ))
 }
 
 fn expect_ready<F>(future: F) -> Result<F::Output, SetupError>

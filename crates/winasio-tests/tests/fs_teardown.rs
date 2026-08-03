@@ -7,7 +7,6 @@
 mod common;
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,19 +15,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use winasio::fs::test_util::{pending_read_file, DropProbeBuf};
-use winasio::fs::{OpenOptions, ReadOutcome};
+use winasio::fs::ReadOutcome;
 use winasio::iocp::{live_operations, OpResult, Proactor, ThreadPool};
 use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, ERROR_OPERATION_ABORTED};
-
-static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-fn temp_path(name: &str) -> PathBuf {
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!(
-        "winasio-fs-teardown-{}-{name}-{n}.tmp",
-        std::process::id()
-    ))
-}
 
 fn wait_for_baseline(proactor: Option<&Proactor>, baseline: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -86,7 +75,7 @@ fn thread_pool_drop_with_operation_future_held_reclaims() {
     let baseline = live_operations();
 
     let (file, _peer) = pending_read_file(&ThreadPool).unwrap();
-    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(
         live_operations() > baseline,
@@ -117,7 +106,7 @@ fn caller_driven_drop_returns_then_drive_reclaims_held_future() {
 
     let proactor = Rc::new(Proactor::new().unwrap());
     let (file, _peer) = pending_read_file(&proactor).unwrap();
-    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(
         live_operations() > baseline,
@@ -152,31 +141,35 @@ fn caller_driven_late_future_drop_does_not_poison_next_handle() {
 
     let proactor = Rc::new(Proactor::new().unwrap());
     let (file, _peer) = pending_read_file(&proactor).unwrap();
-    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(live_operations() > baseline);
 
     drop(file);
+    assert!(
+        live_operations() > baseline,
+        "dropping the owner must leave the old read unresolved until the proactor is driven"
+    );
+
+    let (unrelated, unrelated_peer) = pending_read_file(&proactor).unwrap();
+    let mut unrelated_read = Box::pin(unrelated.read_at(0, Vec::with_capacity(8)));
+    assert_pending(&mut unrelated_read);
     drop(read);
     assert!(
         live_operations() > baseline,
         "dropping the future before driving should abandon, not reclaim inline"
     );
-    wait_for_baseline(Some(&proactor), baseline);
 
-    let path = temp_path("after-late-drop");
-    std::fs::write(&path, b"abc").unwrap();
-    let mut options = OpenOptions::new();
-    options.read(true);
-    let reopened = options.open(&proactor, &path).unwrap();
-    let OpResult(result, buf) = drive_until_ready(
-        &proactor,
-        Box::pin(reopened.read_at(0, Vec::with_capacity(8))),
-    );
+    let OpResult(written, returned) =
+        drive_until_ready(&proactor, Box::pin(unrelated_peer.write(b"abc".to_vec())));
+    assert_eq!(written.unwrap(), returned.len());
+    assert_eq!(returned, b"abc");
+
+    let OpResult(result, buf) = drive_until_ready(&proactor, unrelated_read);
     assert_eq!(result.unwrap(), ReadOutcome::Bytes(3));
     assert_eq!(buf, b"abc");
-    drop(reopened);
-    let _ = std::fs::remove_file(path);
+    drop((unrelated, unrelated_peer));
+    wait_for_baseline(Some(&proactor), baseline);
 }
 
 #[test]
@@ -187,7 +180,7 @@ fn dropping_in_flight_future_does_not_return_buffer_and_reclaims() {
     let (file, _peer) = pending_read_file(&ThreadPool).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let buffer = DropProbeBuf::with_capacity(64, Arc::clone(&drops));
-    let mut read = Box::pin(file.read(buffer));
+    let mut read = Box::pin(file.read_at(0, buffer));
     assert_pending(&mut read);
     assert!(live_operations() > baseline);
 

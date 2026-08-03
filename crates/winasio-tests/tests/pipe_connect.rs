@@ -210,12 +210,16 @@ fn setup_categories_include_already_registered_and_invalid_name() {
     drop(server);
 
     let name = common::unique_pipe_name("setup_categories_already_registered_client");
-    let server = ServerOptions::new(&name).create(&ThreadPool).unwrap();
+    let mut server_options = ServerOptions::new(&name);
+    server_options.first_instance(true);
+    let server = server_options.create(&ThreadPool).unwrap();
     assert!(matches!(
         ClientOptions::new(&name).connect(&RejectRegistration),
         Err(SetupError::AlreadyRegistered)
     ));
     drop(server);
+    let recreated = server_options.create(&ThreadPool).unwrap();
+    drop(recreated);
 }
 
 #[test]

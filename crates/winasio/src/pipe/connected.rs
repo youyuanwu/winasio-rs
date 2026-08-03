@@ -79,6 +79,12 @@ impl<S: Submitter> NamedPipe<S> {
         NamedPipe { inner: Some(inner) }
     }
 
+    #[cfg(feature = "test-util")]
+    pub(crate) fn into_file_parts(mut self) -> (Handle, S) {
+        let inner = self.take_inner();
+        (inner.handle, inner.submitter)
+    }
+
     /// The underlying kernel handle, borrowed for interoperability.
     ///
     /// Ownership is not transferred. Operations built independently from this

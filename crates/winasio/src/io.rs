@@ -193,8 +193,15 @@ where
             // non-empty spare capacity, so `Bytes(0)` reflects the peer, not a
             // buffer with no room.
             Ok(ReadOutcome::Bytes(0)) => {}
-            Ok(ReadOutcome::Eof | ReadOutcome::ClosedPeer) => {
+            // These are different conditions and FR-033 requires the caller be
+            // able to tell them apart: a file simply ended, versus a peer that
+            // went away mid-transfer. Collapsing both into `UnexpectedEof` means
+            // a caller matching on `ClosedPeer` never sees a pipe closure.
+            Ok(ReadOutcome::Eof) => {
                 return TransferResult::failure(buffer, transferred, TransferError::UnexpectedEof);
+            }
+            Ok(ReadOutcome::ClosedPeer) => {
+                return TransferResult::failure(buffer, transferred, TransferError::ClosedPeer);
             }
             Ok(ReadOutcome::Bytes(n) | ReadOutcome::MoreData(n)) => {
                 transferred += n;

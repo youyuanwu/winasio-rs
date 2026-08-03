@@ -102,6 +102,17 @@ fn assert_unexpected_eof<B>(result: &TransferResult<B>, expected: usize) {
     assert_eq!(result.transferred, expected);
 }
 
+/// A peer that went away mid-transfer is a different condition from a stream
+/// that simply ended, and FR-033 requires the caller be able to tell them apart.
+fn assert_closed_peer<B>(result: &TransferResult<B>, expected: usize) {
+    assert!(
+        matches!(&result.result, Err(TransferError::ClosedPeer)),
+        "expected closed peer, got {:?}",
+        result.result
+    );
+    assert_eq!(result.transferred, expected);
+}
+
 #[test]
 fn write_all_large_payload_returns_buffer() {
     let payload = patterned_payload(16 * 1024 + 333);
@@ -119,36 +130,40 @@ fn write_all_large_payload_returns_buffer() {
             }
             Backend::Pipe => {
                 let name = common::unique_pipe_name("write_all_large_payload_returns_buffer");
-                let mut options = ServerOptions::new(&name);
-                options.out_buffer_size(64).in_buffer_size(64);
-                let (server, client) = connected_pair(&name, &options);
+                let (server, client) = message_pair(&name);
                 let expected = payload.clone();
                 let reader = std::thread::spawn(move || {
                     let mut got = Vec::new();
-                    let mut reads = 0;
+                    let mut messages = 0;
                     while got.len() < expected.len() {
                         let OpResult(read, chunk) =
-                            common::block_on(client.read(Vec::with_capacity(127)));
+                            common::block_on(client.read(Vec::with_capacity(expected.len())));
                         match read.unwrap() {
-                            ReadOutcome::Bytes(n) | ReadOutcome::MoreData(n) => {
+                            ReadOutcome::Bytes(n) => {
                                 assert_eq!(n, chunk.len());
                                 assert!(n > 0, "reader must make progress");
                                 got.extend_from_slice(&chunk);
-                                reads += 1;
+                                messages += 1;
+                            }
+                            ReadOutcome::MoreData(_) => {
+                                panic!("reader buffer should fit every write_all message")
                             }
                             other => panic!("unexpected read outcome: {other:?}"),
                         }
                     }
-                    (got, reads)
+                    (got, messages)
                 });
 
                 let result = common::block_on(server.write_all(payload.clone()));
                 assert_success(&result, payload.len());
                 assert_eq!(result.buffer, payload);
                 drop(server);
-                let (got, reads) = reader.join().unwrap();
+                let (got, messages) = reader.join().unwrap();
                 assert_eq!(got, payload);
-                assert!(reads > 1, "small pipe buffer must require multiple reads");
+                assert!(
+                    messages > 1,
+                    "message-mode reads count the underlying write_all submissions"
+                );
             }
         }
     }
@@ -265,7 +280,9 @@ fn read_exact_short_stream_reports_unexpected_eof() {
                 drop(server);
 
                 let result = common::block_on(client.read_exact(Vec::with_capacity(requested)));
-                assert_unexpected_eof(&result, short.len());
+                // The server was dropped, so this is a closed peer -- not the
+                // plain end-of-stream the file branch above sees.
+                assert_closed_peer(&result, short.len());
                 assert_eq!(result.buffer, short);
             }
         }
@@ -299,7 +316,7 @@ fn helper_failure_returns_buffer_category_and_nonzero_count() {
                 drop(server);
 
                 let result = common::block_on(client.read_exact(Vec::with_capacity(requested)));
-                assert_unexpected_eof(&result, short.len());
+                assert_closed_peer(&result, short.len());
                 assert!(result.transferred > 0);
                 assert_eq!(result.buffer, short);
             }

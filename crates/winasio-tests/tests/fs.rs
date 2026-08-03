@@ -6,7 +6,8 @@
 
 mod common;
 
-use std::os::windows::fs::OpenOptionsExt;
+use std::future::Future;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::IntoRawHandle;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -19,7 +20,8 @@ use winasio::iocp::{
 };
 use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE,
 };
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -39,18 +41,39 @@ fn open_read_write<R: Registrar>(registrar: &R, path: &PathBuf) -> File<R::Io> {
     options.open(registrar, path).unwrap()
 }
 
-#[test]
-fn round_trip_thread_pool() {
-    let path = temp_path("round-trip-pool");
-    let file = open_read_write(&ThreadPool, &path);
+trait FileTestRegistrar: Registrar {
+    const ROUND_TRIP_TAG: &'static str;
 
-    let payload = b"hello async file".repeat(64);
-    let OpResult(written, returned) = common::block_on(file.write_at(128, payload.clone()));
+    fn drive<F: Future>(&self, future: F) -> F::Output;
+}
+
+impl FileTestRegistrar for ThreadPool {
+    const ROUND_TRIP_TAG: &'static str = "round-trip-pool";
+
+    fn drive<F: Future>(&self, future: F) -> F::Output {
+        common::block_on(future)
+    }
+}
+
+impl FileTestRegistrar for Rc<Proactor> {
+    const ROUND_TRIP_TAG: &'static str = "round-trip-proactor";
+
+    fn drive<F: Future>(&self, future: F) -> F::Output {
+        common::drive_proactor(self.as_ref(), future)
+    }
+}
+
+fn round_trip_body<R: FileTestRegistrar>(registrar: &R) {
+    let path = temp_path(R::ROUND_TRIP_TAG);
+    let file = open_read_write(registrar, &path);
+
+    let payload = b"safe async file".repeat(72);
+    let OpResult(written, returned) = registrar.drive(file.write_at(64, payload.clone()));
     assert_eq!(written.unwrap(), payload.len());
     assert_eq!(returned, payload);
 
     let OpResult(read, got) =
-        common::block_on(file.read_at(128, Vec::with_capacity(payload.len() + 16)));
+        registrar.drive(file.read_at(64, Vec::with_capacity(payload.len() + 16)));
     assert_eq!(read.unwrap(), ReadOutcome::Bytes(payload.len()));
     assert_eq!(got, payload);
 
@@ -59,23 +82,14 @@ fn round_trip_thread_pool() {
 }
 
 #[test]
+fn round_trip_thread_pool() {
+    round_trip_body(&ThreadPool);
+}
+
+#[test]
 fn round_trip_caller_driven() {
-    let path = temp_path("round-trip-proactor");
     let proactor = Rc::new(Proactor::new().unwrap());
-    let file = open_read_write(&proactor, &path);
-
-    let payload = b"caller driven".repeat(80);
-    let OpResult(written, returned) = proactor.block_on(file.write_at(32, payload.clone()));
-    assert_eq!(written.unwrap(), payload.len());
-    assert_eq!(returned, payload);
-
-    let OpResult(read, got) =
-        proactor.block_on(file.read_at(32, Vec::with_capacity(payload.len())));
-    assert_eq!(read.unwrap(), ReadOutcome::Bytes(payload.len()));
-    assert_eq!(got, payload);
-
-    drop(file);
-    let _ = std::fs::remove_file(path);
+    round_trip_body(&proactor);
 }
 
 #[test]
@@ -103,6 +117,45 @@ fn open_options_create_new_truncate_and_directory_errors() {
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir(dir);
+}
+
+#[test]
+fn open_options_share_mode_and_custom_attributes_have_effect() {
+    let share_path = temp_path("share-mode");
+    create_contents(&share_path, b"locked");
+    let mut exclusive = OpenOptions::new();
+    exclusive.read(true).share_mode(FILE_SHARE_NONE);
+    let file = exclusive.open(&ThreadPool, &share_path).unwrap();
+    assert!(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&share_path)
+            .is_err(),
+        "FILE_SHARE_NONE must prevent a second reader while the handle is open"
+    );
+    drop(file);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(&share_path)
+        .unwrap();
+    let _ = std::fs::remove_file(&share_path);
+
+    let attr_path = temp_path("custom-attributes");
+    let mut custom = OpenOptions::new();
+    custom
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags_and_attributes(FILE_ATTRIBUTE_TEMPORARY);
+    let file = custom.open(&ThreadPool, &attr_path).unwrap();
+    let attributes = std::fs::metadata(&attr_path).unwrap().file_attributes();
+    assert_ne!(
+        attributes & FILE_ATTRIBUTE_TEMPORARY.0,
+        0,
+        "custom_flags_and_attributes must pass file attributes to CreateFileW"
+    );
+    drop(file);
+    let _ = std::fs::remove_file(attr_path);
 }
 
 #[test]
@@ -167,10 +220,14 @@ fn borrowed_handle_works_with_low_level_operation() {
     let file = open_read_write(&proactor, &path);
 
     let payload = b"low level".to_vec();
-    let written = proactor.block_on(proactor.submit(WriteAt::new(file.handle(), 0, payload)));
+    let written = common::drive_proactor(
+        proactor.as_ref(),
+        proactor.submit(WriteAt::new(file.handle(), 0, payload)),
+    );
     assert_eq!(written.0.unwrap(), b"low level".len());
 
-    let OpResult(read, got) = proactor.block_on(file.read_at(0, Vec::with_capacity(32)));
+    let OpResult(read, got) =
+        common::drive_proactor(proactor.as_ref(), file.read_at(0, Vec::with_capacity(32)));
     assert_eq!(read.unwrap(), ReadOutcome::Bytes(b"low level".len()));
     assert_eq!(got, b"low level");
 
