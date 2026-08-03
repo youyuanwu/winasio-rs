@@ -13,13 +13,15 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::{Duration, Instant};
 
 use windows::core::HSTRING;
 
 use winasio::httpsys::{HttpInitializer, ReceiveConfig, RequestQueue, ServerSession, UrlGroup};
+use winasio::iocp::Proactor;
 
 /// Drives a future to completion on this thread.
 ///
@@ -57,6 +59,53 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+}
+
+/// Drives a caller-driven future to completion with a deadline.
+pub fn drive_proactor<F: Future>(proactor: &Proactor, fut: F) -> F::Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut fut = Box::pin(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for caller-driven operation"
+        );
+        let _ = proactor.poll(Some(Duration::from_millis(5)));
+    }
+}
+
+/// Create a pipe name unique across binaries, tests, processes, and threads.
+pub fn unique_pipe_name(test_name: &str) -> String {
+    static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT_PIPE.fetch_add(1, Ordering::SeqCst);
+    let binary = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "unknown-test-binary".to_string());
+    format!(
+        "winasio_{}_{}_{}_{}",
+        sanitize_pipe_component(&binary),
+        sanitize_pipe_component(test_name),
+        std::process::id(),
+        n
+    )
+}
+
+fn sanitize_pipe_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// A URL group together with the session it borrows.

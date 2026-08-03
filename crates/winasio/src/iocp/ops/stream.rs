@@ -14,7 +14,10 @@
 use std::task::Poll;
 
 use windows::core::{Error, Result};
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, HANDLE};
+use windows::Win32::Foundation::{
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE,
+};
+use windows::Win32::System::Pipes::ConnectNamedPipe;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use crate::fs::outcome::{classify_read, ReadOutcome};
@@ -198,6 +201,189 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteHandleAt<B> {
         let ok = unsafe { WriteFile(self.handle.raw(), ptr, len, std::ptr::null_mut(), optr) };
         // No Windows call may occur between `WriteFile` and `win32_result`.
         unsafe { win32_result(ok != 0, optr) }
+    }
+
+    unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
+        // SAFETY: `optr` is the same overlapped pointer passed to `operate`;
+        // the handle is kept alive by this operation's `Handle` clone.
+        unsafe { CancelIoEx(self.handle.raw(), Some(optr)) }
+    }
+}
+
+/// Read from a shared stream handle.
+pub struct ReadHandle<B: IoBufMut> {
+    inner: ReadHandleAt<B>,
+}
+
+impl<B: IoBufMut> ReadHandle<B> {
+    /// Read into `buffer`.
+    pub fn new(handle: Handle, buffer: B) -> Self {
+        ReadHandle {
+            inner: ReadHandleAt::new(handle, 0, buffer),
+        }
+    }
+
+    /// Convert the low-level byte-count result into the safe read outcome.
+    pub(crate) fn finish(self, result: Result<usize>) -> (Result<ReadOutcome>, B) {
+        self.inner.finish(result)
+    }
+}
+
+impl<B: IoBufMut> IntoInner for ReadHandle<B> {
+    type Inner = B;
+
+    fn into_inner(self) -> B {
+        self.inner.into_inner()
+    }
+}
+
+unsafe impl<B: IoBufMut + Send> OpCode for ReadHandle<B> {
+    fn handle(&self) -> Option<HANDLE> {
+        self.inner.handle()
+    }
+
+    unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+        // Pipes ignore the offset fields, but they must still be initialised.
+        set_offset(optr, 0);
+
+        let len = match checked_u32_len(self.inner.buffer.bytes_total()) {
+            Ok(len) => len,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        let ptr = self.inner.buffer.stable_mut_ptr();
+
+        // SAFETY: `ptr` and `len` describe writable storage owned by this
+        // operation. The operation allocation is retained until completion.
+        let ok = unsafe {
+            ReadFile(
+                self.inner.handle.raw(),
+                ptr,
+                len,
+                std::ptr::null_mut(),
+                optr,
+            )
+        };
+        // No Windows call may occur between `ReadFile` and `win32_result`.
+        let result = unsafe { win32_result(ok != 0, optr) };
+        if let Poll::Ready(ref ready) = result {
+            let transferred = inline_transferred_count(ready, optr);
+            self.inner.record_completion(ready, transferred);
+        }
+        result
+    }
+
+    unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
+        // SAFETY: `optr` is the same overlapped pointer passed to `operate`;
+        // the handle is kept alive by this operation's `Handle` clone.
+        unsafe { CancelIoEx(self.inner.handle.raw(), Some(optr)) }
+    }
+
+    unsafe fn on_complete_with(&mut self, result: &Result<usize>, transferred: usize) {
+        self.inner.record_completion(result, transferred);
+    }
+}
+
+/// Write to a shared stream handle.
+pub struct WriteHandle<B: IoBuf> {
+    inner: WriteHandleAt<B>,
+}
+
+impl<B: IoBuf> WriteHandle<B> {
+    /// Write `buffer`.
+    pub fn new(handle: Handle, buffer: B) -> Self {
+        WriteHandle {
+            inner: WriteHandleAt::new(handle, 0, buffer),
+        }
+    }
+}
+
+impl<B: IoBuf> IntoInner for WriteHandle<B> {
+    type Inner = B;
+
+    fn into_inner(self) -> B {
+        self.inner.into_inner()
+    }
+}
+
+unsafe impl<B: IoBuf + Send> OpCode for WriteHandle<B> {
+    fn handle(&self) -> Option<HANDLE> {
+        self.inner.handle()
+    }
+
+    unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+        // Pipes ignore the offset fields, but they must still be initialised.
+        set_offset(optr, 0);
+
+        let len = match checked_u32_len(self.inner.buffer.bytes_init()) {
+            Ok(len) => len,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        let ptr = self.inner.buffer.stable_ptr();
+
+        // SAFETY: `ptr` and `len` describe initialised bytes owned by this
+        // operation. The operation allocation is retained until completion.
+        let ok = unsafe {
+            WriteFile(
+                self.inner.handle.raw(),
+                ptr,
+                len,
+                std::ptr::null_mut(),
+                optr,
+            )
+        };
+        // No Windows call may occur between `WriteFile` and `win32_result`.
+        unsafe { win32_result(ok != 0, optr) }
+    }
+
+    unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
+        // SAFETY: `optr` is the same overlapped pointer passed to `operate`;
+        // the handle is kept alive by this operation's `Handle` clone.
+        unsafe { CancelIoEx(self.inner.handle.raw(), Some(optr)) }
+    }
+}
+
+/// Connect a server-side named pipe instance.
+pub struct ConnectPipe {
+    handle: Handle,
+}
+
+impl ConnectPipe {
+    /// Connect `handle` to a client.
+    pub fn new(handle: Handle) -> Self {
+        ConnectPipe { handle }
+    }
+}
+
+impl IntoInner for ConnectPipe {
+    type Inner = ();
+
+    fn into_inner(self) {}
+}
+
+unsafe impl OpCode for ConnectPipe {
+    fn handle(&self) -> Option<HANDLE> {
+        Some(self.handle.raw())
+    }
+
+    unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+        // Pipes ignore offsets, but the driver reuses the common OVERLAPPED
+        // allocation and the fields must not contain garbage.
+        set_offset(optr, 0);
+
+        // SAFETY: `optr` is the operation's stable OVERLAPPED allocation and
+        // `handle` is a live server-side named-pipe handle.
+        let res = unsafe { ConnectNamedPipe(self.handle.raw(), Some(optr)) };
+        match res {
+            // No Windows call may occur between `ConnectNamedPipe` and
+            // `win32_result`.
+            Ok(()) => unsafe { win32_result(true, optr) },
+            Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
+                // A client that connected before we asked is still success,
+                // and no completion packet will be posted for this condition.
+                Poll::Ready(Ok(0))
+            }
+            Err(_) => unsafe { win32_result(false, optr) },
+        }
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {

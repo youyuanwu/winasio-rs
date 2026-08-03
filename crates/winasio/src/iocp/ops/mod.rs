@@ -12,4 +12,4 @@ mod stream;
 
 pub use event::WaitForHandle;
 pub use file::{ReadAt, SendHandle, WriteAt};
-pub use stream::{ReadHandleAt, WriteHandleAt};
+pub use stream::{ConnectPipe, ReadHandle, ReadHandleAt, WriteHandle, WriteHandleAt};

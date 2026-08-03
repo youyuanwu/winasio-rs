@@ -86,7 +86,7 @@ fn thread_pool_drop_with_operation_future_held_reclaims() {
     let baseline = live_operations();
 
     let (file, _peer) = pending_read_file(&ThreadPool).unwrap();
-    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(
         live_operations() > baseline,
@@ -117,7 +117,7 @@ fn caller_driven_drop_returns_then_drive_reclaims_held_future() {
 
     let proactor = Rc::new(Proactor::new().unwrap());
     let (file, _peer) = pending_read_file(&proactor).unwrap();
-    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(
         live_operations() > baseline,
@@ -152,7 +152,7 @@ fn caller_driven_late_future_drop_does_not_poison_next_handle() {
 
     let proactor = Rc::new(Proactor::new().unwrap());
     let (file, _peer) = pending_read_file(&proactor).unwrap();
-    let mut read = Box::pin(file.read_at(0, Vec::with_capacity(64)));
+    let mut read = Box::pin(file.read(Vec::with_capacity(64)));
     assert_pending(&mut read);
     assert!(live_operations() > baseline);
 
@@ -187,7 +187,7 @@ fn dropping_in_flight_future_does_not_return_buffer_and_reclaims() {
     let (file, _peer) = pending_read_file(&ThreadPool).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let buffer = DropProbeBuf::with_capacity(64, Arc::clone(&drops));
-    let mut read = Box::pin(file.read_at(0, buffer));
+    let mut read = Box::pin(file.read(buffer));
     assert_pending(&mut read);
     assert!(live_operations() > baseline);
 

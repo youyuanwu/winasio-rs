@@ -6,94 +6,59 @@
 
 //! Test-only helpers for exercising file teardown paths.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
-use windows::core::{Error, HSTRING};
-use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-};
-use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
-};
+use crate::iocp::{IoBuf, IoBufMut, Registrar};
+use crate::pipe::{ClientOptions, NamedPipe, ServerOptions};
 
-use crate::iocp::{Handle, IoBuf, IoBufMut, Registrar};
+use super::SetupError;
 
-use super::{File, SetupError};
+/// A pending-read pipe pair for teardown tests.
+pub type PendingReadPair<S> = (NamedPipe<S>, PendingReadPeer<S>);
 
 /// The client side of a pipe used to keep a server read pending.
-pub struct PendingReadPeer {
-    _client: Handle,
+pub struct PendingReadPeer<S: crate::iocp::Submitter> {
+    _client: NamedPipe<S>,
 }
 
 /// Create a registered handle whose reads remain pending until cancelled.
 ///
-/// The returned `File` wraps the server end of a byte-mode named pipe. The peer
-/// is kept open but never writes, so a read submitted through the file is
-/// genuinely in flight rather than an immediate EOF.
+/// The returned pipe is the server end of a byte-mode named pipe. The peer is
+/// kept open but never writes, so a read submitted through the pipe is genuinely
+/// in flight rather than an immediate closed-peer condition.
 pub fn pending_read_file<R: Registrar>(
     registrar: &R,
-) -> Result<(File<R::Io>, PendingReadPeer), SetupError> {
+) -> Result<PendingReadPair<R::Io>, SetupError> {
     let name = unique_pipe_name();
-
-    // SAFETY: creating a local byte-mode named pipe with default security. The
-    // returned handle is checked before ownership is transferred.
-    let server = unsafe {
-        CreateNamedPipeW(
-            &name,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            4096,
-            4096,
-            0,
-            None,
-        )
-    };
-    if server == INVALID_HANDLE_VALUE {
-        return Err(SetupError::from_windows(Error::from_thread()));
-    }
-    // SAFETY: `server` is a newly created, uniquely owned handle.
-    let server = unsafe { Handle::from_raw(server) };
-
-    // SAFETY: opening the client end of the pipe name created above.
-    let client = unsafe {
-        CreateFileW(
-            &name,
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            Default::default(),
-            None,
-        )
-    }
-    .map_err(SetupError::from_windows)?;
-    // SAFETY: `client` is a newly opened, uniquely owned handle.
-    let client = unsafe { Handle::from_raw(client) };
-
-    // SAFETY: the client is already connected, so this reports either success
-    // or `ERROR_PIPE_CONNECTED` without starting an overlapped connect.
-    match unsafe { ConnectNamedPipe(server.raw(), None) } {
-        Ok(()) => {}
-        Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {}
-        Err(e) => return Err(SetupError::from_windows(e)),
-    }
-
-    let submitter = registrar.register(server.raw()).map_err(SetupError::from)?;
-    Ok((
-        File::from_parts(server, submitter),
-        PendingReadPeer { _client: client },
-    ))
+    let server = ServerOptions::new(name.clone()).create(registrar)?;
+    let client = ClientOptions::new(name).connect(registrar)?;
+    let server = expect_ready(server.connect())?.map_err(SetupError::from_windows)?;
+    Ok((server, PendingReadPeer { _client: client }))
 }
 
-fn unique_pipe_name() -> HSTRING {
+fn expect_ready<F>(future: F) -> Result<F::Output, SetupError>
+where
+    F: Future,
+{
+    let mut future = Box::pin(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    match Pin::as_mut(&mut future).poll(&mut cx) {
+        Poll::Ready(output) => Ok(output),
+        Poll::Pending => Err(SetupError::Win32(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult(),
+        ))),
+    }
+}
+
+fn unique_pipe_name() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    HSTRING::from(format!(r"\\.\pipe\winasio_fs_pending_{pid:x}_{n:x}"))
+    format!("winasio_fs_pending_{pid:x}_{n:x}")
 }
 
 /// A mutable buffer that records when it is dropped.
