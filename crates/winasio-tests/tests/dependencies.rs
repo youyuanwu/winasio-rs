@@ -25,43 +25,53 @@ const RUNTIMES: &[&str] = &[
     "glommio",
 ];
 
-#[test]
-fn the_library_pulls_in_no_async_runtime() {
+/// Run `cargo tree` with the given extra arguments, returning its plain output.
+///
+/// `--color never` matters: CI sets `CARGO_TERM_COLOR=always`, which would
+/// otherwise wrap every crate name in ANSI escapes and defeat the parsing below.
+fn cargo_tree(extra: &[&str]) -> Option<String> {
+    let mut args = vec![
+        "tree", "-p", "winasio", "--edges", "normal", "--color", "never",
+    ];
+    args.extend_from_slice(extra);
+
     let output = Command::new(env!("CARGO"))
-        .args([
-            "tree",
-            "-p",
-            "winasio",
-            "--edges",
-            "normal",
-            "--prefix",
-            "none",
-            "--no-dedupe",
-        ])
+        .args(&args)
+        .env("CARGO_TERM_COLOR", "never")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output();
 
-    let output = match output {
-        Ok(o) if o.status.success() => o,
+    match output {
+        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         // `cargo tree` is unavailable or failed; do not fail the suite over
         // tooling that is not the subject of the test.
         _ => {
             eprintln!("skipping: `cargo tree` unavailable");
-            return;
+            None
         }
-    };
+    }
+}
 
-    let tree = String::from_utf8_lossy(&output.stdout);
+/// The crate name a `cargo tree` line refers to, ignoring tree drawing.
+fn crate_name(line: &str) -> Option<&str> {
+    line.trim_start_matches(['│', '├', '└', '─', ' ', '\u{a0}'])
+        .split_whitespace()
+        .next()
+        .filter(|n| !n.is_empty())
+}
+
+#[test]
+fn the_library_pulls_in_no_async_runtime() {
+    let Some(tree) = cargo_tree(&["--prefix", "none", "--no-dedupe"]) else {
+        return;
+    };
     assert!(
         tree.contains("winasio"),
         "cargo tree produced nothing useful:\n{tree}"
     );
 
     for runtime in RUNTIMES {
-        let leaked = tree
-            .lines()
-            .map(str::trim)
-            .any(|line| line.split_whitespace().next() == Some(*runtime));
+        let leaked = tree.lines().any(|line| crate_name(line) == Some(*runtime));
         assert!(
             !leaked,
             "`{runtime}` reached the library's dependency graph. \
@@ -74,29 +84,17 @@ fn the_library_pulls_in_no_async_runtime() {
 /// The library's direct dependencies should stay minimal.
 #[test]
 fn the_library_depends_only_on_windows() {
-    let output = Command::new(env!("CARGO"))
-        .args(["tree", "-p", "winasio", "--edges", "normal", "--depth", "1"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => {
-            eprintln!("skipping: `cargo tree` unavailable");
-            return;
-        }
+    let Some(tree) = cargo_tree(&["--depth", "1"]) else {
+        return;
     };
 
-    let tree = String::from_utf8_lossy(&output.stdout);
-    let direct: Vec<&str> = tree
-        .lines()
-        .skip(1) // the root
-        .filter_map(|l| {
-            let t = l.trim_start_matches(['│', '├', '└', '─', ' ']);
-            t.split_whitespace().next()
-        })
-        .collect();
+    // Skip the root line; everything after it is a direct dependency.
+    let direct: Vec<&str> = tree.lines().skip(1).filter_map(crate_name).collect();
 
+    assert!(
+        !direct.is_empty(),
+        "expected at least one direct dependency:\n{tree}"
+    );
     for dep in &direct {
         assert!(
             *dep == "windows",
