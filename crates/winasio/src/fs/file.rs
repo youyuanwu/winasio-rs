@@ -136,6 +136,61 @@ impl<S: Submitter> File<S> {
         }
     }
 
+    /// Write the whole buffer starting at `offset`.
+    ///
+    /// The helper submits as many positional writes as are needed, advancing a
+    /// local offset after each successful transfer. The `File` keeps no cursor
+    /// state.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred are not undone, and neither the buffer nor the transferred
+    /// count is returned.
+    pub fn write_all<B>(
+        &self,
+        offset: u64,
+        buffer: B,
+    ) -> impl Future<Output = crate::io::TransferResult<B>> + '_
+    where
+        B: IoBuf + Send,
+    {
+        crate::io::write_all(self, offset, buffer)
+    }
+
+    /// Fill the buffer's full capacity from `offset`.
+    ///
+    /// End-of-file before the capacity is filled is reported as
+    /// [`crate::io::TransferError::UnexpectedEof`], with the partially filled
+    /// buffer and transferred count returned in the result.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred are not undone, and neither the buffer nor the transferred
+    /// count is returned.
+    pub fn read_exact<B>(
+        &self,
+        offset: u64,
+        buffer: B,
+    ) -> impl Future<Output = crate::io::TransferResult<B>> + '_
+    where
+        B: IoBufMut + Send,
+    {
+        crate::io::read_exact(self, offset, buffer)
+    }
+
+    /// Read from `offset` until end-of-file into `buffer`.
+    ///
+    /// The returned count is the number of bytes appended by this helper.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred are not undone, and neither the buffer nor the transferred
+    /// count is returned.
+    pub fn read_to_end(
+        &self,
+        offset: u64,
+        buffer: Vec<u8>,
+    ) -> impl Future<Output = crate::io::TransferResult<Vec<u8>>> + '_ {
+        crate::io::read_to_end(self, offset, buffer)
+    }
+
     fn open(&self) -> &Inner<S> {
         self.inner.as_ref().expect("file state is present")
     }

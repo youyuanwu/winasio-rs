@@ -131,6 +131,54 @@ impl<S: Submitter> NamedPipe<S> {
         }
     }
 
+    /// Write the whole buffer to the pipe.
+    ///
+    /// The helper submits as many writes as are needed to transfer the full
+    /// buffer.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred to the peer are not undone, and neither the buffer nor the
+    /// transferred count is returned.
+    pub fn write_all<B>(&self, buffer: B) -> impl Future<Output = crate::io::TransferResult<B>> + '_
+    where
+        B: IoBuf + Send,
+    {
+        crate::io::write_all(self, 0, buffer)
+    }
+
+    /// Fill the buffer's full capacity from the pipe.
+    ///
+    /// A closed peer before the capacity is filled is reported as
+    /// [`crate::io::TransferError::UnexpectedEof`], with the partially filled
+    /// buffer and transferred count returned in the result.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred from the peer are not undone, and neither the buffer nor the
+    /// transferred count is returned.
+    pub fn read_exact<B>(
+        &self,
+        buffer: B,
+    ) -> impl Future<Output = crate::io::TransferResult<B>> + '_
+    where
+        B: IoBufMut + Send,
+    {
+        crate::io::read_exact(self, 0, buffer)
+    }
+
+    /// Read from the pipe until the peer closes into `buffer`.
+    ///
+    /// The returned count is the number of bytes appended by this helper.
+    ///
+    /// If the returned future is dropped before resolving, bytes already
+    /// transferred from the peer are not undone, and neither the buffer nor the
+    /// transferred count is returned.
+    pub fn read_to_end(
+        &self,
+        buffer: Vec<u8>,
+    ) -> impl Future<Output = crate::io::TransferResult<Vec<u8>>> + '_ {
+        crate::io::read_to_end(self, 0, buffer)
+    }
+
     /// Disconnect this server-side pipe and return the reusable server state.
     ///
     /// This consumes the pipe, so it requires exclusive ownership. If the pipe

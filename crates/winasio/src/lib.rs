@@ -6,6 +6,7 @@
 
 pub mod fs;
 pub mod httpsys;
+pub mod io;
 pub mod iocp;
 pub mod pipe;
 pub mod winhttp;
