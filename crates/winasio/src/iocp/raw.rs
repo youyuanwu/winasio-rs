@@ -537,6 +537,19 @@ unsafe fn read_header(optr: *mut OVERLAPPED) -> (u32, &'static OpVTable) {
     (magic, vtable)
 }
 
+/// Serialises tests that observe the process-global operation counter.
+///
+/// `live_operations` counts every operation in the process, and cargo runs tests
+/// in parallel, so a test asserting on it must not observe another test's
+/// allocations. Crucially this is **not** confined to this module: any test
+/// anywhere in the crate that submits an operation bumps the same counter, so it
+/// must take this lock too.
+#[cfg(test)]
+pub(crate) fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+    COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,16 +614,7 @@ mod tests {
 
     fn assert_send<T: Send>() {}
 
-    /// `live_operations` is process-global, so tests that assert on it must not
-    /// observe each other's allocations. Cargo runs tests in parallel by
-    /// default, so they take this lock.
-    ///
-    /// Phase 4's soak has the same constraint.
-    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
-
-    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use super::counter_guard;
 
     #[test]
     fn raw_op_is_send_when_op_is_send() {

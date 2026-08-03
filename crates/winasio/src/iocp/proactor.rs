@@ -456,6 +456,9 @@ mod tests {
 
     #[test]
     fn inline_success_yields_one_result_and_runs_the_completion_hook() {
+        // Submitting bumps the process-global operation counter that the tests
+        // in `raw.rs` assert on, so this must serialise with them.
+        let _guard = crate::iocp::raw::counter_guard();
         let before = INLINE_COMPLETIONS.load(Ordering::SeqCst);
         let proactor = Proactor::new().unwrap();
 
@@ -496,6 +499,7 @@ mod tests {
 
     #[test]
     fn inline_failure_returns_the_operation_state() {
+        let _guard = crate::iocp::raw::counter_guard();
         let proactor = Proactor::new().unwrap();
         let err = windows::core::Error::from_hresult(windows::core::HRESULT(-2147024809));
 
