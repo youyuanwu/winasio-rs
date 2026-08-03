@@ -13,13 +13,16 @@ use windows::Win32::Networking::HttpServer::{
     HTTP_PROPERTY_FLAGS,
 };
 
-use crate::iocp::{IntoInner, OpCode, Submit, ThreadPoolIo};
+use crate::iocp::{IntoInner, IoBuf, IoBufMut, OpCode, OpResult, Submit, ThreadPoolIo};
 
 use super::error::{check, win32_code};
 use super::init::VERSION;
+use super::ops::body::ReceiveBody;
 use super::ops::cancel::CancelRequest;
 use super::ops::receive::ReceiveRequest;
+use super::ops::send::{SendBody, SendResponse};
 use super::request::{Request, RequestId, MIN_CAPACITY};
+use super::response::Response;
 use super::session::UrlGroup;
 
 /// How a queue sizes its receive buffers and how hard it retries.
@@ -194,10 +197,16 @@ impl RequestQueue {
     }
 
     /// Submit an operation, failing rather than panicking once closed.
-    pub(crate) fn submit<T: OpCode + Send>(&self, op: T) -> Result<Submit<T>> {
+    ///
+    /// On failure the operation is handed back, so callers can return the
+    /// caller-supplied state rather than dropping it.
+    pub(crate) fn submit<T: OpCode + Send>(
+        &self,
+        op: T,
+    ) -> std::result::Result<Submit<T>, (Error, T)> {
         match self.io.as_ref() {
             Some(io) => Ok(io.submit(op)),
-            None => Err(Error::from_hresult(ERROR_INVALID_HANDLE.to_hresult())),
+            None => Err((Error::from_hresult(ERROR_INVALID_HANDLE.to_hresult()), op)),
         }
     }
 
@@ -223,7 +232,10 @@ impl RequestQueue {
         loop {
             let request = Request::with_capacity(capacity);
             let op = ReceiveRequest::new(self.handle, target, request);
-            let outcome = self.submit(op)?.await;
+            let outcome = match self.submit(op) {
+                Ok(fut) => fut.await,
+                Err((e, _)) => return Err(ReceiveError::Failed(e)),
+            };
             let (result, op) = outcome.into_parts();
 
             match result {
@@ -258,8 +270,102 @@ impl RequestQueue {
     /// [`ReceiveError::TooLarge`]; leaving it queued would make the next receive
     /// return the same request again.
     pub async fn reject(&self, id: RequestId) -> Result<()> {
-        let outcome = self.submit(CancelRequest::new(self.handle, id))?.await;
-        outcome.0.map(|_| ())
+        let fut = self
+            .submit(CancelRequest::new(self.handle, id))
+            .map_err(|(e, _)| e)?;
+        fut.await.0.map(|_| ())
+    }
+
+    /// Send a complete reply.
+    ///
+    /// The reply comes back with the outcome, on failure as well as success, so
+    /// a failed send does not consume it.
+    ///
+    /// The operating system forbids concurrent sends on a single request
+    /// identifier; that is a caller obligation this API does not enforce.
+    pub async fn send(&self, id: RequestId, response: Response) -> OpResult<usize, Response> {
+        self.send_with(id, response, false).await
+    }
+
+    /// Send a reply, indicating that further body data follows.
+    ///
+    /// Continue with [`send_body`](RequestQueue::send_body), marking the final
+    /// piece as last.
+    pub async fn send_partial(
+        &self,
+        id: RequestId,
+        response: Response,
+    ) -> OpResult<usize, Response> {
+        self.send_with(id, response, true).await
+    }
+
+    async fn send_with(
+        &self,
+        id: RequestId,
+        response: Response,
+        more: bool,
+    ) -> OpResult<usize, Response> {
+        match self.submit(SendResponse::new(self.handle, id, response, more)) {
+            Ok(fut) => fut.await.map_state(IntoInner::into_inner),
+            // Nothing was submitted, so hand the reply straight back.
+            Err((e, op)) => OpResult(Err(e), op.into_inner()),
+        }
+    }
+
+    /// Send a further piece of a reply's body.
+    ///
+    /// Set `last` on the final piece. The buffer comes back with the outcome.
+    pub async fn send_body<B: IoBuf + Send>(
+        &self,
+        id: RequestId,
+        buffer: B,
+        last: bool,
+    ) -> OpResult<usize, B> {
+        match self.submit(SendBody::new(self.handle, id, buffer, last)) {
+            Ok(fut) => fut.await.map_state(IntoInner::into_inner),
+            Err((e, op)) => OpResult(Err(e), op.into_inner()),
+        }
+    }
+
+    /// Read part of a request's body.
+    ///
+    /// The buffer comes back with the outcome. End of body is reported as
+    /// `Ok(0)` rather than as an error.
+    pub async fn read_body<B: IoBufMut + Send>(
+        &self,
+        id: RequestId,
+        buffer: B,
+    ) -> OpResult<usize, B> {
+        match self.submit(ReceiveBody::new(self.handle, id, buffer)) {
+            Ok(fut) => {
+                let OpResult(result, op) = fut.await;
+                // `ERROR_HANDLE_EOF` is how HTTP.sys signals the end of a body.
+                // That is a normal terminating outcome, not a failure.
+                let result = match result {
+                    Err(ref e) if is_eof(e) => Ok(0),
+                    other => other,
+                };
+                OpResult(result, op.into_inner())
+            }
+            Err((e, op)) => OpResult(Err(e), op.into_inner()),
+        }
+    }
+
+    /// Read a request's body to its end.
+    ///
+    /// Reads repeatedly into a buffer of `chunk` bytes until end of body.
+    pub async fn read_body_to_end(&self, id: RequestId, chunk: usize) -> Result<Vec<u8>> {
+        let chunk = chunk.max(1);
+        let mut collected: Vec<u8> = Vec::new();
+        loop {
+            let buffer: Vec<u8> = Vec::with_capacity(chunk);
+            let OpResult(result, buffer) = self.read_body(id, buffer).await;
+            let n = result?;
+            if n == 0 {
+                return Ok(collected);
+            }
+            collected.extend_from_slice(&buffer[..n.min(buffer.len())]);
+        }
     }
 
     /// Close the queue, draining outstanding operations first.
@@ -292,6 +398,11 @@ impl Drop for RequestQueue {
 /// Whether an error is HTTP.sys reporting that the buffer was too small.
 fn is_more_data(err: &Error) -> bool {
     win32_code(err) == Some(windows::Win32::Foundation::ERROR_MORE_DATA.0)
+}
+
+/// Whether an error is HTTP.sys reporting the end of an entity body.
+fn is_eof(err: &Error) -> bool {
+    win32_code(err) == Some(windows::Win32::Foundation::ERROR_HANDLE_EOF.0)
 }
 
 #[cfg(test)]

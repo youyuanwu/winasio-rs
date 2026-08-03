@@ -6,8 +6,10 @@
 
 //! Operations on a request queue.
 
+pub(crate) mod body;
 pub(crate) mod cancel;
 pub(crate) mod receive;
+pub(crate) mod send;
 
 use windows::Win32::Foundation::HANDLE;
 

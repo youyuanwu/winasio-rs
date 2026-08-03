@@ -30,6 +30,14 @@ impl RequestId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// Rebuild an identifier from a raw value.
+    ///
+    /// Useful when an identifier has been carried across a boundary that cannot
+    /// hold the type itself.
+    pub fn from_raw(id: u64) -> RequestId {
+        RequestId(id)
+    }
 }
 
 /// The request's method.

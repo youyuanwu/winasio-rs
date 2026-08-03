@@ -29,14 +29,18 @@ mod init;
 mod ops;
 mod queue;
 mod request;
+mod response;
 mod session;
 
 pub use header::{RequestHeader, ResponseHeader};
 pub use init::HttpInitializer;
+pub use ops::body::ReceiveBody;
 pub use ops::cancel::CancelRequest;
 pub use ops::receive::ReceiveRequest;
+pub use ops::send::{SendBody, SendResponse};
 pub use queue::{ReceiveConfig, ReceiveError, RequestQueue};
 pub use request::{Method, Request, RequestId, UnknownHeaders, MIN_CAPACITY};
+pub use response::{Response, Value, INLINE_CHUNKS, INLINE_UNKNOWN_HEADERS};
 pub use session::{ServerSession, UrlGroup};
 
 /// The element the request buffer is allocated as.
