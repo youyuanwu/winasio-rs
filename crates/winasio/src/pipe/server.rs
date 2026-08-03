@@ -26,7 +26,8 @@ use windows::Win32::Storage::FileSystem::{
     PIPE_ACCESS_OUTBOUND,
 };
 use windows::Win32::System::Pipes::{
-    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    CreateNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE, PIPE_TYPE_BYTE,
+    PIPE_TYPE_MESSAGE, PIPE_WAIT,
 };
 
 use crate::fs::SetupError;
@@ -48,11 +49,23 @@ pub enum AccessDirection {
     Duplex,
 }
 
-/// Builder for creating an overlapped byte-mode named-pipe server instance.
+/// Byte or message mode for a named pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PipeMode {
+    /// Byte stream semantics.
+    #[default]
+    Byte,
+    /// Message semantics. On the server endpoint this also selects message
+    /// read mode.
+    Message,
+}
+
+/// Builder for creating an overlapped named-pipe server instance.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     name: String,
     access: AccessDirection,
+    pipe_type: PipeMode,
     max_instances: u32,
     in_buffer_size: u32,
     out_buffer_size: u32,
@@ -66,6 +79,7 @@ impl ServerOptions {
         ServerOptions {
             name: name.into(),
             access: AccessDirection::Duplex,
+            pipe_type: PipeMode::Byte,
             max_instances: 1,
             in_buffer_size: 4096,
             out_buffer_size: 4096,
@@ -83,6 +97,15 @@ impl ServerOptions {
     /// Set the access direction.
     pub fn access(&mut self, access: AccessDirection) -> &mut Self {
         self.access = access;
+        self
+    }
+
+    /// Set the pipe type. Byte type is the default.
+    ///
+    /// Selecting message type also puts the server endpoint into message read
+    /// mode, so oversized reads report [`super::ReadOutcome::MoreData`].
+    pub fn pipe_type(&mut self, pipe_type: PipeMode) -> &mut Self {
+        self.pipe_type = pipe_type;
         self
     }
 
@@ -126,7 +149,7 @@ impl ServerOptions {
         if self.first_instance {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
-        let pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
+        let pipe_mode = self.pipe_mode() | PIPE_WAIT;
 
         // SAFETY: the name was validated and composed as a local, NUL-free
         // pipe path. All other arguments are values owned by this builder.
@@ -165,6 +188,13 @@ impl ServerOptions {
             AccessDirection::Inbound => PIPE_ACCESS_INBOUND,
             AccessDirection::Outbound => PIPE_ACCESS_OUTBOUND,
             AccessDirection::Duplex => PIPE_ACCESS_DUPLEX,
+        }
+    }
+
+    fn pipe_mode(&self) -> NAMED_PIPE_MODE {
+        match self.pipe_type {
+            PipeMode::Byte => PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+            PipeMode::Message => PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE,
         }
     }
 }

@@ -89,7 +89,12 @@ impl<S: Submitter> NamedPipe<S> {
         self.open().handle.raw()
     }
 
-    /// Start a byte-mode read.
+    /// Start a read.
+    ///
+    /// On a message-read-mode endpoint, an oversized message resolves to
+    /// [`ReadOutcome::MoreData`] carrying the delivered byte count. The
+    /// operation does not grow the buffer or retry; read again to retrieve the
+    /// remainder.
     ///
     /// If the returned future is dropped before resolving, cancellation is
     /// requested and the buffer is not returned.
@@ -108,7 +113,7 @@ impl<S: Submitter> NamedPipe<S> {
         }
     }
 
-    /// Start a byte-mode write.
+    /// Start a write.
     ///
     /// If the returned future is dropped before resolving, cancellation is
     /// requested and the buffer is not returned.

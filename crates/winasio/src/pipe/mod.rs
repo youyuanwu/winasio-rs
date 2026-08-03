@@ -6,7 +6,8 @@
 
 //! Safe asynchronous named-pipe I/O.
 //!
-//! This module creates local Windows named pipes in overlapped byte mode,
+//! This module creates local Windows named pipes in overlapped byte or message
+//! mode,
 //! registers each handle with one of [`crate::iocp`]'s completion backends, and
 //! exposes offsetless reads and writes that own their buffers until completion.
 //! Pipe names are bare final components: builders compose the `\\.\pipe\...`
@@ -20,9 +21,14 @@
 //! * **Register once.** Creating or connecting registers the handle
 //!   immediately. A second registration is reported as
 //!   [`SetupError::AlreadyRegistered`].
-//! * **Byte mode in this phase.** Builders create byte-type, byte-read-mode
-//!   pipes. A short read is therefore an ordinary [`ReadOutcome::Bytes`]
-//!   transfer, never [`ReadOutcome::MoreData`].
+//! * **Byte mode by default.** Builders default to byte type and byte read
+//!   mode. Server options can select message type, and client options can
+//!   select message read mode; a message read that does not fit reports
+//!   [`ReadOutcome::MoreData`] with the delivered byte count.
+//! * **Access direction is runtime-checked.** Every connected pipe exposes both
+//!   [`NamedPipe::read`] and [`NamedPipe::write`] regardless of the configured
+//!   direction. An operation contrary to that direction resolves as the
+//!   platform access failure and returns the caller's buffer.
 //! * **The handle outlives operations created here.** A [`NamedPipe`] and every
 //!   read or write it submits each hold a shared [`crate::iocp::Handle`].
 //!   Dropping the owner cannot close a handle that one of its operations may
@@ -71,6 +77,22 @@
 //! `WaitNamedPipeW` is synchronous and this module owns no runtime-agnostic
 //! timer. Callers who want to wait should retry with their own runtime's timer,
 //! treating [`SetupError::Busy`] as the retryable condition.
+//!
+//! ```no_run
+//! # use std::thread;
+//! # use std::time::Duration;
+//! # use winasio::iocp::ThreadPool;
+//! # use winasio::pipe::{ClientOptions, SetupError};
+//! # fn connect_with_retry(name: &str) -> Result<(), SetupError> {
+//! loop {
+//!     match ClientOptions::new(name).connect(&ThreadPool) {
+//!         Ok(_pipe) => return Ok(()),
+//!         Err(SetupError::Busy) => thread::sleep(Duration::from_millis(10)),
+//!         Err(e) => return Err(e),
+//!     }
+//! }
+//! # }
+//! ```
 
 mod client;
 mod connected;
@@ -81,7 +103,7 @@ pub use crate::fs::{ReadOutcome, SetupError};
 pub use client::ClientOptions;
 pub use connected::NamedPipe;
 pub use name::MAX_NAME_COMPONENT_LEN;
-pub use server::{AccessDirection, NamedPipeServer, ServerOptions};
+pub use server::{AccessDirection, NamedPipeServer, PipeMode, ServerOptions};
 
 /// A [`NamedPipeServer`] using the system thread-pool backend.
 pub type ThreadPoolNamedPipeServer = NamedPipeServer<crate::iocp::ThreadPoolIo>;
