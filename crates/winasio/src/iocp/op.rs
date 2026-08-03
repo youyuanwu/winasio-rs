@@ -126,6 +126,32 @@ pub unsafe trait OpCode: 'static {
     unsafe fn on_complete(&mut self, result: &Result<usize>) {
         let _ = result;
     }
+
+    /// Observe the completion result together with the byte count Windows
+    /// reported, even when the status is a failure.
+    ///
+    /// Some conditions are failures that still transferred data — a named pipe
+    /// message that did not fit the buffer reports `ERROR_MORE_DATA` *and* the
+    /// bytes it delivered. [`OpCode::on_complete`] cannot see that count,
+    /// because a failure status carries no value in the `Result`.
+    ///
+    /// The default forwards to [`OpCode::on_complete`], so operations that do
+    /// not care are unaffected and existing implementations keep working
+    /// unchanged. Override this instead of `on_complete` when the count matters
+    /// on the failure path; the driver calls this one, never both.
+    ///
+    /// `transferred` is what the platform reported. It is **not** validated
+    /// against any buffer length: an implementation that uses it to publish
+    /// initialised bytes must clamp it to its own capacity first.
+    ///
+    /// # Safety
+    ///
+    /// Called only from the completion path, before the state is released or
+    /// returned.
+    unsafe fn on_complete_with(&mut self, result: &Result<usize>, transferred: usize) {
+        let _ = transferred;
+        unsafe { self.on_complete(result) }
+    }
 }
 
 /// Extracts the meaningful result out of a completed operation.

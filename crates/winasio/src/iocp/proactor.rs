@@ -20,8 +20,10 @@ use windows::Win32::System::IO::{OVERLAPPED, OVERLAPPED_ENTRY};
 
 use super::future::Submit;
 use super::op::OpCode;
-use super::port::{entry_result, CompletionPort, RegistrationError, KEY_OPERATION, KEY_WAKEUP};
-use super::raw::{dispatch_completion, Key};
+use super::port::{
+    entry_result, entry_transferred, CompletionPort, RegistrationError, KEY_OPERATION, KEY_WAKEUP,
+};
+use super::raw::{dispatch_completion_with, Key};
 
 /// How many completions to retrieve per wait.
 const BATCH: usize = 64;
@@ -301,7 +303,7 @@ impl ProactorInner {
 
         // Collect first, so no `RefCell` borrow is live while a waker runs —
         // an inline executor could otherwise re-enter this proactor.
-        let mut ready: Vec<(*mut OVERLAPPED, Result<usize>)> = Vec::new();
+        let mut ready: Vec<(*mut OVERLAPPED, Result<usize>, usize)> = Vec::new();
         {
             let mut pending = self.pending.borrow_mut();
             for entry in entries.iter().take(count) {
@@ -317,16 +319,19 @@ impl ProactorInner {
                     continue;
                 }
                 pending.remove(&(optr as usize));
-                ready.push((optr, entry_result(entry)));
+                ready.push((optr, entry_result(entry), entry_transferred(entry)));
             }
         }
 
         let mut delivered = 0usize;
-        for (optr, result) in ready {
+        for (optr, result, transferred) in ready {
             // SAFETY: the completion key established that this packet is ours,
             // so `optr` refers to a live operation allocation whose leaked
             // reference has not been reclaimed.
-            if unsafe { dispatch_completion(optr, result) } {
+            //
+            // The count travels beside the status: a failure cannot carry one,
+            // and some failures still transferred bytes.
+            if unsafe { dispatch_completion_with(optr, result, transferred) } {
                 delivered += 1;
             }
         }

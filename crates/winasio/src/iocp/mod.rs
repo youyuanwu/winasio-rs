@@ -85,8 +85,10 @@
 //! would be a use-after-free. Callers who need a buffer back must await the
 //! operation rather than dropping it.
 
+mod backend;
 mod buf;
 mod future;
+mod handle;
 mod op;
 pub mod ops;
 mod port;
@@ -94,8 +96,10 @@ mod proactor;
 mod raw;
 mod threadpool;
 
+pub use backend::{Registrar, Submitter, ThreadPool};
 pub use buf::{IoBuf, IoBufMut, OpResult};
 pub use future::Submit;
+pub use handle::Handle;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
 pub use ops::{ReadAt, SendHandle, WaitForHandle, WriteAt};
 pub use port::RegistrationError;

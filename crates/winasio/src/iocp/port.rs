@@ -193,6 +193,14 @@ impl Drop for CompletionPort {
     }
 }
 
+/// The byte count a completion packet reported, regardless of its status.
+///
+/// [`entry_result`] cannot carry this on the failure path, but some failures —
+/// `ERROR_MORE_DATA` above all — still transferred data.
+pub(crate) fn entry_transferred(entry: &OVERLAPPED_ENTRY) -> usize {
+    entry.dwNumberOfBytesTransferred as usize
+}
+
 /// Convert the `Internal` field of a completion entry into a result.
 ///
 /// `Internal` carries an `NTSTATUS`, not a Win32 error code, so it must be
