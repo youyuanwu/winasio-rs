@@ -60,6 +60,26 @@ fn assert_not_invalid_handle<T>(result: &windows::core::Result<T>) {
     }
 }
 
+/// Drive a proactor until a future resolves, failing rather than hanging.
+///
+/// `Proactor::block_on` waits indefinitely, so a teardown bug that leaves an
+/// operation permanently outstanding would stall the suite instead of failing
+/// it. Every wait here is bounded so a hang is reported as a failure.
+fn drive_until_ready<F: Future>(proactor: &Proactor, mut future: Pin<Box<F>>) -> F::Output {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "operation never resolved: owner drop did not cancel it"
+        );
+        let _ = proactor.poll(Some(Duration::from_millis(5)));
+    }
+}
+
 #[test]
 fn thread_pool_drop_with_operation_future_held_reclaims() {
     let _guard = common::serial();
@@ -115,7 +135,7 @@ fn caller_driven_drop_returns_then_drive_reclaims_held_future() {
         "without driving the proactor, the operation record must remain live"
     );
 
-    let OpResult(result, buffer) = proactor.block_on(read);
+    let OpResult(result, buffer) = drive_until_ready(&proactor, read);
     assert_not_invalid_handle(&result);
     match result {
         Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
@@ -149,7 +169,10 @@ fn caller_driven_late_future_drop_does_not_poison_next_handle() {
     let mut options = OpenOptions::new();
     options.read(true);
     let reopened = options.open(&proactor, &path).unwrap();
-    let OpResult(result, buf) = proactor.block_on(reopened.read_at(0, Vec::with_capacity(8)));
+    let OpResult(result, buf) = drive_until_ready(
+        &proactor,
+        Box::pin(reopened.read_at(0, Vec::with_capacity(8))),
+    );
     assert_eq!(result.unwrap(), ReadOutcome::Bytes(3));
     assert_eq!(buf, b"abc");
     drop(reopened);
