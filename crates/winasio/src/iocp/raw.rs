@@ -628,6 +628,9 @@ mod tests {
 
     #[test]
     fn overlapped_is_at_offset_zero() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         assert_eq!(std::mem::offset_of!(RawOp<NoopOp>, overlapped), 0);
         assert_eq!(std::mem::offset_of!(RawOp<BigOp>, overlapped), 0);
 
@@ -651,6 +654,9 @@ mod tests {
 
     #[test]
     fn erased_dispatch_reaches_the_right_type() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         REACHED.store(false, Ordering::SeqCst);
         REACHED_LEN.store(0, Ordering::SeqCst);
 
@@ -739,6 +745,9 @@ mod tests {
 
     #[test]
     fn take_result_is_exactly_once() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         let key = Key::new(noop(0));
         let optr = key.leak();
         unsafe { dispatch_completion(optr, Ok(11)) };
@@ -808,6 +817,9 @@ mod tests {
 
     #[test]
     fn waker_is_signalled_on_completion() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         use std::sync::atomic::AtomicBool;
         static WOKEN: AtomicBool = AtomicBool::new(false);
         WOKEN.store(false, Ordering::SeqCst);
@@ -823,6 +835,9 @@ mod tests {
 
     #[test]
     fn abandoned_completion_does_not_wake() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         use std::sync::atomic::AtomicBool;
         static WOKEN: AtomicBool = AtomicBool::new(false);
         WOKEN.store(false, Ordering::SeqCst);
@@ -868,6 +883,9 @@ mod tests {
 
     #[test]
     fn completion_releases_its_reference_before_waking() {
+        // Creating an operation bumps the process-global counter the
+        // assertions in this module depend on.
+        let _guard = counter_guard();
         // The future's `finish` unwraps the allocation to hand back the
         // operation state. If the completion path still held a reference when
         // it woke, an executor polling inline would find the allocation shared

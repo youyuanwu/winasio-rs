@@ -511,6 +511,10 @@ mod tests {
     /// public operations do not exist until later phases.
     #[test]
     fn submitting_to_a_closed_queue_is_an_error() {
+        // The submission is rejected before an operation exists, so the global
+        // counter is untouched -- but take the guard anyway, so this stays true
+        // by construction rather than by inspection.
+        let _guard = crate::iocp::counter_guard();
         let queue = match RequestQueue::new() {
             Ok(q) => q,
             // No HTTP service available; nothing to assert.
