@@ -13,11 +13,92 @@ use windows::Win32::Networking::HttpServer::{
     HTTP_PROPERTY_FLAGS,
 };
 
-use crate::iocp::{OpCode, Submit, ThreadPoolIo};
+use crate::iocp::{IntoInner, OpCode, Submit, ThreadPoolIo};
 
-use super::error::check;
+use super::error::{check, win32_code};
 use super::init::VERSION;
+use super::ops::cancel::CancelRequest;
+use super::ops::receive::ReceiveRequest;
+use super::request::{Request, RequestId, MIN_CAPACITY};
 use super::session::UrlGroup;
+
+/// How a queue sizes its receive buffers and how hard it retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiveConfig {
+    /// Initial buffer size, in bytes. Raised to [`MIN_CAPACITY`] if smaller.
+    pub initial_capacity: usize,
+    /// How many times an over-large request may be retried at a larger size.
+    ///
+    /// Zero disables retrying, so an over-large request fails immediately with
+    /// [`ReceiveError::TooLarge`].
+    pub max_retries: u32,
+}
+
+impl Default for ReceiveConfig {
+    fn default() -> Self {
+        ReceiveConfig {
+            initial_capacity: 4096,
+            max_retries: 1,
+        }
+    }
+}
+
+/// How much a retry enlarges the buffer.
+///
+/// Phase 0 established that the size HTTP.sys needs is *not* recoverable on the
+/// asynchronous path -- the value exists in the completion's `InternalHigh`, but
+/// reading it would mean retaining the `OVERLAPPED` pointer past `operate`,
+/// which the [`OpCode`] contract forbids. So the retry grows blindly instead.
+///
+/// A factor of 16 takes the 4096-byte default to 65536 in a single step, which
+/// covers roughly 60 KB of request text -- comfortably beyond the operating
+/// system's own default request ceiling of about 16 KB. Measured: a request
+/// padded with 4096 bytes needed 5696 bytes of buffer in total.
+const GROWTH_FACTOR: usize = 16;
+
+/// Why a receive did not produce a request.
+#[derive(Debug)]
+pub enum ReceiveError {
+    /// The request did not fit, and the retry bound is exhausted.
+    ///
+    /// The request is still queued. Reject it with
+    /// [`RequestQueue::reject`] -- otherwise the next receive returns the very
+    /// same request and the accept loop livelocks.
+    TooLarge {
+        /// The offending request, so it can be rejected.
+        id: RequestId,
+        /// The largest buffer that was tried.
+        attempted_capacity: usize,
+        /// How many retries were performed.
+        retries: u32,
+    },
+    /// Anything else -- a closed queue, a cancelled operation, a real failure.
+    Failed(Error),
+}
+
+impl std::fmt::Display for ReceiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReceiveError::TooLarge {
+                id,
+                attempted_capacity,
+                retries,
+            } => write!(
+                f,
+                "request {id:?} did not fit in {attempted_capacity} bytes after {retries} retries; reject it to clear the queue"
+            ),
+            ReceiveError::Failed(e) => write!(f, "receive failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReceiveError {}
+
+impl From<Error> for ReceiveError {
+    fn from(e: Error) -> Self {
+        ReceiveError::Failed(e)
+    }
+}
 
 /// A listener.
 ///
@@ -32,6 +113,7 @@ pub struct RequestQueue {
     /// `None` once closed. Dropping the registration cancels and drains
     /// outstanding operations, which is why it is released *before* the handle.
     io: Option<ThreadPoolIo>,
+    config: ReceiveConfig,
 }
 
 impl std::fmt::Debug for RequestQueue {
@@ -51,9 +133,20 @@ unsafe impl Sync for RequestQueue {}
 impl RequestQueue {
     /// Create an anonymous request queue and register it for completions.
     pub fn new() -> Result<RequestQueue> {
+        RequestQueue::with_config(ReceiveConfig::default())
+    }
+
+    /// Create a queue with a specific receive configuration.
+    pub fn with_config(config: ReceiveConfig) -> Result<RequestQueue> {
         let mut handle = HANDLE::default();
         let code = unsafe {
-            HttpCreateRequestQueue(VERSION, windows::core::PCWSTR::null(), None, None, &mut handle)
+            HttpCreateRequestQueue(
+                VERSION,
+                windows::core::PCWSTR::null(),
+                None,
+                None,
+                &mut handle,
+            )
         };
         check(code)?;
         debug_assert!(!handle.is_invalid());
@@ -62,6 +155,7 @@ impl RequestQueue {
             Ok(io) => Ok(RequestQueue {
                 handle,
                 io: Some(io),
+                config,
             }),
             Err(e) => {
                 // Do not leak the queue if registration fails.
@@ -69,6 +163,11 @@ impl RequestQueue {
                 Err(Error::from(e))
             }
         }
+    }
+
+    /// The receive configuration in force.
+    pub fn config(&self) -> ReceiveConfig {
+        self.config
     }
 
     /// Direct traffic for `group`'s URLs to this queue.
@@ -88,20 +187,79 @@ impl RequestQueue {
     }
 
     /// The underlying handle, for operations built against this queue.
-    // Consumed by the operations added in later phases.
+    // Consumed by the reply and body operations in later phases.
     #[allow(dead_code)]
     pub(crate) fn handle(&self) -> HANDLE {
         self.handle
     }
 
     /// Submit an operation, failing rather than panicking once closed.
-    // Consumed by the operations added in later phases.
-    #[allow(dead_code)]
     pub(crate) fn submit<T: OpCode + Send>(&self, op: T) -> Result<Submit<T>> {
         match self.io.as_ref() {
             Some(io) => Ok(io.submit(op)),
             None => Err(Error::from_hresult(ERROR_INVALID_HANDLE.to_hresult())),
         }
+    }
+
+    /// Await the next request.
+    ///
+    /// Several receives may be outstanding on one queue at a time; each resolves
+    /// to a distinct request.
+    ///
+    /// A request whose metadata exceeds the configured capacity is retried
+    /// automatically at a larger size, up to the configured bound. Beyond that
+    /// it comes back as [`ReceiveError::TooLarge`], carrying the identifier
+    /// needed to [`reject`](RequestQueue::reject) it.
+    pub async fn receive(&self) -> std::result::Result<Request, ReceiveError> {
+        self.receive_id(RequestId::NEXT).await
+    }
+
+    /// Await one specific request, by identifier.
+    pub async fn receive_id(&self, id: RequestId) -> std::result::Result<Request, ReceiveError> {
+        let mut capacity = self.config.initial_capacity.max(MIN_CAPACITY);
+        let mut target = id;
+        let mut retries = 0u32;
+
+        loop {
+            let request = Request::with_capacity(capacity);
+            let op = ReceiveRequest::new(self.handle, target, request);
+            let outcome = self.submit(op)?.await;
+            let (result, op) = outcome.into_parts();
+
+            match result {
+                Ok(_) => {
+                    let mut request = op.into_inner();
+                    request.set_retries(retries);
+                    return Ok(request);
+                }
+                Err(e) if is_more_data(&e) => {
+                    // HTTP.sys filled in the header even though the tail did not
+                    // fit, so the identifier is available to target the retry.
+                    let recovered = op.recovered_id();
+                    if retries >= self.config.max_retries {
+                        return Err(ReceiveError::TooLarge {
+                            id: recovered,
+                            attempted_capacity: capacity,
+                            retries,
+                        });
+                    }
+                    retries += 1;
+                    target = recovered;
+                    capacity = capacity.saturating_mul(GROWTH_FACTOR);
+                }
+                Err(e) => return Err(ReceiveError::Failed(e)),
+            }
+        }
+    }
+
+    /// Discard a queued request without replying to it.
+    ///
+    /// This is how an over-large request is cleared after
+    /// [`ReceiveError::TooLarge`]; leaving it queued would make the next receive
+    /// return the same request again.
+    pub async fn reject(&self, id: RequestId) -> Result<()> {
+        let outcome = self.submit(CancelRequest::new(self.handle, id))?.await;
+        outcome.0.map(|_| ())
     }
 
     /// Close the queue, draining outstanding operations first.
@@ -129,6 +287,11 @@ impl Drop for RequestQueue {
         // Ignored: a panic in `Drop` aborts during unwinding.
         let _ = self.close();
     }
+}
+
+/// Whether an error is HTTP.sys reporting that the buffer was too small.
+fn is_more_data(err: &Error) -> bool {
+    win32_code(err) == Some(windows::Win32::Foundation::ERROR_MORE_DATA.0)
 }
 
 #[cfg(test)]
@@ -179,7 +342,17 @@ mod tests {
         let bogus = RequestQueue {
             handle: HANDLE(usize::MAX as *mut core::ffi::c_void),
             io: None,
+            config: ReceiveConfig::default(),
         };
         drop(bogus);
+    }
+
+    #[test]
+    fn default_config_matches_the_specification() {
+        let c = ReceiveConfig::default();
+        assert_eq!(c.initial_capacity, 4096);
+        assert_eq!(c.max_retries, 1);
+        // One retry at x16 must clear the operating system's own ~16 KB ceiling.
+        assert!(c.initial_capacity * GROWTH_FACTOR > 16 * 1024 * 3);
     }
 }

@@ -24,12 +24,19 @@
 //! [`HTTP_REQUEST_V2`]: windows::Win32::Networking::HttpServer::HTTP_REQUEST_V2
 
 mod error;
+mod header;
 mod init;
+mod ops;
 mod queue;
+mod request;
 mod session;
 
+pub use header::{RequestHeader, ResponseHeader};
 pub use init::HttpInitializer;
-pub use queue::RequestQueue;
+pub use ops::cancel::CancelRequest;
+pub use ops::receive::ReceiveRequest;
+pub use queue::{ReceiveConfig, ReceiveError, RequestQueue};
+pub use request::{Method, Request, RequestId, UnknownHeaders, MIN_CAPACITY};
 pub use session::{ServerSession, UrlGroup};
 
 /// The element the request buffer is allocated as.

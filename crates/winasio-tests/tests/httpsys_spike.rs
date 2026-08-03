@@ -23,7 +23,7 @@ use windows::Win32::Foundation::{HANDLE, WIN32_ERROR};
 use windows::Win32::Networking::HttpServer::{
     HttpAddUrlToUrlGroup, HttpCloseRequestQueue, HttpCloseServerSession, HttpCloseUrlGroup,
     HttpCreateRequestQueue, HttpCreateServerSession, HttpCreateUrlGroup, HttpInitialize,
-    HttpReceiveHttpRequest, HttpSetUrlGroupProperty, HttpTerminate, HttpServerBindingProperty,
+    HttpReceiveHttpRequest, HttpServerBindingProperty, HttpSetUrlGroupProperty, HttpTerminate,
     HTTPAPI_VERSION, HTTP_BINDING_INFO, HTTP_INITIALIZE_CONFIG, HTTP_INITIALIZE_SERVER,
     HTTP_PROPERTY_FLAGS, HTTP_RECEIVE_HTTP_REQUEST_FLAGS, HTTP_REQUEST_V2,
 };
@@ -161,7 +161,9 @@ impl SpikeReceive {
         }
         let raw = self.buffer.as_ptr() as *const HTTP_REQUEST_V2;
         let id = unsafe { (*raw).Base.RequestId };
-        self.findings.request_id.store(id as usize, Ordering::SeqCst);
+        self.findings
+            .request_id
+            .store(id as usize, Ordering::SeqCst);
     }
 }
 
@@ -234,10 +236,10 @@ impl Drop for Listener {
 }
 
 fn send_request(path: &str, header_padding: usize) {
+    use winasio::winhttp::HSession;
     use windows::Win32::Networking::WinHttp::{
         WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_OPEN_REQUEST_FLAGS,
     };
-    use winasio::winhttp::HSession;
 
     let session = HSession::new(
         HSTRING::from("spike"),
@@ -272,7 +274,9 @@ fn probe(label: &str, capacity_bytes: u32, padding: usize, submit_first: bool) {
     };
     let io = ThreadPoolIo::new(listener.queue).expect("register queue");
     let findings = Arc::new(Findings::default());
-    findings.internal_high_in_operate.store(-1, Ordering::SeqCst);
+    findings
+        .internal_high_in_operate
+        .store(-1, Ordering::SeqCst);
     findings
         .internal_high_in_complete
         .store(-1, Ordering::SeqCst);
@@ -303,12 +307,30 @@ fn probe(label: &str, capacity_bytes: u32, padding: usize, submit_first: bool) {
     };
     println!("--------------------------------------------------------------");
     println!("SPIKE {label} [{ordering}] capacity={capacity_bytes} bytes");
-    println!("  Q1 operate() return code   : {}", findings.operate_code.load(Ordering::SeqCst));
-    println!("  Q1 went pending            : {}", findings.went_pending.load(Ordering::SeqCst) == 1);
-    println!("  Q1 completion result code  : {}", findings.completion_code.load(Ordering::SeqCst));
-    println!("  Q2 RequestId recovered     : {:#x}", findings.request_id.load(Ordering::SeqCst));
-    println!("  Q3 InternalHigh in operate : {}", findings.internal_high_in_operate.load(Ordering::SeqCst));
-    println!("  Q3 InternalHigh in complete: {}", findings.internal_high_in_complete.load(Ordering::SeqCst));
+    println!(
+        "  Q1 operate() return code   : {}",
+        findings.operate_code.load(Ordering::SeqCst)
+    );
+    println!(
+        "  Q1 went pending            : {}",
+        findings.went_pending.load(Ordering::SeqCst) == 1
+    );
+    println!(
+        "  Q1 completion result code  : {}",
+        findings.completion_code.load(Ordering::SeqCst)
+    );
+    println!(
+        "  Q2 RequestId recovered     : {:#x}",
+        findings.request_id.load(Ordering::SeqCst)
+    );
+    println!(
+        "  Q3 InternalHigh in operate : {}",
+        findings.internal_high_in_operate.load(Ordering::SeqCst)
+    );
+    println!(
+        "  Q3 InternalHigh in complete: {}",
+        findings.internal_high_in_complete.load(Ordering::SeqCst)
+    );
     println!("  outcome                    : {:?}", outcome.0);
     drop(listener);
 }
@@ -380,7 +402,10 @@ fn probe_cancel() {
     let op2 = SpikeReceive::new(listener.queue, 65536, id, findings2.clone());
     let out2 = futures_block_on(io.submit(op2));
     println!("  re-receive that id         : {:?}", out2.0);
-    println!("  => cancel usable for FR-016: {}", cancel_code == 0 && out2.0.is_err());
+    println!(
+        "  => cancel usable for FR-016: {}",
+        cancel_code == 0 && out2.0.is_err()
+    );
     drop(listener);
 }
 
@@ -389,7 +414,10 @@ fn probe_cancel() {
 fn phase0_retry_mechanics_spike() {
     let base = std::mem::size_of::<HTTP_REQUEST_V2>() as u32;
     println!("size_of::<HTTP_REQUEST_V2>() = {base}");
-    println!("align_of::<HTTP_REQUEST_V2>() = {}", std::mem::align_of::<HTTP_REQUEST_V2>());
+    println!(
+        "align_of::<HTTP_REQUEST_V2>() = {}",
+        std::mem::align_of::<HTTP_REQUEST_V2>()
+    );
 
     // Q1/Q2/Q3/Q6, pending ordering: undersized but >= base structure.
     probe("A undersized/pending", base + 16, 4096, true);
