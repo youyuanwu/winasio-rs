@@ -6,22 +6,107 @@
 
 //! A safe, asynchronous wrapper over the Windows HTTP Server API (HTTP.sys).
 //!
-//! This is a building block, not a framework: it gives you everything needed to
+//! This is a building block, not a framework. It gives you everything needed to
 //! interpret a request, read its body, compose a reply and send it, and leaves
-//! the accept loop to you.
+//! the accept loop to you. Operations are built on [`crate::iocp`], so nothing
+//! here depends on a particular async runtime.
 //!
-//! Operations are built on [`crate::iocp`], so they are runtime-agnostic.
+//! # A minimal server
 //!
-//! # Alignment
+//! ```no_run
+//! use std::sync::Arc;
+//! use windows::core::HSTRING;
+//! use winasio::httpsys::{
+//!     HttpInitializer, RequestQueue, Response, ResponseHeader, ServerSession, UrlGroup,
+//! };
 //!
-//! HTTP.sys writes an [`HTTP_REQUEST_V2`] into a caller-supplied buffer, and
-//! that structure needs stricter alignment than a byte buffer provides. Getting
-//! it wrong is reported by the operating system as `ERROR_NOACCESS`, but forming
-//! an under-aligned pointer to the structure is undefined behaviour in Rust
-//! regardless -- so the receive buffer is allocated through an element type wide
-//! enough to guarantee it, checked below at compile time.
+//! # async fn run() -> windows::core::Result<()> {
+//! let _http = HttpInitializer::new()?;
+//! let session = ServerSession::new()?;
+//! let group = UrlGroup::new(&session)?;
 //!
-//! [`HTTP_REQUEST_V2`]: windows::Win32::Networking::HttpServer::HTTP_REQUEST_V2
+//! let queue = Arc::new(RequestQueue::new()?);
+//! queue.bind_url_group(&group)?;
+//! group.add_url(&HSTRING::from("http://localhost:8080/demo/"))?;
+//!
+//! while let Ok(request) = queue.receive().await {
+//!     // Borrowed from the request's own buffer; no allocation.
+//!     let target = request.target().unwrap_or_default().to_owned();
+//!
+//!     let mut reply = Response::new(200);
+//!     reply
+//!         .set_header(ResponseHeader::CONTENT_TYPE, &b"text/plain"[..])
+//!         .add_body(format!("you asked for {target}").into_bytes());
+//!
+//!     queue.send(request.id(), reply).await.0?;
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A complete, runnable version lives in the test crate's
+//! `examples/httpsys_server.rs`.
+//!
+//! # Invariants and obligations
+//!
+//! * **A received [`Request`] is an ordinary value.** HTTP.sys writes the URL,
+//!   headers and addresses into the tail of a buffer and stores pointers to that
+//!   tail in the header at its start. Because the buffer is a heap allocation of
+//!   its own, moving a `Request` moves a pointer rather than the bytes, so those
+//!   pointers stay valid. No `Pin` is involved.
+//!
+//! * **Accessors borrow, they do not copy.** [`Request::raw_target`],
+//!   [`Request::header`] and the rest return slices into the request's buffer,
+//!   tied to its lifetime. Reading a request allocates nothing.
+//!
+//!   The one exception is the operating system's pre-parsed URL components,
+//!   which it supplies as UTF-16. Those are available borrowed as `&[u16]` --
+//!   [`Request::path_wide`] and friends -- or converted with the `*_lossy`
+//!   forms, which do allocate.
+//!
+//! * **Request and reply header names are different types.** HTTP.sys numbers
+//!   the two sets differently, and every identifier from 20 to 29 means a
+//!   *different header* on each side. [`RequestHeader`] and [`ResponseHeader`]
+//!   are therefore not interchangeable, and the compiler enforces it.
+//!
+//! * **A reply may be built and moved freely before it is sent.** Every pointer
+//!   inside it is derived at send time, once the operation has reached its final
+//!   address. Values that are compile-time constants cost no allocation.
+//!
+//! * **State comes back.** Sends and body operations resolve to an
+//!   [`OpResult`](crate::iocp::OpResult), which carries the outcome *and* the
+//!   reply or buffer that was handed in -- on failure as well as success.
+//!
+//! * **Over-large requests are retried, then must be rejected.** A request whose
+//!   metadata exceeds the configured capacity is retried at a larger size, up to
+//!   [`ReceiveConfig::max_retries`]. Beyond that it surfaces as
+//!   [`ReceiveError::TooLarge`], and the caller **must** call
+//!   [`RequestQueue::reject`] with the identifier it carries. The request stays
+//!   queued otherwise, so an accept loop that merely logged the error would
+//!   receive the same request forever.
+//!
+//! * **Closing is how a server stops.** [`RequestQueue::close`] takes `&self`,
+//!   so a queue shared as an `Arc` can be shut down while workers are blocked in
+//!   [`RequestQueue::receive`]; their receives then resolve with an error.
+//!   Closing cancels and drains outstanding operations before releasing the
+//!   handle.
+//!
+//! * **Caller obligations the API does not enforce.** The operating system
+//!   forbids two sends running concurrently on the *same* request identifier, so
+//!   a request is best owned end to end by whoever received it. Serving
+//!   *different* requests from many threads at once is fine. The operating
+//!   system also appends its own product token to whatever `Server` header the
+//!   application sets, so that header is not observed verbatim by a client.
+//!
+//! # Allocation budget
+//!
+//! Serving one request end to end costs **three** allocations: the receive
+//! operation's record, the request's metadata buffer, and the send operation's
+//! record. That figure does not change with the number of headers read or set.
+//!
+//! Beyond that: a receive retry adds two, each body operation adds one, and a
+//! reply exceeding [`INLINE_UNKNOWN_HEADERS`] unrecognised headers or
+//! [`INLINE_CHUNKS`] body chunks adds one for the spilled array.
 
 mod error;
 mod header;
@@ -45,12 +130,14 @@ pub use session::{ServerSession, UrlGroup};
 
 /// The element the request buffer is allocated as.
 ///
-/// Its alignment must cover `HTTP_REQUEST_V2`'s; see the module documentation.
+/// Its alignment must cover `HTTP_REQUEST_V2`'s; see [`Request`].
 pub(crate) type BufferUnit = u64;
 
-// Phase 0 measured `align_of::<HTTP_REQUEST_V2>() == 8` on x86_64. This turns
-// any future divergence -- a new architecture, or a bindings change -- into a
-// build failure rather than silent undefined behaviour.
+// `align_of::<HTTP_REQUEST_V2>()` is 8 on x86_64, measured during development.
+// This turns any future divergence -- a new architecture, or a bindings change
+// -- into a build failure rather than silent undefined behaviour. Misalignment
+// is reported by the operating system as `ERROR_NOACCESS`, but forming an
+// under-aligned pointer to the structure is undefined behaviour regardless.
 const _: () = assert!(
     std::mem::align_of::<BufferUnit>()
         >= std::mem::align_of::<windows::Win32::Networking::HttpServer::HTTP_REQUEST_V2>(),
