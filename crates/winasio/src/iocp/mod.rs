@@ -101,7 +101,7 @@ pub use buf::{IoBuf, IoBufMut, OpResult};
 pub use future::Submit;
 pub use handle::Handle;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
-pub use ops::{ReadAt, SendHandle, WaitForHandle, WriteAt};
+pub use ops::{ReadAt, ReadHandleAt, SendHandle, WaitForHandle, WriteAt, WriteHandleAt};
 pub use port::RegistrationError;
 pub use proactor::{Notify, Proactor};
 pub use threadpool::ThreadPoolIo;
