@@ -14,7 +14,7 @@
 use std::task::Poll;
 
 use windows::core::{Error, Result};
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE};
+use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, HANDLE};
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use crate::fs::outcome::{classify_read, ReadOutcome};
@@ -51,6 +51,20 @@ fn set_offset(optr: *mut OVERLAPPED, offset: u64) {
     unsafe {
         (*optr).Anonymous.Anonymous.Offset = offset as u32;
         (*optr).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    }
+}
+
+fn inline_transferred_count(result: &Result<usize>, optr: *mut OVERLAPPED) -> usize {
+    match result {
+        Ok(transferred) => *transferred,
+        Err(err) if err.code() == ERROR_MORE_DATA.to_hresult() => {
+            // SAFETY: `optr` is the same `OVERLAPPED` passed to `ReadFile`.
+            // Reading the field is not a Windows call, so it does not disturb
+            // the thread-local last-error value already consumed by
+            // `win32_result`.
+            unsafe { (*optr).InternalHigh }
+        }
+        Err(_) => 0,
     }
 }
 
@@ -122,7 +136,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadHandleAt<B> {
         // No Windows call may occur between `ReadFile` and `win32_result`.
         let result = unsafe { win32_result(ok != 0, optr) };
         if let Poll::Ready(ref ready) = result {
-            let transferred = ready.as_ref().copied().unwrap_or(0);
+            let transferred = inline_transferred_count(ready, optr);
             self.record_completion(ready, transferred);
         }
         result
@@ -206,5 +220,29 @@ mod tests {
     #[test]
     fn checked_length_accepts_the_platform_maximum() {
         assert_eq!(checked_u32_len(u32::MAX as usize).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn inline_more_data_uses_internal_high_for_count_and_init() {
+        let mut overlapped = OVERLAPPED {
+            InternalHigh: 7,
+            ..OVERLAPPED::default()
+        };
+        let err = Error::from_hresult(ERROR_MORE_DATA.to_hresult());
+        let result = Err(err);
+
+        let transferred = inline_transferred_count(&result, &mut overlapped);
+        assert_eq!(transferred, 7);
+
+        // SAFETY: an invalid handle is owned by nobody and will not be closed.
+        // This test never starts I/O with it; it only exercises completion
+        // bookkeeping on the operation value.
+        let handle = unsafe { Handle::from_raw(HANDLE::default()) };
+        let mut op = ReadHandleAt::new(handle, 0, Vec::with_capacity(16));
+        op.record_completion(&result, transferred);
+        let (outcome, buffer) = op.finish(result);
+
+        assert_eq!(outcome.unwrap(), ReadOutcome::MoreData(7));
+        assert_eq!(buffer.len(), 7);
     }
 }

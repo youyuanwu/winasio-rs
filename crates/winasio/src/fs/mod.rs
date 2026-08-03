@@ -45,6 +45,8 @@ mod error;
 mod file;
 mod options;
 pub mod outcome;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 
 pub use error::SetupError;
 pub use file::File;
