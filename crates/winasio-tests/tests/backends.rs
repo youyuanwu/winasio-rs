@@ -768,6 +768,9 @@ fn trait_round_trip_own_port() {
     use std::rc::Rc;
     use winasio::iocp::Registrar;
 
+    // Creating operations perturbs the process-global counter other tests in
+    // this binary assert on, so serialise with them.
+    let _guard = counter_guard();
     let file = TempFile::create(w!("trt"));
     let proactor = Rc::new(Proactor::new().expect("proactor"));
     let io = proactor.register(file.handle).expect("register");
@@ -785,6 +788,8 @@ fn trait_round_trip_own_port() {
 fn trait_round_trip_thread_pool() {
     use winasio::iocp::{Registrar, ThreadPool};
 
+    // See `trait_round_trip_own_port`: this creates operations too.
+    let _guard = counter_guard();
     let file = TempFile::create(w!("trtp"));
     let io = ThreadPool.register(file.handle).expect("register");
 
