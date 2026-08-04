@@ -27,6 +27,7 @@ use winasio::httpsys::{
     HttpInitializer, Method, ReceiveError, RequestQueue, Response, ResponseHeader, ServerSession,
     UrlGroup,
 };
+use winasio::iocp::ThreadPool;
 
 /// Serve `count` requests, then stop. Pass `usize::MAX` to serve forever.
 ///
@@ -37,7 +38,7 @@ pub async fn run_server(port: u16, path: &str, count: usize) -> Result<()> {
     let session = ServerSession::new()?;
     let group = UrlGroup::new(&session)?;
 
-    let queue = Arc::new(RequestQueue::new()?);
+    let queue = Arc::new(RequestQueue::new(&ThreadPool)?);
     queue.bind_url_group(&group)?;
     group.add_url(&HSTRING::from(format!("http://localhost:{port}/{path}/")))?;
 

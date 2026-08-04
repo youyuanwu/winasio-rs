@@ -18,6 +18,7 @@ use windows::Win32::Networking::HttpServer::{
 };
 
 use winasio::httpsys::{HttpInitializer, RequestQueue, ServerSession, UrlGroup};
+use winasio::iocp::ThreadPool;
 
 const PORT: u16 = 12360;
 
@@ -46,7 +47,7 @@ fn setup_chain_succeeds_and_reports_failure_as_a_value() {
 
     let session = ServerSession::new().expect("session");
     let group = UrlGroup::new(&session).expect("url group");
-    let queue = RequestQueue::new().expect("queue");
+    let queue = RequestQueue::new(&ThreadPool).expect("queue");
     queue.bind_url_group(&group).expect("bind");
     group.add_url(&url("lifecycle")).expect("add url");
 
@@ -70,7 +71,7 @@ fn repeated_initialisation_is_reference_counted() {
         let inner = HttpInitializer::new().expect("second initialise");
         // The inner shutdown must not tear the subsystem down under the outer.
         drop(inner);
-        RequestQueue::new().expect("subsystem still up after the inner drop");
+        RequestQueue::new(&ThreadPool).expect("subsystem still up after the inner drop");
     }
     drop(outer);
 }
@@ -91,7 +92,7 @@ fn dropping_the_initializer_shuts_the_subsystem_down() {
 
     {
         let http = HttpInitializer::new().expect("initialise");
-        RequestQueue::new().expect("queue while initialised");
+        RequestQueue::new(&ThreadPool).expect("queue while initialised");
         drop(http);
     }
 
@@ -132,7 +133,7 @@ fn dropping_the_initializer_shuts_the_subsystem_down() {
 fn closing_a_queue_twice_succeeds() {
     let _guard = serial();
     let _http = HttpInitializer::new().expect("initialise");
-    let queue = RequestQueue::new().expect("queue");
+    let queue = RequestQueue::new(&ThreadPool).expect("queue");
     queue.close().expect("first close");
     queue.close().expect("second close is a no-op");
 }
@@ -142,7 +143,7 @@ fn closing_a_queue_twice_succeeds() {
 fn dropping_a_closed_queue_is_fine() {
     let _guard = serial();
     let _http = HttpInitializer::new().expect("initialise");
-    let queue = RequestQueue::new().expect("queue");
+    let queue = RequestQueue::new(&ThreadPool).expect("queue");
     queue.close().expect("close");
     drop(queue);
 }

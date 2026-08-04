@@ -25,6 +25,7 @@ use windows::core::HSTRING;
 use winasio::httpsys::{
     HttpInitializer, RequestQueue, Response, ResponseHeader, ServerSession, UrlGroup,
 };
+use winasio::iocp::ThreadPool;
 
 const PORT: u16 = 12366;
 
@@ -84,7 +85,7 @@ fn bench_request_response(c: &mut Criterion) {
         eprintln!("skipping benchmark: cannot create a URL group");
         return;
     };
-    let Ok(queue) = RequestQueue::new() else {
+    let Ok(queue) = RequestQueue::new(&ThreadPool) else {
         eprintln!("skipping benchmark: cannot create a queue");
         return;
     };

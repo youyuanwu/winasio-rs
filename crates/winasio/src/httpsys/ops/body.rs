@@ -27,9 +27,9 @@ pub struct ReceiveBody<B: IoBufMut> {
 }
 
 impl<B: IoBufMut> ReceiveBody<B> {
-    pub(crate) fn new(queue: HANDLE, request_id: RequestId, buffer: B) -> Self {
+    pub(crate) fn new(queue: QueueHandle, request_id: RequestId, buffer: B) -> Self {
         ReceiveBody {
-            queue: QueueHandle(queue),
+            queue,
             request_id,
             buffer,
         }
@@ -38,11 +38,11 @@ impl<B: IoBufMut> ReceiveBody<B> {
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
     fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.0)
+        Some(self.queue.raw())
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        let queue = self.queue.0;
+        let queue = self.queue.raw();
         let id = self.request_id.get();
         let len = self.buffer.bytes_total() as u32;
         // Derived from `&mut self`, at the operation's final address.
@@ -76,7 +76,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
-        unsafe { CancelIoEx(self.queue.0, Some(optr)) }
+        unsafe { CancelIoEx(self.queue.raw(), Some(optr)) }
     }
 }
 
