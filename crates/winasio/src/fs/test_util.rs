@@ -110,16 +110,12 @@ unsafe impl IoBuf for DropProbeBuf {
     }
 }
 
-// SAFETY: the mutable pointer is the same `Vec<u8>` allocation reported by
-// `stable_ptr`; capacity bounds the writable region; and `set_init` delegates to
-// `Vec::set_len` after checking that bound.
+// SAFETY: the slice covers the same `Vec<u8>` allocation reported by
+// `stable_ptr`, from its first byte, and `set_init` delegates to `Vec::set_len`
+// after checking the capacity bound.
 unsafe impl IoBufMut for DropProbeBuf {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.bytes.as_mut_ptr()
-    }
-
-    fn bytes_total(&self) -> usize {
-        self.bytes.capacity()
+    fn as_uninit(&mut self) -> &mut crate::iocp::UninitSlice {
+        self.bytes.as_uninit()
     }
 
     unsafe fn set_init(&mut self, len: usize) {

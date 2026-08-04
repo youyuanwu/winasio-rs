@@ -9,6 +9,7 @@
 pub mod event;
 pub mod file;
 mod stream;
+pub(crate) mod sys;
 
 pub use event::WaitForHandle;
 pub use file::{ReadAt, SendHandle, WriteAt};

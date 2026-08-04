@@ -13,10 +13,8 @@
 
 use std::task::Poll;
 
-use windows::core::{Error, Result};
-use windows::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE,
-};
+use windows::core::Result;
+use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE};
 use windows::Win32::System::Pipes::ConnectNamedPipe;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
@@ -25,37 +23,7 @@ use crate::iocp::buf::{IoBuf, IoBufMut};
 use crate::iocp::handle::Handle;
 use crate::iocp::op::{win32_result, IntoInner, OpCode};
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn ReadFile(
-        hfile: HANDLE,
-        buffer: *mut u8,
-        bytes_to_read: u32,
-        bytes_read: *mut u32,
-        overlapped: *mut OVERLAPPED,
-    ) -> i32;
-
-    fn WriteFile(
-        hfile: HANDLE,
-        buffer: *const u8,
-        bytes_to_write: u32,
-        bytes_written: *mut u32,
-        overlapped: *mut OVERLAPPED,
-    ) -> i32;
-}
-
-fn checked_u32_len(len: usize) -> Result<u32> {
-    u32::try_from(len).map_err(|_| Error::from_hresult(ERROR_INVALID_PARAMETER.to_hresult()))
-}
-
-fn set_offset(optr: *mut OVERLAPPED, offset: u64) {
-    // SAFETY: `optr` is the `OVERLAPPED` embedded in this operation's stable
-    // allocation, supplied by the driver before the operation starts.
-    unsafe {
-        (*optr).Anonymous.Anonymous.Offset = offset as u32;
-        (*optr).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-    }
-}
+use super::sys::{checked_u32_len, set_offset, ReadFile, WriteFile};
 
 fn inline_transferred_count(result: &Result<usize>, optr: *mut OVERLAPPED) -> usize {
     match result {
@@ -125,13 +93,14 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadHandleAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
-        let len = match checked_u32_len(self.buffer.bytes_total()) {
+        let buffer = self.buffer.as_uninit();
+        let len = match checked_u32_len(buffer.len()) {
             Ok(len) => len,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        let ptr = self.buffer.stable_mut_ptr();
+        let ptr = buffer.as_mut_ptr().cast::<u8>();
 
         // SAFETY: `ptr` and `len` describe writable storage owned by this
         // operation. The operation allocation is retained until completion.
@@ -188,7 +157,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteHandleAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
         let len = match checked_u32_len(self.buffer.bytes_init()) {
             Ok(len) => len,
@@ -244,13 +213,14 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadHandle<B> {
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
-        let len = match checked_u32_len(self.inner.buffer.bytes_total()) {
+        let buffer = self.inner.buffer.as_uninit();
+        let len = match checked_u32_len(buffer.len()) {
             Ok(len) => len,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        let ptr = self.inner.buffer.stable_mut_ptr();
+        let ptr = buffer.as_mut_ptr().cast::<u8>();
 
         // SAFETY: `ptr` and `len` describe writable storage owned by this
         // operation. The operation allocation is retained until completion.
@@ -312,7 +282,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteHandle<B> {
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
         let len = match checked_u32_len(self.inner.buffer.bytes_init()) {
             Ok(len) => len,
@@ -368,7 +338,7 @@ unsafe impl OpCode for ConnectPipe {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore offsets, but the driver reuses the common OVERLAPPED
         // allocation and the fields must not contain garbage.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
         // SAFETY: `optr` is the operation's stable OVERLAPPED allocation and
         // `handle` is a live server-side named-pipe handle.
@@ -396,17 +366,8 @@ unsafe impl OpCode for ConnectPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn checked_length_rejects_values_windows_cannot_express() {
-        let err = checked_u32_len(u32::MAX as usize + 1).unwrap_err();
-        assert_eq!(err.code(), ERROR_INVALID_PARAMETER.to_hresult());
-    }
-
-    #[test]
-    fn checked_length_accepts_the_platform_maximum() {
-        assert_eq!(checked_u32_len(u32::MAX as usize).unwrap(), u32::MAX);
-    }
+    use windows::core::Error;
+    use windows::Win32::Foundation::ERROR_MORE_DATA;
 
     #[test]
     fn inline_more_data_uses_internal_high_for_count_and_init() {

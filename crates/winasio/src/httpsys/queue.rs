@@ -534,7 +534,6 @@ mod tests {
     use super::*;
     use crate::iocp::{ThreadPool, ThreadPoolIo};
     use std::task::Poll;
-    use windows::Win32::Foundation::GetHandleInformation;
     use windows::Win32::System::IO::OVERLAPPED;
 
     struct NeverRuns;
@@ -546,11 +545,6 @@ mod tests {
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             unreachable!("a closed queue must reject the submission before operating")
         }
-    }
-
-    fn handle_is_valid(handle: HANDLE) -> bool {
-        let mut flags = 0u32;
-        unsafe { GetHandleInformation(handle, &mut flags) }.is_ok()
     }
 
     /// FR-010: submitting to a closed queue returns an error value rather than
@@ -596,6 +590,19 @@ mod tests {
         assert!(!queue.is_open());
     }
 
+    /// The queue handle outlives `close` for exactly as long as an operation
+    /// still owns a reference to it.
+    ///
+    /// Asserted through the reference count rather than by asking Windows
+    /// whether the raw value is still a live handle. That check is unsound in a
+    /// test binary: once the handle closes, Windows may hand the same value to
+    /// another thread's `CreateFile` before the check runs, and the test then
+    /// fails spuriously -- measured at roughly 1 run in 75 across the suite,
+    /// and 0 in 300 when this test ran alone.
+    ///
+    /// Counting references is also the stronger assertion, because it
+    /// attributes the surviving reference to the pending operation
+    /// specifically; a handle-validity check cannot tell who held it.
     #[test]
     fn close_is_deferred_until_a_real_operation_releases_the_handle() {
         let _guard = crate::iocp::counter_guard();
@@ -606,7 +613,9 @@ mod tests {
             Ok(q) => q,
             Err(_) => return,
         };
-        let raw = queue.with_open(|h| h.raw()).expect("queue is open");
+        // Held for the whole test so the reference count stays observable once
+        // the queue has released its own reference.
+        let probe = queue.with_open(|h| h).expect("queue is open");
 
         // A genuine pending receive rather than a hand-made clone. That is the
         // point: this test must fail if operations ever stop carrying ownership
@@ -621,21 +630,28 @@ mod tests {
             Ok(fut) => fut,
             Err(_) => return,
         };
+        assert_eq!(
+            probe.ref_count(),
+            3,
+            "the queue, this probe, and the pending operation"
+        );
 
         queue.close().expect("close with an operation outstanding");
         assert!(!queue.is_open());
-        assert!(
-            handle_is_valid(raw),
+        assert_eq!(
+            probe.ref_count(),
+            2,
             "a pending operation must keep the queue handle alive past close"
         );
 
         // Dropping the registration inside `close` already waited for the
-        // callbacks, so the abandoned future owns the only remaining reference
-        // and releasing it closes the handle here, synchronously.
+        // callbacks, so releasing the abandoned future hands its reference back
+        // here, synchronously.
         drop(pending);
-        assert!(
-            !handle_is_valid(raw),
-            "releasing the last operation closes the queue handle"
+        assert_eq!(
+            probe.ref_count(),
+            1,
+            "releasing the operation releases its handle reference"
         );
     }
 
