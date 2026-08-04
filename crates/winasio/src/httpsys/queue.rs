@@ -125,9 +125,17 @@ impl From<Error> for ReceiveError {
 }
 
 /// The parts that exist only while the queue is open.
+///
+/// Field order is load-bearing on an implicit drop: the submitter must go
+/// first, because dropping the thread-pool registration cancels and waits while
+/// holding a bare `HANDLE` ([`Registration::drop`](crate::iocp::ThreadPoolIo)),
+/// and releasing the queue's handle reference before that could close -- and let
+/// Windows recycle -- the very handle it is cancelling on. `close` destructures
+/// and drops in this order explicitly; the declaration order makes the invariant
+/// hold even if a future refactor drops an `Open` as a value.
 struct Open<S> {
-    handle: QueueHandle,
     io: S,
+    handle: QueueHandle,
 }
 
 /// A listener.
@@ -237,11 +245,16 @@ impl<S: Submitter> RequestQueue<S> {
 
     /// Direct traffic for `group`'s URLs to this queue.
     pub fn bind_url_group(&self, group: &UrlGroup) -> Result<()> {
-        let handle = self.with_open(|h| h.raw())?;
+        // Hold the clone across the call rather than extracting the raw value.
+        // `close` takes `&self` and `with_open` drops the read lock before
+        // returning, so a raw handle captured here could be closed -- and the
+        // value recycled onto an unrelated queue -- before it is used, silently
+        // binding the URL group to someone else's listener.
+        let handle = self.with_open(|h| h)?;
         let info = HTTP_BINDING_INFO {
             // `Present` bit: the binding is being set rather than cleared.
             Flags: HTTP_PROPERTY_FLAGS { _bitfield: 1 },
-            RequestQueueHandle: handle,
+            RequestQueueHandle: handle.raw(),
         };
         unsafe {
             group.set_property(
@@ -460,9 +473,26 @@ impl<S: Submitter> RequestQueue<S> {
     /// the queue is gone.
     ///
     /// Idempotent: closing an already-closed queue succeeds and does nothing.
-    /// When this queue holds the last handle reference, the real HTTP.sys close
-    /// code is reported; if in-flight operations still hold clones, close is
-    /// deferred to the last clone and this returns `Ok(())`.
+    ///
+    /// # The close may be deferred
+    ///
+    /// In-flight operations hold a reference to the queue handle, which is what
+    /// keeps late cancellation from targeting a closed -- or recycled -- handle.
+    /// So if any operation is still alive, the `HttpCloseRequestQueue` is
+    /// deferred to whichever reference drops last, and this returns `Ok(())`
+    /// having reported nothing; the deferred call's own error is discarded,
+    /// because it runs in a `Drop`.
+    ///
+    /// Until that happens HTTP.sys still holds the queue, so a caller who closes
+    /// and immediately re-reserves the same URL can fail. **For a deterministic
+    /// close, drop or await every outstanding operation future first**: the
+    /// queue then holds the last reference, the close happens inline, and the
+    /// real HTTP.sys code is returned.
+    ///
+    /// Note this is not the same as "no callbacks are running". On the
+    /// thread-pool backend, dropping the registration waits for callbacks, but a
+    /// completed-and-unpolled future still owns its operation -- and so still
+    /// holds a reference.
     pub fn close(&self) -> Result<()> {
         let taken = {
             let mut guard = self.open.write().unwrap_or_else(|e| e.into_inner());
@@ -505,7 +535,6 @@ mod tests {
     use crate::iocp::{ThreadPool, ThreadPoolIo};
     use std::task::Poll;
     use windows::Win32::Foundation::GetHandleInformation;
-    use windows::Win32::Networking::HttpServer::HttpCreateRequestQueue;
     use windows::Win32::System::IO::OVERLAPPED;
 
     struct NeverRuns;
@@ -517,29 +546,6 @@ mod tests {
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             unreachable!("a closed queue must reject the submission before operating")
         }
-    }
-
-    struct NoopSubmitter;
-
-    impl Submitter for NoopSubmitter {
-        fn submit<T: OpCode + Send>(&self, _op: T) -> Submit<T> {
-            unreachable!("this test only exercises RequestQueue::close")
-        }
-    }
-
-    fn new_raw_queue() -> Option<HANDLE> {
-        let mut handle = HANDLE::default();
-        let code = unsafe {
-            HttpCreateRequestQueue(
-                VERSION,
-                windows::core::PCWSTR::null(),
-                None,
-                None,
-                &mut handle,
-            )
-        };
-        check(code).ok()?;
-        Some(handle)
     }
 
     fn handle_is_valid(handle: HANDLE) -> bool {
@@ -591,38 +597,45 @@ mod tests {
     }
 
     #[test]
-    fn close_defers_the_handle_close_until_an_operation_clone_drops() {
+    fn close_is_deferred_until_a_real_operation_releases_the_handle() {
         let _guard = crate::iocp::counter_guard();
         let Ok(_http) = crate::httpsys::HttpInitializer::new() else {
             return;
         };
-        let Some(raw) = new_raw_queue() else {
-            return;
+        let queue = match RequestQueue::new(&ThreadPool) {
+            Ok(q) => q,
+            Err(_) => return,
         };
-        // SAFETY: HTTP.sys returned a newly owned request queue handle.
-        let handle = unsafe { QueueHandle::from_raw(raw) };
-        let operation_clone = handle.clone();
-        let queue = RequestQueue::<NoopSubmitter> {
-            open: RwLock::new(Some(Open {
-                handle,
-                io: NoopSubmitter,
-            })),
-            config: ReceiveConfig::default(),
+        let raw = queue.with_open(|h| h.raw()).expect("queue is open");
+
+        // A genuine pending receive rather than a hand-made clone. That is the
+        // point: this test must fail if operations ever stop carrying ownership
+        // of the queue handle, which is the whole safety guarantee.
+        let handle = queue.with_open(|h| h).expect("queue is open");
+        let op = ReceiveRequest::new(
+            handle,
+            RequestId::NEXT,
+            Request::with_capacity(MIN_CAPACITY),
+        );
+        let pending = match queue.submit(op) {
+            Ok(fut) => fut,
+            Err(_) => return,
         };
 
-        queue
-            .close()
-            .expect("close with an outstanding operation clone");
+        queue.close().expect("close with an operation outstanding");
         assert!(!queue.is_open());
         assert!(
             handle_is_valid(raw),
-            "close must be deferred while the operation clone owns the handle"
+            "a pending operation must keep the queue handle alive past close"
         );
 
-        drop(operation_clone);
+        // Dropping the registration inside `close` already waited for the
+        // callbacks, so the abandoned future owns the only remaining reference
+        // and releasing it closes the handle here, synchronously.
+        drop(pending);
         assert!(
             !handle_is_valid(raw),
-            "the last operation clone closes the queue handle"
+            "releasing the last operation closes the queue handle"
         );
     }
 

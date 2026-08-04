@@ -103,7 +103,12 @@
 //!   [`RequestQueue::receive`]; their receives then resolve with an error.
 //!   Closing cancels outstanding operations first. If an operation still owns a
 //!   handle clone, the HTTP.sys close is deferred to that clone's drop; otherwise
-//!   `close` reports the real close status.
+//!   `close` reports the real close status. Until the deferred close runs
+//!   HTTP.sys still holds the queue, so a shutdown that immediately re-reserves
+//!   the same URL should drop or await the outstanding operation futures first.
+//!   That applies to either backend: on the thread pool, `close` waits for
+//!   callbacks, but a completed future that was never polled still owns its
+//!   operation.
 //!
 //! * **Caller obligations the API does not enforce.** The operating system
 //!   forbids two sends running concurrently on the *same* request identifier, so

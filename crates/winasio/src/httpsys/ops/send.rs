@@ -35,8 +35,10 @@ pub struct SendResponse {
     response: Response,
 }
 
-// SAFETY: `Response` is already `Send`; the handle is thread-agnostic.
-unsafe impl Send for SendResponse {}
+// `Send` is derived, not asserted: `QueueHandle` is `Send + Sync` through the
+// audited `SendHandle` it wraps, `Response` carries its own `Send`, and the rest
+// is plain data. Asserting it here would silently keep the type `Send` if a
+// `!Send` field were ever added.
 
 impl SendResponse {
     pub(crate) fn new(

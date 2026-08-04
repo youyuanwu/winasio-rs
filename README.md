@@ -45,7 +45,7 @@ let _http = HttpInitializer::new()?;
 let session = ServerSession::new()?;
 let group = UrlGroup::new(&session)?;
 
-let queue = Arc::new(RequestQueue::new()?);
+let queue = Arc::new(RequestQueue::new(&ThreadPool)?);
 queue.bind_url_group(&group)?;
 group.add_url(&HSTRING::from("http://localhost:8080/demo/"))?;
 
