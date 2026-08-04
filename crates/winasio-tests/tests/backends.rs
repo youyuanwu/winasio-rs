@@ -10,11 +10,18 @@
 //! whichever backend delivers its completion. Every case below therefore has a
 //! `_own_port` and a `_thread_pool` variant driven by the same body.
 
+mod common;
+
+use std::rc::Rc;
 use std::time::Duration;
 
-use winasio::iocp::{live_operations, Proactor, ReadAt, RegistrationError, ThreadPoolIo, WriteAt};
+use winasio::iocp::{
+    live_operations, OpResult, Proactor, ReadAt, Registrar, RegistrationError, ThreadPool,
+    ThreadPoolIo, WriteAt,
+};
+use winasio::pipe::{ClientOptions, NamedPipe, ReadOutcome, ServerOptions};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_OPERATION_ABORTED, GENERIC_WRITE, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DeleteFileW, GetTempFileNameW, GetTempPathW, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_SHARE_NONE,
@@ -711,4 +718,264 @@ fn thread_pool_backend_works_under_a_multi_threaded_runtime() {
         result.unwrap();
         assert_eq!(buf, expected, "round-trip across worker threads");
     });
+}
+
+// ---------------------------------------------------------------------------
+// The registrar/submitter abstraction.
+//
+// Everything above names a concrete backend. These name none: the body is
+// written against the traits, and only the registrar differs at the call site.
+// ---------------------------------------------------------------------------
+
+/// One round trip, expressed without naming a backend.
+fn trait_round_trip<S: winasio::iocp::Submitter>(
+    io: &S,
+    handle: HANDLE,
+    drive: impl Fn(&mut dyn FnMut() -> bool),
+) {
+    let payload = b"through the trait".to_vec();
+    let expected = payload.clone();
+
+    let mut write = Box::pin(winasio::iocp::Submitter::submit(
+        io,
+        WriteAt::new(handle, 0, payload),
+    ));
+    let mut done = None;
+    drive(&mut || match poll_once(&mut write) {
+        Some(r) => {
+            done = Some(r);
+            true
+        }
+        None => false,
+    });
+    assert_eq!(done.expect("write completed").0.unwrap(), expected.len());
+
+    let mut read = Box::pin(winasio::iocp::Submitter::submit(
+        io,
+        ReadAt::new(handle, 0, Vec::with_capacity(expected.len())),
+    ));
+    let mut done = None;
+    drive(&mut || match poll_once(&mut read) {
+        Some(r) => {
+            done = Some(r);
+            true
+        }
+        None => false,
+    });
+    let (result, buf) = done.expect("read completed").into_inner_parts();
+    result.unwrap();
+    assert_eq!(buf, expected, "same body, either backend");
+}
+
+/// Poll a future once with a no-op waker, returning its output if ready.
+// (reuses the `poll_once` defined above)
+
+#[test]
+fn trait_round_trip_own_port() {
+    use std::rc::Rc;
+    use winasio::iocp::Registrar;
+
+    // Creating operations perturbs the process-global counter other tests in
+    // this binary assert on, so serialise with them.
+    let _guard = counter_guard();
+    let file = TempFile::create(w!("trt"));
+    let proactor = Rc::new(Proactor::new().expect("proactor"));
+    let io = proactor.register(file.handle).expect("register");
+
+    trait_round_trip(&io, file.handle, |ready| {
+        while !ready() {
+            proactor
+                .poll(Some(Duration::from_millis(100)))
+                .expect("poll");
+        }
+    });
+}
+
+#[test]
+fn trait_round_trip_thread_pool() {
+    use winasio::iocp::{Registrar, ThreadPool};
+
+    // See `trait_round_trip_own_port`: this creates operations too.
+    let _guard = counter_guard();
+    let file = TempFile::create(w!("trtp"));
+    let io = ThreadPool.register(file.handle).expect("register");
+
+    trait_round_trip(&io, file.handle, |ready| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+}
+
+#[test]
+fn registering_the_same_handle_twice_fails_through_the_trait() {
+    use winasio::iocp::{Registrar, ThreadPool};
+
+    let file = TempFile::create(w!("trdup"));
+    let _first = ThreadPool
+        .register(file.handle)
+        .expect("first registration");
+    let second = ThreadPool.register(file.handle);
+    assert!(
+        matches!(second, Err(RegistrationError::AlreadyRegistered(_))),
+        "a handle belongs to exactly one completion mechanism"
+    );
+}
+
+#[test]
+fn thread_pool_handles_skip_the_port_on_inline_success() {
+    // `ConnectPipe` reports an already-connected client as an inline success and
+    // relies on no completion packet following. That is only sound because this
+    // flag is accepted; if it were ever false, teardown would block forever on a
+    // pending-I/O count nothing clears.
+    let file = TempFile::create(w!("trskip"));
+    let io = ThreadPoolIo::new(file.handle).expect("register");
+    assert!(
+        io.skips_on_success(),
+        "inline-success operations depend on this"
+    );
+}
+
+trait PipeTestRegistrar: Registrar {
+    const EXCHANGE_NAME: &'static str;
+    const TEARDOWN_NAME: &'static str;
+
+    fn drive<F: std::future::Future>(&self, future: F) -> F::Output;
+    fn wait_for_baseline(&self, baseline: usize);
+}
+
+impl PipeTestRegistrar for ThreadPool {
+    const EXCHANGE_NAME: &'static str = "backend_pipe_exchange_thread_pool";
+    const TEARDOWN_NAME: &'static str = "backend_pipe_teardown_thread_pool";
+
+    fn drive<F: std::future::Future>(&self, future: F) -> F::Output {
+        drive_thread_pool(future)
+    }
+
+    fn wait_for_baseline(&self, baseline: usize) {
+        wait_for_pipe_counter_baseline(None, baseline);
+    }
+}
+
+impl PipeTestRegistrar for Rc<Proactor> {
+    const EXCHANGE_NAME: &'static str = "backend_pipe_exchange_own_port";
+    const TEARDOWN_NAME: &'static str = "backend_pipe_teardown_own_port";
+
+    fn drive<F: std::future::Future>(&self, future: F) -> F::Output {
+        drive_own_port(self.as_ref(), future)
+    }
+
+    fn wait_for_baseline(&self, baseline: usize) {
+        wait_for_pipe_counter_baseline(Some(self.as_ref()), baseline);
+    }
+}
+
+fn pipe_pair<R: PipeTestRegistrar>(
+    registrar: &R,
+    test_name: &str,
+) -> (NamedPipe<R::Io>, NamedPipe<R::Io>) {
+    let name = common::unique_pipe_name(test_name);
+    let server = ServerOptions::new(&name)
+        .create(registrar)
+        .expect("create server");
+    let accept = server.connect();
+    let client = ClientOptions::new(&name)
+        .connect(registrar)
+        .expect("connect client");
+    let server = registrar.drive(accept).expect("accept client");
+    (server, client)
+}
+
+fn wait_for_pipe_counter_baseline(proactor: Option<&Proactor>, baseline: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while live_operations() > baseline && std::time::Instant::now() < deadline {
+        if let Some(proactor) = proactor {
+            let _ = proactor.poll(Some(Duration::from_millis(5)));
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert_eq!(
+        live_operations(),
+        baseline,
+        "pipe operation records must return to their pre-test baseline"
+    );
+}
+
+fn assert_pipe_cancelled(result: windows::core::Result<ReadOutcome>) {
+    match result {
+        Err(e) if e.code() == ERROR_OPERATION_ABORTED.to_hresult() => {}
+        other => panic!("expected cancelled in-flight pipe read, got {other:?}"),
+    }
+}
+
+fn pipe_exchange_body<R: PipeTestRegistrar>(registrar: &R) {
+    let (server, client) = pipe_pair(registrar, R::EXCHANGE_NAME);
+
+    let OpResult(written, returned) = registrar.drive(client.write(b"request".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = registrar.drive(server.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+
+    let OpResult(written, returned) = registrar.drive(server.write(b"response".to_vec()));
+    assert_eq!(written.unwrap(), returned.len());
+    let OpResult(read, got) = registrar.drive(client.read(Vec::with_capacity(16)));
+    assert_eq!(read.unwrap(), ReadOutcome::Bytes(returned.len()));
+    assert_eq!(got, returned);
+}
+
+#[test]
+fn pipe_exchange_own_port_registrar() {
+    let _guard = counter_guard();
+    let proactor = Rc::new(Proactor::new().expect("proactor"));
+    pipe_exchange_body(&proactor);
+}
+
+#[test]
+fn pipe_exchange_thread_pool_registrar() {
+    let _guard = counter_guard();
+    pipe_exchange_body(&ThreadPool);
+}
+
+fn pipe_teardown_body<R: PipeTestRegistrar>(registrar: &R) {
+    let baseline = live_operations();
+    let (server, _client) = pipe_pair(registrar, R::TEARDOWN_NAME);
+
+    let mut read = Box::pin(server.read(Vec::with_capacity(64)));
+    assert!(
+        poll_once(&mut read).is_none(),
+        "pipe read must be in flight before teardown"
+    );
+    assert!(live_operations() > baseline);
+
+    let started = std::time::Instant::now();
+    drop(server);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "dropping a pipe owner must be bounded"
+    );
+
+    let OpResult(result, buffer) = registrar.drive(read);
+    assert_pipe_cancelled(result);
+    assert!(buffer.capacity() >= 64);
+    registrar.wait_for_baseline(baseline);
+}
+
+#[test]
+fn pipe_teardown_with_in_flight_read_own_port_registrar() {
+    let _guard = counter_guard();
+    let proactor = Rc::new(Proactor::new().expect("proactor"));
+    pipe_teardown_body(&proactor);
+}
+
+#[test]
+fn pipe_teardown_with_in_flight_read_thread_pool_registrar() {
+    let _guard = counter_guard();
+    pipe_teardown_body(&ThreadPool);
 }

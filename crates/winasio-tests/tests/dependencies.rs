@@ -11,6 +11,7 @@
 //! The guard proves it stayed a development dependency of the *test* crate and
 //! did not reach `winasio`.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Crates that would mean an async runtime had leaked into the library.
@@ -102,4 +103,56 @@ fn the_library_depends_only_on_windows() {
              only on `windows`.\n{tree}"
         );
     }
+}
+
+#[test]
+fn new_file_pipe_sources_do_not_add_unsafe_send_or_sync_impls() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let mut files = Vec::new();
+    collect_rs_files(&root.join("crates\\winasio\\src\\fs"), &mut files);
+    collect_rs_files(&root.join("crates\\winasio\\src\\pipe"), &mut files);
+    files.extend([
+        root.join("crates\\winasio\\src\\io.rs"),
+        root.join("crates\\winasio\\src\\iocp\\backend.rs"),
+        root.join("crates\\winasio\\src\\iocp\\handle.rs"),
+        root.join("crates\\winasio\\src\\iocp\\ops\\stream.rs"),
+    ]);
+
+    let mut offenders = Vec::new();
+    for file in files {
+        let source = std::fs::read_to_string(&file).unwrap();
+        for (line_index, line) in source.lines().enumerate() {
+            if is_unsafe_send_or_sync_impl(line) {
+                offenders.push(format!("{}:{}", file.display(), line_index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "new file/pipe sources must not add unsafe impl Send/Sync; found:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn collect_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rs_files(&path, files);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn is_unsafe_send_or_sync_impl(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("unsafe impl")
+        && (line.contains(" Send for ")
+            || line.contains(" Send for")
+            || line.contains(" Sync for ")
+            || line.contains(" Sync for"))
 }

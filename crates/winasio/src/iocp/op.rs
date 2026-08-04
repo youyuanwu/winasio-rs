@@ -115,16 +115,55 @@ pub unsafe trait OpCode: 'static {
     /// Lets an operation read back fields Windows filled in — transferred
     /// lengths, address sizes, flags — while it still has `&mut self`.
     ///
-    /// Called **at most once**: an operation that completes inline from
-    /// [`OpCode::operate`] never produces a completion packet, so this does not
-    /// run for it.
+    /// Runs on whichever path resolved the operation: the completion packet, or
+    /// the inline path when [`OpCode::operate`] finished synchronously and no
+    /// packet will follow. An operation that must classify a condition the
+    /// platform can report either way therefore needs no separate inline hook.
+    ///
+    /// **Not guaranteed to run exactly once.** An operation that classifies its
+    /// own inline result inside `operate` will also see the driver's inline
+    /// call, so implementations must be idempotent rather than assuming a
+    /// single invocation.
     ///
     /// # Safety
     ///
-    /// Called only from the completion path, before the state is released or
-    /// returned.
+    /// Called only while the driver holds exclusive access to the operation,
+    /// before its state is released or returned.
     unsafe fn on_complete(&mut self, result: &Result<usize>) {
         let _ = result;
+    }
+
+    /// Observe the completion result together with the byte count Windows
+    /// reported, even when the status is a failure.
+    ///
+    /// Some conditions are failures that still transferred data — a named pipe
+    /// message that did not fit the buffer reports `ERROR_MORE_DATA` *and* the
+    /// bytes it delivered. [`OpCode::on_complete`] cannot see that count,
+    /// because a failure status carries no value in the `Result`.
+    ///
+    /// The default forwards to [`OpCode::on_complete`], so operations that do
+    /// not care are unaffected and existing implementations keep working
+    /// unchanged. Override this instead of `on_complete` when the count matters
+    /// on the failure path; the driver calls this one, never both.
+    ///
+    /// `transferred` is what the platform reported. It is **not** validated
+    /// against any buffer length: an implementation that uses it to publish
+    /// initialised bytes must clamp it to its own capacity first.
+    ///
+    /// Called under the same conditions as [`OpCode::on_complete`], and with
+    /// the same caveat: it is **not** guaranteed to run exactly once, because
+    /// an operation that classifies its own inline result inside `operate` also
+    /// sees the driver's inline call. Implementations must be idempotent.
+    ///
+    /// # Safety
+    ///
+    /// Called only while the driver holds exclusive access to the operation,
+    /// before its state is released or returned.
+    unsafe fn on_complete_with(&mut self, result: &Result<usize>, transferred: usize) {
+        let _ = transferred;
+        // SAFETY: this call inherits this method's own contract — the driver
+        // holds exclusive access and the state has not been released.
+        unsafe { self.on_complete(result) }
     }
 }
 

@@ -41,7 +41,7 @@ use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 use super::future::Submit;
 use super::op::OpCode;
 use super::port::RegistrationError;
-use super::raw::{dispatch_completion, Key};
+use super::raw::{dispatch_completion_with, Key};
 
 /// See `port.rs`; not exported by the `windows` crate.
 const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
@@ -103,10 +103,13 @@ unsafe extern "system" fn io_callback(
     // escaping here aborts the process from a pool thread the user cannot
     // observe. `on_complete` is user code and may panic.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: `dispatch_completion` establishes ownership by address before
-        // dereferencing, so a packet from an unrelated overlapped call on this
-        // handle is ignored rather than read through.
-        unsafe { dispatch_completion(optr, result) };
+        // SAFETY: `dispatch_completion_with` establishes ownership by address
+        // before dereferencing, so a packet from an unrelated overlapped call on
+        // this handle is ignored rather than read through.
+        //
+        // The count is passed separately: a failure status cannot carry one, and
+        // some failures — `ERROR_MORE_DATA` above all — still transferred bytes.
+        unsafe { dispatch_completion_with(optr, result, bytes_transferred) };
     }));
 }
 

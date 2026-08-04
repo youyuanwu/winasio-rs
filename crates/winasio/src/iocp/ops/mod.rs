@@ -8,6 +8,8 @@
 
 pub mod event;
 pub mod file;
+mod stream;
 
 pub use event::WaitForHandle;
 pub use file::{ReadAt, SendHandle, WriteAt};
+pub use stream::{ConnectPipe, ReadHandle, ReadHandleAt, WriteHandle, WriteHandleAt};

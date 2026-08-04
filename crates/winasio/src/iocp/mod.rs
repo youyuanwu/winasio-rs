@@ -56,11 +56,18 @@
 //! | Who drives completions | you, via [`Proactor::poll`] | the Win32 thread pool |
 //! | Thread affinity | `!Send`; submit and poll on one thread | `Send + Sync` |
 //! | Suits | single-threaded loops, tight control over when work is processed | multi-threaded runtimes, or anywhere you do not want a driver |
+//! | Safe-wrapper type parameter | `Rc<Proactor>` submitter returned by registration | `ThreadPoolIo` submitter returned by registration |
 //! | Batching | yes, many completions per wait | no |
 //! | Shutdown | deterministic drain | cancel-and-drain on drop |
 //!
 //! Registering a handle twice — with either backend, in either order — fails
 //! with [`RegistrationError::AlreadyRegistered`].
+//!
+//! Safe wrappers such as [`crate::fs::File`] and [`crate::pipe::NamedPipe`] are
+//! generic over the submitter they own. They are not built around a boxed
+//! backend object: [`Submitter::submit`] is generic over the operation type, and
+//! erasing it would require boxing each operation and adding an allocation to
+//! every I/O.
 //!
 //! The [`Submit`] futures both backends produce are [`Send`] whenever the
 //! operation is, so only the [`Proactor`] itself is thread-bound.
@@ -85,8 +92,10 @@
 //! would be a use-after-free. Callers who need a buffer back must await the
 //! operation rather than dropping it.
 
+mod backend;
 mod buf;
 mod future;
+mod handle;
 mod op;
 pub mod ops;
 mod port;
@@ -94,10 +103,15 @@ mod proactor;
 mod raw;
 mod threadpool;
 
+pub use backend::{Registrar, Submitter, ThreadPool};
 pub use buf::{IoBuf, IoBufMut, OpResult};
 pub use future::Submit;
+pub use handle::Handle;
 pub use op::{win32_result, IntoInner, OpCode, OpType};
-pub use ops::{ReadAt, SendHandle, WaitForHandle, WriteAt};
+pub use ops::{
+    ConnectPipe, ReadAt, ReadHandle, ReadHandleAt, SendHandle, WaitForHandle, WriteAt, WriteHandle,
+    WriteHandleAt,
+};
 pub use port::RegistrationError;
 pub use proactor::{Notify, Proactor};
 pub use threadpool::ThreadPoolIo;

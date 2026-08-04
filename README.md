@@ -81,6 +81,45 @@ Three things are worth knowing:
 See the [example server](./crates/winasio-tests/examples/httpsys_server.rs) for
 complete, runnable code.
 
+# Fs
+Safe asynchronous file I/O on top of the IOCP layer. Files are opened for
+overlapped I/O, registered immediately, and expose positional reads, writes, and
+whole-buffer helpers while returning the caller's buffer on resolved operations.
+
+```rs
+let mut options = OpenOptions::new();
+options.read(true).write(true).create(true).truncate(true);
+
+let file = options.open(&ThreadPool, "target/winasio-readme-fs.bin")?;
+let data = b"hello file".to_vec();
+let OpResult(written, data) = file.write_at(0, data).await;
+written?;
+
+let OpResult(read, buf) = file.read_at(0, Vec::with_capacity(data.len())).await;
+assert_eq!(read?, ReadOutcome::Bytes(data.len()));
+assert_eq!(&buf, b"hello file");
+```
+
+# Pipe
+Safe local named-pipe server and client APIs with byte mode by default and
+message mode available when framing matters. A server instance connects into a
+typed connected pipe; disconnect consumes it and returns a reusable server
+instance.
+
+```rs
+let name = "winasio_readme_pipe";
+let server = ServerOptions::new(name).create(&ThreadPool)?;
+let client = ClientOptions::new(name).connect(&ThreadPool)?;
+let server = server.connect().await?;
+
+let OpResult(written, payload) = client.write(b"ping".to_vec()).await;
+written?;
+
+let OpResult(read, buf) = server.read(Vec::with_capacity(payload.len())).await;
+assert_eq!(read?, ReadOutcome::Bytes(payload.len()));
+assert_eq!(&buf, b"ping");
+```
+
 # Winhttp
 Winhttp in async mode with rust async await wrapper.
 Example snippit:

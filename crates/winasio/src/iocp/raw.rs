@@ -135,8 +135,11 @@ impl OpState {
 
 /// Type-erased operations the completion path performs without knowing `T`.
 pub(crate) struct OpVTable {
-    /// Store the result, run `on_complete`, and wake the future if any.
-    complete: unsafe fn(*mut OVERLAPPED, Result<usize>),
+    /// Store the result, run the completion hook, and wake the future if any.
+    ///
+    /// The third argument is the byte count the platform reported, which is
+    /// carried separately because a failure status still cannot hold one.
+    complete: unsafe fn(*mut OVERLAPPED, Result<usize>, usize),
 }
 
 /// Fixed-layout prefix following `OVERLAPPED`, letting the completion path
@@ -236,7 +239,11 @@ fn vtable_of<T: OpCode>() -> &'static OpVTable {
 /// `optr` must be a pointer produced by [`Key::leak`] for an operation of type
 /// `T` whose leaked reference has not yet been reclaimed. That reference is
 /// consumed here.
-unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize>) {
+unsafe fn complete_erased<T: OpCode>(
+    optr: *mut OVERLAPPED,
+    result: Result<usize>,
+    transferred: usize,
+) {
     // Reclaim the reference the kernel held. The allocation cannot be freed
     // before this function returns, because we now own a strong count.
     let arc: Arc<RawOp<T>> = unsafe { Arc::from_raw(optr as *const RawOp<T>) };
@@ -247,7 +254,7 @@ unsafe fn complete_erased<T: OpCode>(optr: *mut OVERLAPPED, result: Result<usize
     {
         let mut op = arc.op.lock().unwrap();
         if let Some(op) = op.as_mut() {
-            unsafe { op.on_complete(&result) };
+            unsafe { op.on_complete_with(&result, transferred) };
         }
     }
 
@@ -292,6 +299,62 @@ pub(crate) struct Key<T: OpCode> {
     inner: Arc<RawOp<T>>,
 }
 
+pub(crate) struct ErasedCancel {
+    ptr: *const (),
+    vtable: &'static ErasedCancelVTable,
+}
+
+struct ErasedCancelVTable {
+    cancel: unsafe fn(*const ()) -> Result<()>,
+    drop_ref: unsafe fn(*const ()),
+}
+
+impl ErasedCancel {
+    pub(crate) fn cancel(&self) -> Result<()> {
+        // SAFETY: `ptr` was produced by `Key::erased_cancel` for this vtable.
+        unsafe { (self.vtable.cancel)(self.ptr) }
+    }
+}
+
+impl Drop for ErasedCancel {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` is the strong reference owned by this value.
+        unsafe { (self.vtable.drop_ref)(self.ptr) };
+    }
+}
+
+fn erased_cancel_vtable_of<T: OpCode>() -> &'static ErasedCancelVTable {
+    trait HasVTable {
+        const VTABLE: ErasedCancelVTable;
+    }
+    impl<T: OpCode> HasVTable for T {
+        const VTABLE: ErasedCancelVTable = ErasedCancelVTable {
+            cancel: cancel_erased::<T>,
+            drop_ref: drop_erased::<T>,
+        };
+    }
+    &<T as HasVTable>::VTABLE
+}
+
+unsafe fn cancel_erased<T: OpCode>(ptr: *const ()) -> Result<()> {
+    // SAFETY: `ptr` is a strong `Arc<RawOp<T>>` reference created by
+    // `Key::erased_cancel`. `ManuallyDrop` lets us borrow it without consuming
+    // the pending table's reference.
+    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const RawOp<T>) });
+    let optr = Arc::as_ptr(&arc) as *mut OVERLAPPED;
+    let mut guard = arc.op.lock().unwrap();
+    match guard.as_mut() {
+        // SAFETY: `optr` is this operation's own OVERLAPPED pointer.
+        Some(op) => unsafe { op.cancel(optr) },
+        None => Ok(()),
+    }
+}
+
+unsafe fn drop_erased<T: OpCode>(ptr: *const ()) {
+    // SAFETY: `ptr` is the strong reference owned by `ErasedCancel`.
+    drop(unsafe { Arc::from_raw(ptr as *const RawOp<T>) });
+}
+
 impl<T: OpCode> Key<T> {
     /// Allocate an operation.
     pub(crate) fn new(op: T) -> Self {
@@ -334,6 +397,14 @@ impl<T: OpCode> Key<T> {
         let raw = Arc::into_raw(Arc::clone(&self.inner)) as *mut OVERLAPPED;
         live::insert(raw as usize);
         raw
+    }
+
+    /// Clone a type-erased reference that can cancel this operation.
+    pub(crate) fn erased_cancel(&self) -> ErasedCancel {
+        ErasedCancel {
+            ptr: Arc::into_raw(Arc::clone(&self.inner)) as *const (),
+            vtable: erased_cancel_vtable_of::<T>(),
+        }
     }
 
     /// Reclaim a reference leaked by [`Key::leak`] for an operation that never
@@ -395,9 +466,16 @@ impl<T: OpCode> Key<T> {
     /// The completion path does this itself; this is for the synchronous case,
     /// where no packet is delivered.
     pub(crate) fn on_complete_inline(&self, result: &Result<usize>) {
+        let transferred = *result.as_ref().unwrap_or(&0);
+        self.on_complete_inline_with(result, transferred);
+    }
+
+    /// As [`Key::on_complete_inline`], but carrying the platform's byte count
+    /// alongside the status.
+    pub(crate) fn on_complete_inline_with(&self, result: &Result<usize>, transferred: usize) {
         let mut op = self.inner.op.lock().unwrap();
         if let Some(op) = op.as_mut() {
-            unsafe { op.on_complete(result) };
+            unsafe { op.on_complete_with(result, transferred) };
         }
     }
 
@@ -500,6 +578,27 @@ impl<T: OpCode> Key<T> {
 /// `optr` may be any pointer, including one this crate has never seen. It is
 /// only dereferenced once membership has been established.
 pub(crate) unsafe fn dispatch_completion(optr: *mut OVERLAPPED, result: Result<usize>) -> bool {
+    // Without a separately reported count, the only count available is the one
+    // in the result itself, which is zero for a failure.
+    let transferred = *result.as_ref().unwrap_or(&0);
+    unsafe { dispatch_completion_with(optr, result, transferred) }
+}
+
+/// As [`dispatch_completion`], but carrying the byte count the platform
+/// reported alongside the status.
+///
+/// Backends use this so an operation can still learn how much was transferred
+/// when the status is a failure — `ERROR_MORE_DATA` being the case that matters.
+///
+/// # Safety
+///
+/// `optr` may be any pointer, including one this crate has never seen. It is
+/// only dereferenced once membership has been established.
+pub(crate) unsafe fn dispatch_completion_with(
+    optr: *mut OVERLAPPED,
+    result: Result<usize>,
+    transferred: usize,
+) -> bool {
     if optr.is_null() {
         return false;
     }
@@ -517,7 +616,7 @@ pub(crate) unsafe fn dispatch_completion(optr: *mut OVERLAPPED, result: Result<u
         debug_assert!(false, "operation allocation header is corrupt");
         return false;
     }
-    unsafe { (header.1.complete)(optr, result) };
+    unsafe { (header.1.complete)(optr, result, transferred) };
     true
 }
 
@@ -553,7 +652,7 @@ pub(crate) fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::task::Poll;
 
     struct NoopOp {
@@ -650,6 +749,68 @@ mod tests {
         assert_eq!(std::mem::offset_of!(RawOp<NoopOp>, header), expected);
         assert_eq!(std::mem::offset_of!(RawOp<BigOp>, header), expected);
         assert_eq!(std::mem::offset_of!(RawOp<ObservingOp>, header), expected);
+    }
+
+    /// Records the count handed to `on_complete_with`, including on failure.
+    static COUNTING_TRANSFERRED: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    struct CountingOp;
+
+    unsafe impl OpCode for CountingOp {
+        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+            None
+        }
+
+        unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+            Poll::Pending
+        }
+
+        unsafe fn on_complete_with(&mut self, _result: &Result<usize>, transferred: usize) {
+            COUNTING_TRANSFERRED.store(transferred, Ordering::SeqCst);
+        }
+    }
+
+    impl crate::iocp::op::IntoInner for CountingOp {
+        type Inner = ();
+        fn into_inner(self) {}
+    }
+
+    #[test]
+    fn failure_completion_still_carries_its_byte_count() {
+        // A named-pipe message that does not fit reports ERROR_MORE_DATA *and*
+        // the bytes it delivered. Without this the count is unrecoverable, and
+        // the caller cannot tell which bytes of their own buffer are valid.
+        let _guard = counter_guard();
+        COUNTING_TRANSFERRED.store(usize::MAX, Ordering::SeqCst);
+
+        let key = Key::new(CountingOp);
+        let optr = key.leak();
+        let err = windows::core::Error::from_hresult(
+            windows::Win32::Foundation::ERROR_MORE_DATA.to_hresult(),
+        );
+        assert!(unsafe { dispatch_completion_with(optr, Err(err), 10) });
+
+        assert_eq!(
+            COUNTING_TRANSFERRED.load(Ordering::SeqCst),
+            10,
+            "the count must survive a non-success status"
+        );
+        // The status itself is untouched: a truncated message is still an error
+        // at this layer, and classifying it is the operation's job.
+        assert!(key.take_completion().unwrap().0.is_err());
+    }
+
+    #[test]
+    fn plain_dispatch_still_reports_the_success_count() {
+        // The count-less entry point must keep behaving exactly as before, so
+        // no existing operation observes a change.
+        let _guard = counter_guard();
+        COUNTING_TRANSFERRED.store(usize::MAX, Ordering::SeqCst);
+
+        let key = Key::new(CountingOp);
+        let optr = key.leak();
+        assert!(unsafe { dispatch_completion(optr, Ok(7)) });
+        assert_eq!(COUNTING_TRANSFERRED.load(Ordering::SeqCst), 7);
     }
 
     #[test]
