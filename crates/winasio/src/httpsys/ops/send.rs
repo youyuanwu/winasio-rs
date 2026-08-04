@@ -35,18 +35,20 @@ pub struct SendResponse {
     response: Response,
 }
 
-// SAFETY: `Response` is already `Send`; the handle is thread-agnostic.
-unsafe impl Send for SendResponse {}
+// `Send` is derived, not asserted: `QueueHandle` is `Send + Sync` through the
+// audited `SendHandle` it wraps, `Response` carries its own `Send`, and the rest
+// is plain data. Asserting it here would silently keep the type `Send` if a
+// `!Send` field were ever added.
 
 impl SendResponse {
     pub(crate) fn new(
-        queue: HANDLE,
+        queue: QueueHandle,
         request_id: RequestId,
         response: Response,
         more_data: bool,
     ) -> Self {
         SendResponse {
-            queue: QueueHandle(queue),
+            queue,
             request_id,
             flags: if more_data {
                 HTTP_SEND_RESPONSE_FLAG_MORE_DATA
@@ -60,7 +62,7 @@ impl SendResponse {
 
 unsafe impl OpCode for SendResponse {
     fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.0)
+        Some(self.queue.raw())
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
@@ -74,7 +76,7 @@ unsafe impl OpCode for SendResponse {
         };
         let code = unsafe {
             HttpSendHttpResponse(
-                self.queue.0,
+                self.queue.raw(),
                 self.request_id.get(),
                 self.flags,
                 raw,
@@ -90,7 +92,7 @@ unsafe impl OpCode for SendResponse {
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
-        unsafe { CancelIoEx(self.queue.0, Some(optr)) }
+        unsafe { CancelIoEx(self.queue.raw(), Some(optr)) }
     }
 }
 
@@ -124,9 +126,9 @@ pub struct SendBody<B: IoBuf> {
 unsafe impl<B: IoBuf + Send> Send for SendBody<B> {}
 
 impl<B: IoBuf> SendBody<B> {
-    pub(crate) fn new(queue: HANDLE, request_id: RequestId, buffer: B, last: bool) -> Self {
+    pub(crate) fn new(queue: QueueHandle, request_id: RequestId, buffer: B, last: bool) -> Self {
         SendBody {
-            queue: QueueHandle(queue),
+            queue,
             request_id,
             flags: if last {
                 0
@@ -141,7 +143,7 @@ impl<B: IoBuf> SendBody<B> {
 
 unsafe impl<B: IoBuf + Send> OpCode for SendBody<B> {
     fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.0)
+        Some(self.queue.raw())
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
@@ -166,7 +168,7 @@ unsafe impl<B: IoBuf + Send> OpCode for SendBody<B> {
 
         let code = unsafe {
             HttpSendResponseEntityBody(
-                self.queue.0,
+                self.queue.raw(),
                 self.request_id.get(),
                 self.flags,
                 // The slice is borrowed only for the call, but the kernel keeps
@@ -184,7 +186,7 @@ unsafe impl<B: IoBuf + Send> OpCode for SendBody<B> {
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
-        unsafe { CancelIoEx(self.queue.0, Some(optr)) }
+        unsafe { CancelIoEx(self.queue.raw(), Some(optr)) }
     }
 }
 

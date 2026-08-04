@@ -32,9 +32,9 @@ pub struct ReceiveRequest {
 }
 
 impl ReceiveRequest {
-    pub(crate) fn new(queue: HANDLE, request_id: RequestId, request: Request) -> Self {
+    pub(crate) fn new(queue: QueueHandle, request_id: RequestId, request: Request) -> Self {
         ReceiveRequest {
-            queue: QueueHandle(queue),
+            queue,
             request_id,
             request,
         }
@@ -53,11 +53,11 @@ impl ReceiveRequest {
 
 unsafe impl OpCode for ReceiveRequest {
     fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.0)
+        Some(self.queue.raw())
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        let queue = self.queue.0;
+        let queue = self.queue.raw();
         let id = self.request_id.get();
         let capacity = self.request.capacity() as u32;
         // Derived from `&mut self`, which already lives at its final address.
@@ -79,7 +79,7 @@ unsafe impl OpCode for ReceiveRequest {
     }
 
     unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
-        unsafe { CancelIoEx(self.queue.0, Some(optr)) }
+        unsafe { CancelIoEx(self.queue.raw(), Some(optr)) }
     }
 }
 

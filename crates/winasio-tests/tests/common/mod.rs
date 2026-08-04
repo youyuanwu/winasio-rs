@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 
 use winasio::httpsys::{HttpInitializer, ReceiveConfig, RequestQueue, ServerSession, UrlGroup};
-use winasio::iocp::Proactor;
+use winasio::iocp::{Proactor, ThreadPool, ThreadPoolIo};
 
 /// Drives a future to completion on this thread.
 ///
@@ -131,7 +131,7 @@ pub struct Server {
     // Field order is drop order. The binding goes before the queue, and both
     // before the initializer.
     _binding: Binding,
-    queue: Arc<RequestQueue>,
+    queue: Arc<RequestQueue<ThreadPoolIo>>,
     _http: HttpInitializer,
     port: u16,
     path: String,
@@ -155,7 +155,8 @@ impl Server {
         let session_ref: &'static ServerSession = unsafe { &*(&*session as *const ServerSession) };
         let group = UrlGroup::new(session_ref).expect("UrlGroup::new");
 
-        let queue = RequestQueue::with_config(config).expect("RequestQueue::with_config");
+        let queue =
+            RequestQueue::with_config(&ThreadPool, config).expect("RequestQueue::with_config");
         queue.bind_url_group(&group).expect("bind_url_group");
 
         let url = HSTRING::from(format!("http://localhost:{port}/{path}/"));
@@ -176,7 +177,7 @@ impl Server {
         })
     }
 
-    pub fn queue(&self) -> &Arc<RequestQueue> {
+    pub fn queue(&self) -> &Arc<RequestQueue<ThreadPoolIo>> {
         &self.queue
     }
 

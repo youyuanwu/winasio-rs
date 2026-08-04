@@ -17,11 +17,12 @@ use std::sync::Arc;
 
 use common::{block_on, send_raw, Server};
 use winasio::httpsys::{ReceiveConfig, RequestQueue, Response, ResponseHeader};
+use winasio::iocp::ThreadPoolIo;
 
 const PORT: u16 = 12365;
 
 /// Serve requests until the queue closes, answering each with its own target.
-fn serve_loop(queue: Arc<RequestQueue>, served: Arc<AtomicUsize>) {
+fn serve_loop(queue: Arc<RequestQueue<ThreadPoolIo>>, served: Arc<AtomicUsize>) {
     loop {
         let request = match block_on(queue.receive()) {
             Ok(r) => r,

@@ -19,13 +19,14 @@
 //! use winasio::httpsys::{
 //!     HttpInitializer, RequestQueue, Response, ResponseHeader, ServerSession, UrlGroup,
 //! };
+//! use winasio::iocp::ThreadPool;
 //!
 //! # async fn run() -> windows::core::Result<()> {
 //! let _http = HttpInitializer::new()?;
 //! let session = ServerSession::new()?;
 //! let group = UrlGroup::new(&session)?;
 //!
-//! let queue = Arc::new(RequestQueue::new()?);
+//! let queue = Arc::new(RequestQueue::new(&ThreadPool)?);
 //! queue.bind_url_group(&group)?;
 //! group.add_url(&HSTRING::from("http://localhost:8080/demo/"))?;
 //!
@@ -77,6 +78,17 @@
 //!   [`OpResult`](crate::iocp::OpResult), which carries the outcome *and* the
 //!   reply or buffer that was handed in -- on failure as well as success.
 //!
+//! * **The completion backend is chosen per queue.** [`RequestQueue::new`]
+//!   registers the HTTP.sys handle with the registrar you pass, so the same
+//!   request and reply API works with either
+//!   [`ThreadPool`](crate::iocp::ThreadPool) or
+//!   [`Proactor`](crate::iocp::Proactor). A normal server should still use the
+//!   Win32 thread pool: request queues are usually shared as `Arc`s across
+//!   worker tasks on a multi-threaded runtime, while `Proactor` is `!Send`.
+//!   Proactor-backed queues are for single-threaded loops, and that affinity is
+//!   derived from the submitter type -- `RequestQueue<Rc<Proactor>>` is not
+//!   `Send`.
+//!
 //! * **Over-large requests are retried, then discarded.** A request whose
 //!   metadata exceeds the configured capacity is retried at a larger size, up to
 //!   [`ReceiveConfig::max_retries`]. Beyond that the library **discards it** and
@@ -89,8 +101,14 @@
 //! * **Closing is how a server stops.** [`RequestQueue::close`] takes `&self`,
 //!   so a queue shared as an `Arc` can be shut down while workers are blocked in
 //!   [`RequestQueue::receive`]; their receives then resolve with an error.
-//!   Closing cancels and drains outstanding operations before releasing the
-//!   handle.
+//!   Closing cancels outstanding operations first. If an operation still owns a
+//!   handle clone, the HTTP.sys close is deferred to that clone's drop; otherwise
+//!   `close` reports the real close status. Until the deferred close runs
+//!   HTTP.sys still holds the queue, so a shutdown that immediately re-reserves
+//!   the same URL should drop or await the outstanding operation futures first.
+//!   That applies to either backend: on the thread pool, `close` waits for
+//!   callbacks, but a completed future that was never polled still owns its
+//!   operation.
 //!
 //! * **Caller obligations the API does not enforce.** The operating system
 //!   forbids two sends running concurrently on the *same* request identifier, so
