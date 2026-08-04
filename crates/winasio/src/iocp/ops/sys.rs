@@ -37,16 +37,22 @@ extern "system" {
 
 /// Reject a transfer length Windows cannot express.
 ///
-/// Silently truncating to `u32` would read or write less than the caller asked
-/// for and report that short count as success.
+/// The `windows` crate's own `ReadFile`/`WriteFile` wrappers do
+/// `len().try_into().unwrap()`, so an over-large buffer panicked. Returning an
+/// error instead keeps a bad length out of the completion machinery, where a
+/// panic would unwind through a callback.
 pub(crate) fn checked_u32_len(len: usize) -> Result<u32> {
     u32::try_from(len).map_err(|_| Error::from_hresult(ERROR_INVALID_PARAMETER.to_hresult()))
 }
 
 /// Set the absolute offset an overlapped transfer starts at.
-pub(crate) fn set_offset(optr: *mut OVERLAPPED, offset: u64) {
-    // SAFETY: `optr` is the `OVERLAPPED` embedded in this operation's stable
-    // allocation, supplied by the driver before the operation starts.
+///
+/// # Safety
+///
+/// `optr` must point to a valid, writable `OVERLAPPED` -- in practice the one
+/// embedded in the operation's own allocation, supplied by the driver before
+/// the operation starts.
+pub(crate) unsafe fn set_offset(optr: *mut OVERLAPPED, offset: u64) {
     unsafe {
         (*optr).Anonymous.Anonymous.Offset = offset as u32;
         (*optr).Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;

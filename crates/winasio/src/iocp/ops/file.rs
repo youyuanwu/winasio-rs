@@ -75,7 +75,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Offsets live in the OVERLAPPED the caller gave us, which is inside
         // this operation's own allocation.
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
         let buffer = self.buffer.as_uninit();
         let len = match checked_u32_len(buffer.len()) {
@@ -137,7 +137,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
         let len = match checked_u32_len(self.buffer.bytes_init()) {
             Ok(len) => len,

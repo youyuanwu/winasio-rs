@@ -12,6 +12,90 @@
 //! those operations simply own their structure directly.
 
 use std::fmt::Debug;
+use std::mem::MaybeUninit;
+
+/// A writable byte region that may be uninitialised.
+///
+/// Handing out `&mut [MaybeUninit<u8>]` would let *safe* code store
+/// [`MaybeUninit::uninit`] over bytes a buffer has already initialised, and a
+/// later safe read of those bytes is undefined behaviour. This newtype exposes
+/// everything an operation needs -- a pointer, a length, a sub-window -- and
+/// nothing that can de-initialise a byte, so the buffer's initialised prefix
+/// cannot be damaged through it.
+///
+/// Modelled on [`bytes::buf::UninitSlice`], for the same reason.
+///
+/// ```compile_fail
+/// use std::mem::MaybeUninit;
+/// use winasio::iocp::{IoBufMut, UninitSlice};
+///
+/// let mut v: Vec<u8> = vec![1, 2, 3, 4];
+/// let slice: &mut UninitSlice = v.as_uninit();
+/// // There is no way back to `&mut [MaybeUninit<u8>]`, so this cannot compile.
+/// let raw: &mut [MaybeUninit<u8>] = slice;
+/// ```
+///
+/// [`bytes::buf::UninitSlice`]: https://docs.rs/bytes/latest/bytes/buf/struct.UninitSlice.html
+#[repr(transparent)]
+pub struct UninitSlice([MaybeUninit<u8>]);
+
+impl UninitSlice {
+    /// Wrap a raw pointer and length.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address `len` writable bytes that stay valid for `'a`, and no
+    /// other reference may alias them for that lifetime.
+    pub unsafe fn from_raw_parts_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut UninitSlice {
+        // SAFETY: the caller guarantees the region; `UninitSlice` is
+        // `repr(transparent)` over `[MaybeUninit<u8>]`, which has the same
+        // layout as `[u8]`.
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u8>>(), len) };
+        unsafe { &mut *(slice as *mut [MaybeUninit<u8>] as *mut UninitSlice) }
+    }
+
+    /// Wrap an already-initialised slice.
+    fn from_init_mut(slice: &mut [u8]) -> &mut UninitSlice {
+        // SAFETY: every initialised byte is a valid `MaybeUninit<u8>`, and the
+        // borrow is preserved. Nothing here can de-initialise them, because
+        // this type offers no way to write an uninitialised value.
+        unsafe { UninitSlice::from_raw_parts_mut(slice.as_mut_ptr(), slice.len()) }
+    }
+
+    /// Address of the first byte, for handing to Windows.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr().cast::<u8>()
+    }
+
+    /// Number of writable bytes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is anywhere to write.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// A sub-window, for buffer adapters.
+    ///
+    /// # Panics
+    ///
+    /// If `start > end` or `end` exceeds [`len`](UninitSlice::len).
+    pub fn slice_mut(&mut self, start: usize, end: usize) -> &mut UninitSlice {
+        let sub = &mut self.0[start..end];
+        // SAFETY: `repr(transparent)`, and the borrow is preserved.
+        unsafe { &mut *(sub as *mut [MaybeUninit<u8>] as *mut UninitSlice) }
+    }
+}
+
+impl Debug for UninitSlice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UninitSlice")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 /// A stable, owned buffer that can be read from.
 ///
@@ -36,31 +120,36 @@ pub unsafe trait IoBuf: 'static {
 ///
 /// In addition to [`IoBuf`]'s requirements:
 ///
-/// * The data pointer of [`as_uninit`](IoBufMut::as_uninit) must be the same
-///   address as [`IoBuf::stable_ptr`], and must stay the same for as long as the
-///   buffer is owned by an operation.
-/// * The returned slice must cover the buffer from its **first** byte, not from
-///   its initialised prefix: [`set_init`](IoBufMut::set_init) publishes an
-///   absolute length, and adapters index from the start.
+/// * [`as_uninit`](IoBufMut::as_uninit) must return the same address as
+///   [`IoBuf::stable_ptr`], and that address must stay the same for as long as
+///   the buffer is owned by an operation.
+/// * The returned region is the one [`set_init`](IoBufMut::set_init)'s length is
+///   measured against. An adapter presenting a sub-window of an inner buffer is
+///   fine, provided it translates `set_init` back to the inner buffer's own
+///   coordinates -- see this crate's internal `TailBuf`.
 /// * [`set_init`](IoBufMut::set_init) must make the first `len` bytes readable.
 ///
-/// The old `stable_mut_ptr` returned a bare pointer whose length the caller had
-/// to carry separately, and recombining the two into a `&mut [u8]` produced a
-/// reference over uninitialised spare capacity. Handing out
-/// `&mut [MaybeUninit<u8>]` keeps pointer, length and lifetime together, so that
-/// mistake is no longer expressible. Windows is given the pointer and the length
-/// directly; it never sees a Rust slice.
+/// The predecessor of `as_uninit` returned a bare pointer whose length the
+/// caller carried separately, and recombining the two into a `&mut [u8]`
+/// produced a reference over uninitialised spare capacity. Returning a
+/// [`UninitSlice`] keeps pointer, length and lifetime together, so that mistake
+/// is no longer expressible, and -- unlike a plain `&mut [MaybeUninit<u8>]` --
+/// it also cannot be used to de-initialise bytes the buffer has already
+/// initialised. Windows is given the pointer and the length directly; it never
+/// sees a Rust slice.
 pub unsafe trait IoBufMut: IoBuf {
     /// The whole buffer -- initialised prefix and uninitialised tail alike.
     ///
-    /// A zero-capacity buffer returns an empty slice, which may have a non-null
-    /// but non-dereferenceable data pointer.
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>];
+    /// A zero-capacity buffer returns an empty region, which may have a
+    /// non-null but non-dereferenceable address.
+    fn as_uninit(&mut self) -> &mut UninitSlice;
 
     /// Capacity available for Windows to write into.
     ///
-    /// Provided rather than required, so it can never disagree with
-    /// [`as_uninit`](IoBufMut::as_uninit).
+    /// Provided so that implementors need not keep two values in sync. Nothing
+    /// in this crate passes this value to Windows -- transfer lengths always
+    /// come from [`as_uninit`](IoBufMut::as_uninit) itself -- so overriding it
+    /// inconsistently cannot widen a transfer.
     fn bytes_total(&mut self) -> usize {
         self.as_uninit().len()
     }
@@ -85,14 +174,13 @@ unsafe impl IoBuf for Vec<u8> {
 }
 
 unsafe impl IoBufMut for Vec<u8> {
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+    fn as_uninit(&mut self) -> &mut UninitSlice {
         let capacity = self.capacity();
-        let ptr = self.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>();
-        // SAFETY: the whole allocation, initialised prefix included. Covering
-        // the buffer from its first byte rather than only the spare capacity is
-        // required: `set_init` publishes an absolute length, and `TailBuf`
-        // indexes from the start.
-        unsafe { std::slice::from_raw_parts_mut(ptr, capacity) }
+        // SAFETY: `Vec` guarantees the pointer is valid for `capacity` bytes.
+        // The region covers the whole allocation, initialised prefix included,
+        // because `set_init` publishes an absolute length and `TailBuf` indexes
+        // from the start. `UninitSlice` cannot de-initialise that prefix.
+        unsafe { UninitSlice::from_raw_parts_mut(self.as_mut_ptr(), capacity) }
     }
 
     unsafe fn set_init(&mut self, len: usize) {
@@ -115,15 +203,10 @@ unsafe impl IoBuf for Box<[u8]> {
 }
 
 unsafe impl IoBufMut for Box<[u8]> {
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
-        // SAFETY: a boxed slice is fully initialised, and every initialised
-        // `u8` is a valid `MaybeUninit<u8>`.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
-                self.len(),
-            )
-        }
+    fn as_uninit(&mut self) -> &mut UninitSlice {
+        // A boxed slice is fully initialised, so no uninitialised region exists
+        // to protect -- but the same type is used for uniformity.
+        UninitSlice::from_init_mut(self)
     }
 
     unsafe fn set_init(&mut self, _len: usize) {
@@ -201,11 +284,11 @@ mod tests {
         assert_eq!(v.bytes_init(), 10);
     }
 
-    /// `bytes_total` is provided in terms of `as_uninit`, so the two cannot
-    /// drift apart -- which is what made the old split pointer/length pair
-    /// recombinable into a slice over uninitialised memory.
+    /// `bytes_total` is provided in terms of `as_uninit`, so an implementor
+    /// need not keep two values in sync -- which is what made the old split
+    /// pointer/length pair recombinable into a slice over uninitialised memory.
     #[test]
-    fn capacity_always_matches_the_uninit_slice() {
+    fn capacity_always_matches_the_uninit_region() {
         let mut v: Vec<u8> = Vec::with_capacity(64);
         assert_eq!(v.as_uninit().len(), v.bytes_total());
         unsafe { v.set_init(10) };
@@ -219,16 +302,59 @@ mod tests {
         assert_eq!(b.as_uninit().len(), b.bytes_total());
     }
 
-    /// The slice must start at the buffer's first byte, not at its initialised
+    /// The region must start at the buffer's first byte, not at its initialised
     /// prefix: `set_init` publishes an absolute length and `TailBuf` indexes
     /// from the start.
     #[test]
-    fn uninit_slice_starts_at_the_first_byte() {
+    fn uninit_region_starts_at_the_first_byte() {
         let mut v: Vec<u8> = Vec::with_capacity(8);
         let base = v.stable_ptr();
         unsafe { v.set_init(4) };
-        assert_eq!(v.as_uninit().as_mut_ptr().cast::<u8>().cast_const(), base);
+        assert_eq!(v.as_uninit().as_mut_ptr().cast_const(), base);
         assert_eq!(v.as_uninit().len(), 8);
+    }
+
+    /// The reason `as_uninit` returns [`UninitSlice`] rather than
+    /// `&mut [MaybeUninit<u8>]`.
+    ///
+    /// `as_uninit` is a *safe* method covering the whole allocation, so a raw
+    /// `&mut [MaybeUninit<u8>]` would let safe code store `MaybeUninit::uninit`
+    /// over bytes the buffer has already initialised, and the next safe read of
+    /// those bytes would be undefined behaviour. `UninitSlice` exposes a
+    /// pointer, a length and a sub-window, and nothing that can write an
+    /// uninitialised value.
+    ///
+    /// The compile-time half of this is the `compile_fail` doctest on
+    /// [`UninitSlice`]; what is checked here is that the initialised prefix
+    /// genuinely survives a round trip through the region.
+    #[test]
+    fn the_initialised_prefix_cannot_be_damaged_through_the_region() {
+        let mut v: Vec<u8> = vec![1, 2, 3, 4];
+        v.reserve(4);
+
+        let region = v.as_uninit();
+        assert!(region.len() >= 8, "prefix plus spare capacity");
+        // Only a pointer and a length come out; there is no safe path from here
+        // to writing `MaybeUninit::uninit` into the first four bytes.
+        let _ptr = region.as_mut_ptr();
+
+        assert_eq!(&v[..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn sub_windows_are_bounds_checked() {
+        let mut v: Vec<u8> = Vec::with_capacity(16);
+        let region = v.as_uninit();
+        assert_eq!(region.slice_mut(4, 12).len(), 8);
+        assert_eq!(region.slice_mut(16, 16).len(), 0);
+        assert!(region.slice_mut(16, 16).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn a_sub_window_past_the_end_panics_rather_than_aliasing() {
+        let mut v: Vec<u8> = Vec::with_capacity(16);
+        let _ = v.as_uninit().slice_mut(0, 17);
     }
 
     #[test]

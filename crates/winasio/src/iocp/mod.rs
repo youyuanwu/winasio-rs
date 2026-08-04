@@ -104,7 +104,7 @@ mod raw;
 mod threadpool;
 
 pub use backend::{Registrar, Submitter, ThreadPool};
-pub use buf::{IoBuf, IoBufMut, OpResult};
+pub use buf::{IoBuf, IoBufMut, OpResult, UninitSlice};
 pub use future::Submit;
 pub use handle::Handle;
 pub use op::{win32_result, IntoInner, OpCode, OpType};

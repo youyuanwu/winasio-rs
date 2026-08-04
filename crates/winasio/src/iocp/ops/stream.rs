@@ -93,7 +93,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadHandleAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
         let buffer = self.buffer.as_uninit();
         let len = match checked_u32_len(buffer.len()) {
@@ -157,7 +157,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteHandleAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        set_offset(optr, self.offset);
+        unsafe { set_offset(optr, self.offset) };
 
         let len = match checked_u32_len(self.buffer.bytes_init()) {
             Ok(len) => len,
@@ -213,7 +213,7 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadHandle<B> {
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
         let buffer = self.inner.buffer.as_uninit();
         let len = match checked_u32_len(buffer.len()) {
@@ -282,7 +282,7 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteHandle<B> {
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
         let len = match checked_u32_len(self.inner.buffer.bytes_init()) {
             Ok(len) => len,
@@ -338,7 +338,7 @@ unsafe impl OpCode for ConnectPipe {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore offsets, but the driver reuses the common OVERLAPPED
         // allocation and the fields must not contain garbage.
-        set_offset(optr, 0);
+        unsafe { set_offset(optr, 0) };
 
         // SAFETY: `optr` is the operation's stable OVERLAPPED allocation and
         // `handle` is a live server-side named-pipe handle.

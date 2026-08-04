@@ -312,16 +312,18 @@ unsafe impl<B: IoBuf> IoBuf for TailBuf<B> {
 }
 
 unsafe impl<B: IoBufMut> IoBufMut for TailBuf<B> {
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+    fn as_uninit(&mut self) -> &mut crate::iocp::UninitSlice {
         let offset = self.offset;
         let limit = self.limit;
         let whole = self.inner.as_uninit();
         // Bounds-checked rather than pointer arithmetic. An offset past the end
         // must yield an empty tail, not a panic -- `read_exact` walks the offset
-        // forward until the buffer is full.
+        // forward until the buffer is full. `saturating_add` is load-bearing:
+        // plain `+` would overflow-panic in debug once `offset + limit` passed
+        // `usize::MAX`.
         let start = offset.min(whole.len());
         let end = start.saturating_add(limit).min(whole.len());
-        &mut whole[start..end]
+        whole.slice_mut(start, end)
     }
 
     /// # Safety

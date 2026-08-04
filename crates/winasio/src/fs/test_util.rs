@@ -114,7 +114,7 @@ unsafe impl IoBuf for DropProbeBuf {
 // `stable_ptr`, from its first byte, and `set_init` delegates to `Vec::set_len`
 // after checking the capacity bound.
 unsafe impl IoBufMut for DropProbeBuf {
-    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+    fn as_uninit(&mut self) -> &mut crate::iocp::UninitSlice {
         self.bytes.as_uninit()
     }
 
