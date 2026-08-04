@@ -246,6 +246,192 @@ fn zero_byte_read_thread_pool() {
 // --- duplicate and cross-backend registration ---------------------------
 
 #[test]
+fn an_inline_success_on_a_real_handle_queues_no_packet() {
+    use windows::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
+
+    let _guard = counter_guard();
+    let name = HSTRING::from(format!(
+        r"\\.\pipe\{}",
+        common::unique_pipe_name("backend_inline_no_packet")
+    ));
+
+    // `PIPE_ACCESS_DUPLEX`, which the `windows` crate exposes only as a raw
+    // file-attribute value.
+    let server = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0x0000_0003)
+                | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            None,
+        )
+    };
+    assert!(!server.is_invalid(), "create named pipe");
+    // SAFETY: a freshly created server end; ownership moves into the `Handle`.
+    let server = unsafe { winasio::iocp::Handle::from_raw(server) };
+
+    let proactor = Proactor::new().unwrap();
+    proactor.attach(server.raw()).unwrap();
+
+    // Connect before asking to be connected. An instance is free, so this
+    // succeeds without the server having called `ConnectNamedPipe`.
+    let client = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            windows::Win32::Storage::FileSystem::OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            None,
+        )
+    }
+    .expect("connect client");
+
+    // Connect the client so the pipe is writable. `ConnectPipe` reports an
+    // already-connected client as `ERROR_PIPE_CONNECTED`, a Win32 *failure*
+    // return that queues no packet whether or not the skip mode is set — so
+    // this half is setup, and proves nothing about registration.
+    let connect = proactor.submit(winasio::iocp::ConnectPipe::new(server.clone()));
+    drive_own_port(&proactor, connect).0.unwrap();
+
+    // A write with buffer space available is satisfied by the initiating call.
+    // This one *is* flag-sensitive: measured on this machine, the same write
+    // queues a packet when `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` is absent and
+    // none when it is set.
+    let before = proactor.unclaimed_completions();
+    let write = proactor.submit(winasio::iocp::WriteHandle::new(
+        server.clone(),
+        b"abc".to_vec(),
+    ));
+    assert_eq!(
+        proactor.pending_count(),
+        0,
+        "a write with buffer space available is satisfied inline"
+    );
+
+    // The operation was reclaimed above, so a packet arriving now would find no
+    // live allocation. `poll` cannot show that: it returns how many completions
+    // were *dispatched*, and an unmatched packet is discarded silently. Assert
+    // on the discard counter instead, or this test cannot fail.
+    assert_eq!(
+        proactor.poll(Some(Duration::from_millis(50))).unwrap(),
+        0,
+        "nothing was left to dispatch"
+    );
+    assert_eq!(
+        proactor.unclaimed_completions(),
+        before,
+        "an inline success on a registered handle must not queue a packet at all"
+    );
+    assert_eq!(drive_own_port(&proactor, write).0.unwrap(), 3);
+
+    unsafe { CloseHandle(client) }.unwrap();
+}
+
+#[test]
+fn a_handle_refusing_the_skip_mode_is_refused_registration() {
+    // The mode is a registration precondition, but no real handle has been
+    // found that accepts association and then refuses it — so the failure is
+    // injected. Without this, the error variant and both backends' partial
+    // teardown paths would be dead code.
+    let file = TempFile::create(w!("bprs1"));
+    let proactor = Proactor::new().unwrap();
+
+    let attached = {
+        let _refuse = winasio::iocp::RefuseSkipMode::new();
+        proactor.attach(file.handle)
+    };
+    assert!(
+        matches!(attached, Err(RegistrationError::SkipModeUnsupported(_))),
+        "registration must not succeed under a contract the driver cannot honour, got {attached:?}"
+    );
+
+    // The injection is scoped: the guard above has been dropped, so an ordinary
+    // registration works again. (This handle is spent — association is
+    // permanent — so use a fresh one.)
+    let other = TempFile::create(w!("bprs2"));
+    Proactor::new().unwrap().attach(other.handle).unwrap();
+}
+
+#[test]
+fn a_refused_thread_pool_registration_tears_down_without_blocking() {
+    // `ThreadPoolIo::new` builds the registration before setting the mode, so
+    // this failure runs `Registration::drop` -> CancelIoEx +
+    // WaitForThreadpoolIoCallbacks + CloseThreadpoolIo with no I/O ever
+    // started. That must release rather than wait for a callback that will
+    // never come. A regression here hangs; the bound catches a slow one.
+    let file = TempFile::create(w!("bprs3"));
+
+    let started = std::time::Instant::now();
+    let registered = {
+        let _refuse = winasio::iocp::RefuseSkipMode::new();
+        ThreadPoolIo::new(file.handle)
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(registered, Err(RegistrationError::SkipModeUnsupported(_))),
+        "a refused registration must not yield a usable ThreadPoolIo"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "teardown of a refused registration blocked for {elapsed:?}"
+    );
+}
+
+#[test]
+fn the_skip_mode_failure_is_not_mistaken_for_a_duplicate_registration() {
+    // Windows reports both refusal and re-registration as
+    // ERROR_INVALID_PARAMETER, and `from_association` attributes that code to
+    // `AlreadyRegistered`. The skip-mode path must not go through it.
+    let file = TempFile::create(w!("bprs4"));
+    let err = {
+        let _refuse = winasio::iocp::RefuseSkipMode::new();
+        Proactor::new().unwrap().attach(file.handle).unwrap_err()
+    };
+    assert!(
+        !matches!(err, RegistrationError::AlreadyRegistered(_)),
+        "a refusal is not a duplicate registration"
+    );
+    assert!(
+        format!("{err}").contains("inline success"),
+        "the message should say what was refused, got {err}"
+    );
+}
+
+#[test]
+fn a_refused_registration_surfaces_through_the_safe_api() {
+    // The safe wrappers must turn this into an ordinary setup failure — not a
+    // panic, and not a leaked handle. `SetupError::Win32` is deliberate: the
+    // realistic codes here (87 / 5) would be mis-mapped onto NotFound-style
+    // filesystem meanings by the usual classifier.
+    let name = common::unique_pipe_name("backend_refused_registration");
+    let created = {
+        let _refuse = winasio::iocp::RefuseSkipMode::new();
+        ServerOptions::new(&name).create(&ThreadPool)
+    };
+    assert!(
+        matches!(created, Err(winasio::pipe::SetupError::Win32(_))),
+        "a refused registration should surface as a plain Win32 setup failure"
+    );
+
+    // Not poisoned for later callers: the guard is scoped, and the pipe name is
+    // free again because the refused server closed its handle.
+    let server = ServerOptions::new(&name).create(&ThreadPool);
+    assert!(
+        server.is_ok(),
+        "the refused attempt must not have leaked the pipe instance"
+    );
+}
+
+#[test]
 fn duplicate_registration_same_backend_own_port() {
     let file = TempFile::create(w!("bp5"));
     let proactor = Proactor::new().unwrap();
@@ -384,11 +570,6 @@ struct FailingOp {
 }
 
 unsafe impl winasio::iocp::OpCode for FailingOp {
-    /// `None`: this never starts, so no completion packet can follow.
-    fn handle(&self) -> Option<HANDLE> {
-        None
-    }
-
     unsafe fn operate(
         &mut self,
         _optr: *mut windows::Win32::System::IO::OVERLAPPED,
@@ -482,12 +663,6 @@ struct InlineOp {
 }
 
 unsafe impl winasio::iocp::OpCode for InlineOp {
-    /// `None`: this operation is not backed by a handle, so no completion
-    /// packet can follow its inline result.
-    fn handle(&self) -> Option<HANDLE> {
-        None
-    }
-
     unsafe fn operate(
         &mut self,
         _optr: *mut windows::Win32::System::IO::OVERLAPPED,
@@ -828,17 +1003,21 @@ fn registering_the_same_handle_twice_fails_through_the_trait() {
 }
 
 #[test]
-fn thread_pool_handles_skip_the_port_on_inline_success() {
+fn registration_requires_suppressing_the_inline_success_notification() {
     // `ConnectPipe` reports an already-connected client as an inline success and
-    // relies on no completion packet following. That is only sound because this
-    // flag is accepted; if it were ever false, teardown would block forever on a
-    // pending-I/O count nothing clears.
-    let file = TempFile::create(w!("trskip"));
-    let io = ThreadPoolIo::new(file.handle).expect("register");
-    assert!(
-        io.skips_on_success(),
-        "inline-success operations depend on this"
-    );
+    // relies on no completion notification following. Both backends make that a
+    // registration precondition rather than per-handle state: a handle that
+    // refuses the mode is rejected outright, so no operation can observe the
+    // other contract and block teardown forever on a pending-I/O count nothing
+    // clears. This checks the ordinary case is still accepted.
+    let pooled = TempFile::create(w!("trskip"));
+    ThreadPoolIo::new(pooled.handle).expect("a file handle supports the skip mode");
+
+    let attached = TempFile::create(w!("prskip"));
+    Proactor::new()
+        .unwrap()
+        .attach(attached.handle)
+        .expect("a file handle supports the skip mode");
 }
 
 trait PipeTestRegistrar: Registrar {

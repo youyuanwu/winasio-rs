@@ -9,7 +9,6 @@
 use std::task::Poll;
 
 use windows::core::Result;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::HttpServer::{
     HttpDataChunkFromMemory, HttpSendHttpResponse, HttpSendResponseEntityBody, HTTP_DATA_CHUNK,
     HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
@@ -61,10 +60,6 @@ impl SendResponse {
 }
 
 unsafe impl OpCode for SendResponse {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Every pointer inside the reply is derived here, from `&mut self`,
         // which already sits at the operation's final address.
@@ -142,10 +137,6 @@ impl<B: IoBuf> SendBody<B> {
 }
 
 unsafe impl<B: IoBuf + Send> OpCode for SendBody<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let len = match u32::try_from(self.buffer.bytes_init()) {
             Ok(len) => len,

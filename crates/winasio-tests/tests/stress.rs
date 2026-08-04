@@ -89,11 +89,6 @@ struct FailingOp {
 }
 
 unsafe impl OpCode for FailingOp {
-    /// `None`: this never starts, so no completion packet can follow.
-    fn handle(&self) -> Option<HANDLE> {
-        None
-    }
-
     unsafe fn operate(
         &mut self,
         _optr: *mut windows::Win32::System::IO::OVERLAPPED,

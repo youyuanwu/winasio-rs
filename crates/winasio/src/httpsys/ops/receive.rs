@@ -9,7 +9,6 @@
 use std::task::Poll;
 
 use windows::core::Result;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::HttpServer::{
     HttpReceiveHttpRequest, HTTP_RECEIVE_HTTP_REQUEST_FLAGS,
 };
@@ -52,10 +51,6 @@ impl ReceiveRequest {
 }
 
 unsafe impl OpCode for ReceiveRequest {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let queue = self.queue.raw();
         let id = self.request_id.get();

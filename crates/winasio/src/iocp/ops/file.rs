@@ -68,10 +68,6 @@ impl<B: IoBufMut> IntoInner for ReadAt<B> {
 }
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.handle.0)
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Offsets live in the OVERLAPPED the caller gave us, which is inside
         // this operation's own allocation.
@@ -133,10 +129,6 @@ impl<B: IoBuf> IntoInner for WriteAt<B> {
 }
 
 unsafe impl<B: IoBuf + Send> OpCode for WriteAt<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.handle.0)
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         unsafe { set_offset(optr, self.offset) };
 

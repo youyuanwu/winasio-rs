@@ -79,13 +79,11 @@ use super::threadpool::ThreadPoolIo;
 /// use std::rc::Rc;
 /// use std::task::Poll;
 /// use winasio::iocp::{Proactor, Submitter, IntoInner, OpCode, win32_result};
-/// use windows::Win32::Foundation::HANDLE;
 /// use windows::Win32::System::IO::OVERLAPPED;
 ///
 /// struct NotSendOp(Rc<u8>); // `Rc` makes it `!Send`.
 ///
 /// unsafe impl OpCode for NotSendOp {
-///     fn handle(&self) -> Option<HANDLE> { None }
 ///     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<windows::core::Result<usize>> {
 ///         unsafe { win32_result(false, optr) }
 ///     }
@@ -107,13 +105,11 @@ use super::threadpool::ThreadPoolIo;
 /// use std::rc::Rc;
 /// use std::task::Poll;
 /// use winasio::iocp::{Proactor, IntoInner, OpCode, win32_result};
-/// use windows::Win32::Foundation::HANDLE;
 /// use windows::Win32::System::IO::OVERLAPPED;
 ///
 /// struct NotSendOp(Rc<u8>);
 ///
 /// unsafe impl OpCode for NotSendOp {
-///     fn handle(&self) -> Option<HANDLE> { None }
 ///     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<windows::core::Result<usize>> {
 ///         unsafe { win32_result(false, optr) }
 ///     }

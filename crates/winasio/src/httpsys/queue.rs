@@ -539,9 +539,6 @@ mod tests {
     struct NeverRuns;
 
     unsafe impl OpCode for NeverRuns {
-        fn handle(&self) -> Option<HANDLE> {
-            None
-        }
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             unreachable!("a closed queue must reject the submission before operating")
         }

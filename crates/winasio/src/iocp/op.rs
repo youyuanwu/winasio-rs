@@ -14,21 +14,7 @@
 use std::task::Poll;
 
 use windows::core::{Error, Result};
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::IO::OVERLAPPED;
-
-/// How an operation's completion is signalled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum OpType {
-    /// A true overlapped operation. `operate` passes the `OVERLAPPED` pointer to
-    /// a Windows API which completes through an I/O completion port or a
-    /// thread-pool I/O callback.
-    Overlapped,
-    /// A wait on a signalable handle, driven by the Win32 wait infrastructure
-    /// rather than by an I/O completion.
-    Event(HANDLE),
-}
 
 /// One asynchronous Windows operation.
 ///
@@ -49,41 +35,20 @@ pub enum OpType {
 ///   or into values that may later move, are undefined behaviour.
 /// * `operate` must actually initiate the operation using the `optr` it is given,
 ///   and must not retain `optr` beyond the call.
-/// * If `operate` can return `Poll::Ready(Ok(_))` — completing inline — and the
-///   handle it used does not have `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` set,
-///   then [`OpCode::handle`] must return that handle. Otherwise the driver will
-///   release the operation while Windows is still holding a pointer to it.
+/// * If `operate` can return `Poll::Ready(Ok(_))`, the handle it runs on must
+///   have been registered through [`Proactor::attach`](crate::iocp::Proactor::attach)
+///   or [`ThreadPoolIo::new`](crate::iocp::ThreadPoolIo::new). Registration is
+///   what suppresses the completion for an inline success; the driver relies on
+///   that and reclaims the operation without waiting for one. On an unregistered
+///   handle a packet still arrives, and would reference released state.
 /// * `cancel` must request cancellation of the operation started by `operate`
 ///   (normally `CancelIoEx`) and must not free anything.
 /// * The implementor must not assume `cancel` prevents completion. Cancellation
 ///   is asynchronous; a completion still arrives and is the point at which the
 ///   operation's state is released.
-/// * If `op_type` returns [`OpType::Event`], the handle must remain valid until
+/// * Any handle the operation borrows rather than owns must stay valid until
 ///   the operation reaches a terminal state.
 pub unsafe trait OpCode: 'static {
-    /// How this operation completes. Defaults to a true overlapped operation.
-    fn op_type(&self) -> OpType {
-        OpType::Overlapped
-    }
-
-    /// Which handle this operation runs on, if any.
-    ///
-    /// **This has no default, deliberately.** The driver uses it to decide,
-    /// after [`OpCode::operate`] returns `Poll::Ready(Ok(_))`, whether a
-    /// completion packet is *also* coming — which depends on whether the handle
-    /// skips the completion port on success.
-    ///
-    /// Getting it wrong is a use-after-free, so every implementor is required
-    /// to state the answer rather than inherit one:
-    ///
-    /// * `Some(handle)` — the operation runs on this handle. Always correct.
-    /// * `None` — the operation cannot complete inline, so the question does
-    ///   not arise. Only sound if [`OpCode::operate`] never returns
-    ///   `Poll::Ready(Ok(_))`.
-    ///
-    /// When in doubt, return `Some`.
-    fn handle(&self) -> Option<HANDLE>;
-
     /// Start the operation.
     ///
     /// Returns [`Poll::Pending`] if it started asynchronously and a completion
@@ -116,9 +81,11 @@ pub unsafe trait OpCode: 'static {
     /// lengths, address sizes, flags — while it still has `&mut self`.
     ///
     /// Runs on whichever path resolved the operation: the completion packet, or
-    /// the inline path when [`OpCode::operate`] finished synchronously and no
-    /// packet will follow. An operation that must classify a condition the
-    /// platform can report either way therefore needs no separate inline hook.
+    /// the inline path when [`OpCode::operate`] finished synchronously — on a
+    /// handle registered through this crate no packet follows an inline
+    /// success, which is a precondition of implementing this trait. An
+    /// operation that must classify a condition the platform can report either
+    /// way therefore needs no separate inline hook.
     ///
     /// **Not guaranteed to run exactly once.** An operation that classifies its
     /// own inline result inside `operate` will also see the driver's inline

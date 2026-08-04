@@ -49,10 +49,6 @@ struct ConnectPipe {
 }
 
 unsafe impl OpCode for ConnectPipe {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.pipe.0)
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let res = unsafe { ConnectNamedPipe(self.pipe.0, Some(optr)) };
         match res {
@@ -104,10 +100,6 @@ struct PipeRead {
 }
 
 unsafe impl OpCode for PipeRead {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.pipe.0)
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // The kernel writes straight into the boxed structure. The pointer is
         // derived from `&mut self`, which lives at a stable heap address for the

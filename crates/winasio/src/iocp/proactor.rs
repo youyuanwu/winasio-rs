@@ -79,8 +79,13 @@ struct ProactorInner {
     /// Operations in flight, so shutdown can cancel them. Only touched from the
     /// owning thread; completion callbacks never reach it.
     pending: RefCell<HashMap<usize, ErasedCancel>>,
-    /// Per handle: does an inline success skip the completion port?
-    skips_on_success: RefCell<HashMap<isize, bool>>,
+    /// Completion packets carrying this crate's key that matched no live
+    /// operation. Test support: the inline-success path reclaims an operation
+    /// without waiting for a packet, and a packet arriving anyway is *silently
+    /// discarded* by the address check — so `poll`'s return value cannot reveal
+    /// it. This can.
+    #[cfg(any(test, feature = "test-util"))]
+    unclaimed: std::cell::Cell<usize>,
 }
 
 /// Wakes a blocked [`Proactor::poll`] from another thread.
@@ -106,7 +111,8 @@ impl Proactor {
             inner: ProactorInner {
                 port: Arc::new(CompletionPort::new()?),
                 pending: RefCell::new(HashMap::new()),
-                skips_on_success: RefCell::new(HashMap::new()),
+                #[cfg(any(test, feature = "test-util"))]
+                unclaimed: std::cell::Cell::new(0),
             },
             _not_send: PhantomData,
         })
@@ -117,13 +123,22 @@ impl Proactor {
     /// A handle may be registered with exactly one completion mechanism, for
     /// its whole lifetime. A second attempt — with either backend, in either
     /// order — fails with [`RegistrationError::AlreadyRegistered`].
+    ///
+    /// Registration also suppresses the completion packet for operations that
+    /// succeed inline, so that [`submit`](Proactor::submit) can treat an inline
+    /// success as final. A handle that does not support that mode is rejected
+    /// with [`RegistrationError::SkipModeUnsupported`] instead of being
+    /// registered under a contract the proactor would have to track per handle.
+    ///
+    /// # On failure the handle is spent
+    ///
+    /// Association with a completion port is permanent and cannot be undone, and
+    /// it happens before the mode is set. So an error here — including
+    /// `SkipModeUnsupported` — may leave `handle` bound to a port the caller has
+    /// no reference to. It cannot be registered again with either backend, and
+    /// submitting operations for it is unsound. Close it.
     pub fn attach(&self, handle: HANDLE) -> std::result::Result<(), RegistrationError> {
-        let skips = self.inner.port.attach(handle)?;
-        self.inner
-            .skips_on_success
-            .borrow_mut()
-            .insert(handle.0 as isize, skips);
-        Ok(())
+        self.inner.port.attach(handle)
     }
 
     /// A handle that can wake a blocked [`Proactor::poll`] from another thread.
@@ -160,20 +175,14 @@ impl Proactor {
                 Submit::ready(key, Err(e))
             }
             Poll::Ready(Ok(n)) => {
-                if self.packet_follows_inline_success(&key) {
-                    // The handle does not skip the port, so a packet is still
-                    // coming and owns the leaked reference.
-                    self.track(optr, &key);
-                    Submit::pending(key)
-                } else {
-                    // No packet will arrive. Run the completion hook here, since
-                    // nothing else will, then reclaim the reference.
-                    let result = Ok(n);
-                    key.on_complete_inline(&result);
-                    // SAFETY: matches the leak above; no completion will arrive.
-                    unsafe { Key::<T>::unleak(optr) };
-                    Submit::ready(key, result)
-                }
+                // No packet will arrive: every registered handle suppresses the
+                // completion for an inline success. Run the completion hook
+                // here, since nothing else will, then reclaim the reference.
+                let result = Ok(n);
+                key.on_complete_inline(&result);
+                // SAFETY: matches the leak above; no completion will arrive.
+                unsafe { Key::<T>::unleak(optr) };
+                Submit::ready(key, result)
             }
         }
     }
@@ -183,25 +192,6 @@ impl Proactor {
             .pending
             .borrow_mut()
             .insert(optr as usize, key.erased_cancel());
-    }
-
-    /// Whether a completion packet will follow an inline success.
-    ///
-    /// Determined per handle from what `SetFileCompletionNotificationModes`
-    /// reported at registration. An operation that does not report its handle is
-    /// assumed to skip the port, which is the documented contract on
-    /// [`OpCode::handle`].
-    fn packet_follows_inline_success<T: OpCode>(&self, key: &Key<T>) -> bool {
-        match key.handle() {
-            Some(h) => !self
-                .inner
-                .skips_on_success
-                .borrow()
-                .get(&(h.0 as isize))
-                .copied()
-                .unwrap_or(false),
-            None => false,
-        }
     }
 
     /// The raw port handle, so an event wait can post its completion here.
@@ -220,6 +210,19 @@ impl Proactor {
     /// Number of operations still in flight.
     pub fn pending_count(&self) -> usize {
         self.inner.pending.borrow().len()
+    }
+
+    /// Completion packets that carried this crate's key but matched no live
+    /// operation, since this proactor was created.
+    ///
+    /// Test support. [`poll`](Proactor::poll) reports how many completions were
+    /// *dispatched*, so a packet for an operation that was already reclaimed —
+    /// the exact failure the inline-success path would produce if a registered
+    /// handle did not suppress it — is invisible in its return value. This
+    /// counts those.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn unclaimed_completions(&self) -> usize {
+        self.inner.unclaimed.get()
     }
 
     /// Drive this proactor until `fut` resolves, and return its output.
@@ -331,6 +334,12 @@ impl ProactorInner {
             // and some failures still transferred bytes.
             if unsafe { dispatch_completion_with(optr, result, transferred) } {
                 delivered += 1;
+            } else {
+                // Either a foreign overlapped call on an attached handle, or a
+                // packet for an operation already reclaimed. Both are ignored
+                // here; only the counter distinguishes them from silence.
+                #[cfg(any(test, feature = "test-util"))]
+                self.unclaimed.set(self.unclaimed.get() + 1);
             }
         }
         Ok(delivered)
@@ -406,11 +415,6 @@ mod tests {
     static INLINE_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
 
     unsafe impl OpCode for InlineOp {
-        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-            None
-        }
-
-        // No handle reported: the driver must assume no packet follows.
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Ready(self.outcome.clone())
         }
