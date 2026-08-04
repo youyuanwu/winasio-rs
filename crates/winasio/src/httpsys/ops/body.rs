@@ -46,8 +46,9 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
         let queue = self.queue.raw();
         let id = self.request_id.get();
         // Derived from `&mut self`, at the operation's final address. Pointer
-        // and length come from one slice, and the slice is `MaybeUninit`, so
-        // the buffer's uninitialised capacity never becomes a `&mut [u8]`.
+        // and length come from one `UninitSlice`, which can neither be turned
+        // into a reference to uninitialised memory nor used to de-initialise
+        // the buffer's existing contents.
         let buffer = self.buffer.as_uninit();
         let len = match checked_u32_len(buffer.len()) {
             Ok(len) => len,

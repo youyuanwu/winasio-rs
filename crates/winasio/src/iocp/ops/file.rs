@@ -82,8 +82,9 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
             Ok(len) => len,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        // The pointer and length come from one slice, and the slice is
-        // `MaybeUninit`, so no reference to uninitialised memory is created.
+        // The pointer and length come from one `UninitSlice`, which can neither
+        // be turned into a reference to uninitialised memory nor used to
+        // de-initialise the buffer's existing contents.
         let ptr = buffer.as_mut_ptr().cast::<u8>();
 
         let ok = unsafe { ReadFile(self.handle.0, ptr, len, std::ptr::null_mut(), optr) } != 0;

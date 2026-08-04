@@ -55,10 +55,16 @@ impl UninitSlice {
     }
 
     /// Wrap an already-initialised slice.
-    fn from_init_mut(slice: &mut [u8]) -> &mut UninitSlice {
-        // SAFETY: every initialised byte is a valid `MaybeUninit<u8>`, and the
-        // borrow is preserved. Nothing here can de-initialise them, because
-        // this type offers no way to write an uninitialised value.
+    ///
+    /// Safe, and public, because an implementor backed by a bare `&mut [u8]`,
+    /// an array or an arena slab would otherwise have to reach for
+    /// [`from_raw_parts_mut`](UninitSlice::from_raw_parts_mut) and pair a
+    /// pointer with a length by hand -- the very thing this type exists to
+    /// eliminate. Every initialised `u8` is a valid `MaybeUninit<u8>`, and
+    /// nothing here can de-initialise it.
+    pub fn new(slice: &mut [u8]) -> &mut UninitSlice {
+        // SAFETY: the region is valid and initialised for `slice.len()` bytes,
+        // and the borrow is preserved.
         unsafe { UninitSlice::from_raw_parts_mut(slice.as_mut_ptr(), slice.len()) }
     }
 
@@ -206,7 +212,7 @@ unsafe impl IoBufMut for Box<[u8]> {
     fn as_uninit(&mut self) -> &mut UninitSlice {
         // A boxed slice is fully initialised, so no uninitialised region exists
         // to protect -- but the same type is used for uniformity.
-        UninitSlice::from_init_mut(self)
+        UninitSlice::new(self)
     }
 
     unsafe fn set_init(&mut self, _len: usize) {
@@ -355,6 +361,15 @@ mod tests {
     fn a_sub_window_past_the_end_panics_rather_than_aliasing() {
         let mut v: Vec<u8> = Vec::with_capacity(16);
         let _ = v.as_uninit().slice_mut(0, 17);
+    }
+
+    /// The other documented panic: std words this case differently, so the
+    /// `end > len` test above does not cover it.
+    #[test]
+    #[should_panic(expected = "slice index starts at")]
+    fn an_inverted_sub_window_panics() {
+        let mut v: Vec<u8> = Vec::with_capacity(16);
+        let _ = v.as_uninit().slice_mut(8, 4);
     }
 
     #[test]
