@@ -35,6 +35,15 @@ pub(crate) struct QueueHandle(Arc<Owned>);
 struct Owned {
     handle: SendHandle,
     closed: AtomicBool,
+    /// Test-only: counts real `HttpCloseRequestQueue` calls.
+    ///
+    /// Tests cannot ask the operating system whether a *value* is still one of
+    /// our handles: once closed, Windows may hand the same value straight back
+    /// to another thread's `CreateFile`, and `GetHandleInformation` would then
+    /// report it as live. Counting the calls here observes the property
+    /// directly, and proves it happens exactly once.
+    #[cfg(test)]
+    closes: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Owned {
@@ -45,6 +54,10 @@ impl Owned {
         }
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(closes) = &self.closes {
+            closes.fetch_add(1, Ordering::AcqRel);
         }
         check(unsafe { HttpCloseRequestQueue(handle) })
     }
@@ -72,6 +85,26 @@ impl QueueHandle {
         QueueHandle(Arc::new(Owned {
             handle: SendHandle(handle),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            closes: None,
+        }))
+    }
+
+    /// Like [`from_raw`](QueueHandle::from_raw), but counting real closes into
+    /// `closes` so a test can observe them without inspecting a handle value.
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`from_raw`](QueueHandle::from_raw).
+    #[cfg(test)]
+    pub(crate) unsafe fn from_raw_observed(
+        handle: HANDLE,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        QueueHandle(Arc::new(Owned {
+            handle: SendHandle(handle),
+            closed: AtomicBool::new(false),
+            closes: Some(closes),
         }))
     }
 
@@ -99,6 +132,7 @@ impl QueueHandle {
 mod tests {
     use super::*;
     use crate::httpsys::init::VERSION;
+    use std::sync::atomic::AtomicUsize;
     use windows::Win32::Foundation::GetHandleInformation;
     use windows::Win32::Networking::HttpServer::HttpCreateRequestQueue;
 
@@ -141,14 +175,22 @@ mod tests {
     }
 
     #[test]
-    fn last_reference_closes_the_queue() {
+    fn last_reference_closes_the_queue_exactly_once() {
         let Some(raw) = new_raw_queue() else {
             return;
         };
+        let closes = Arc::new(AtomicUsize::new(0));
         // SAFETY: HTTP.sys returned a newly owned request queue handle.
-        let handle = unsafe { QueueHandle::from_raw(raw) };
+        let handle = unsafe { QueueHandle::from_raw_observed(raw, Arc::clone(&closes)) };
         handle.release().expect("last reference closes");
-        assert!(!handle_is_valid(raw));
+        // `release` recovers the value out of the `Arc`, which then runs `Drop`
+        // as it falls out of scope -- so this also pins the idempotence that
+        // stops a second `HttpCloseRequestQueue` reaching a recycled value.
+        assert_eq!(
+            closes.load(Ordering::Acquire),
+            1,
+            "the queue is closed exactly once"
+        );
     }
 
     #[test]
@@ -156,15 +198,27 @@ mod tests {
         let Some(raw) = new_raw_queue() else {
             return;
         };
+        let closes = Arc::new(AtomicUsize::new(0));
         // SAFETY: HTTP.sys returned a newly owned request queue handle.
-        let handle = unsafe { QueueHandle::from_raw(raw) };
+        let handle = unsafe { QueueHandle::from_raw_observed(raw, Arc::clone(&closes)) };
         let clone = handle.clone();
 
         handle.release().expect("release with a clone succeeds");
         assert_eq!(clone.ref_count(), 1);
+        assert_eq!(
+            closes.load(Ordering::Acquire),
+            0,
+            "the close is deferred while a clone still owns the handle"
+        );
+        // Sound in the positive direction: the handle really is still open, so
+        // no recycled value can be mistaken for it.
         assert!(handle_is_valid(raw));
 
         drop(clone);
-        assert!(!handle_is_valid(raw));
+        assert_eq!(
+            closes.load(Ordering::Acquire),
+            1,
+            "the last clone performs the close"
+        );
     }
 }
