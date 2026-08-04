@@ -8,17 +8,20 @@
 //!
 //! These double as worked examples of the byte-buffer shape: the operation owns
 //! its buffer, hands it back on completion, and derives every pointer it gives
-//! Windows from `&mut self`.
+//! Windows from `&mut self`. Reads pass a pointer and a length straight to
+//! Windows rather than building a `&mut [u8]`, because the writable region
+//! includes the buffer's uninitialised spare capacity.
 
 use std::task::Poll;
 
 use windows::core::Result;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use crate::iocp::buf::{IoBuf, IoBufMut};
 use crate::iocp::op::{win32_result, IntoInner, OpCode};
+
+use super::sys::{checked_u32_len, set_offset, ReadFile, WriteFile};
 
 /// A handle that may be moved between threads.
 ///
@@ -72,19 +75,18 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReadAt<B> {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Offsets live in the OVERLAPPED the caller gave us, which is inside
         // this operation's own allocation.
-        unsafe {
-            (*optr).Anonymous.Anonymous.Offset = self.offset as u32;
-            (*optr).Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-        }
+        set_offset(optr, self.offset);
 
-        let total = self.buffer.bytes_total();
-        let ptr = self.buffer.stable_mut_ptr();
-        // SAFETY: `ptr` addresses `total` writable bytes owned by this
-        // operation, which outlives the call because the allocation is pinned
-        // by the driver's reference count.
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, total) };
+        let buffer = self.buffer.as_uninit();
+        let len = match checked_u32_len(buffer.len()) {
+            Ok(len) => len,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        // The pointer and length come from one slice, and the slice is
+        // `MaybeUninit`, so no reference to uninitialised memory is created.
+        let ptr = buffer.as_mut_ptr().cast::<u8>();
 
-        let ok = unsafe { ReadFile(self.handle.0, Some(slice), None, Some(optr)) }.is_ok();
+        let ok = unsafe { ReadFile(self.handle.0, ptr, len, std::ptr::null_mut(), optr) } != 0;
         unsafe { win32_result(ok, optr) }
     }
 
@@ -135,18 +137,18 @@ unsafe impl<B: IoBuf + Send> OpCode for WriteAt<B> {
     }
 
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
-        unsafe {
-            (*optr).Anonymous.Anonymous.Offset = self.offset as u32;
-            (*optr).Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-        }
+        set_offset(optr, self.offset);
 
-        let len = self.buffer.bytes_init();
+        let len = match checked_u32_len(self.buffer.bytes_init()) {
+            Ok(len) => len,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        // Only initialised bytes are sent, so this side never had the
+        // uninitialised-slice problem; it uses the raw binding for symmetry and
+        // to get the same length check.
         let ptr = self.buffer.stable_ptr();
-        // SAFETY: `ptr` addresses `len` initialised bytes owned by this
-        // operation, kept alive by the driver's reference count.
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
-        let ok = unsafe { WriteFile(self.handle.0, Some(slice), None, Some(optr)) }.is_ok();
+        let ok = unsafe { WriteFile(self.handle.0, ptr, len, std::ptr::null_mut(), optr) } != 0;
         unsafe { win32_result(ok, optr) }
     }
 

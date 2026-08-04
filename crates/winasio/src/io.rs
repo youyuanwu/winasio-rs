@@ -312,15 +312,16 @@ unsafe impl<B: IoBuf> IoBuf for TailBuf<B> {
 }
 
 unsafe impl<B: IoBufMut> IoBufMut for TailBuf<B> {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.stable_mut_ptr().wrapping_add(self.offset)
-    }
-
-    fn bytes_total(&self) -> usize {
-        self.inner
-            .bytes_total()
-            .saturating_sub(self.offset)
-            .min(self.limit)
+    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        let offset = self.offset;
+        let limit = self.limit;
+        let whole = self.inner.as_uninit();
+        // Bounds-checked rather than pointer arithmetic. An offset past the end
+        // must yield an empty tail, not a panic -- `read_exact` walks the offset
+        // forward until the buffer is full.
+        let start = offset.min(whole.len());
+        let end = start.saturating_add(limit).min(whole.len());
+        &mut whole[start..end]
     }
 
     /// # Safety

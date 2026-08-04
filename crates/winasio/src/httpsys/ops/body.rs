@@ -14,6 +14,7 @@ use windows::Win32::Networking::HttpServer::HttpReceiveRequestEntityBody;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use crate::httpsys::request::RequestId;
+use crate::iocp::ops::sys::checked_u32_len;
 use crate::iocp::{IntoInner, IoBufMut, OpCode};
 
 use super::receive::poll_from_code;
@@ -44,9 +45,15 @@ unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let queue = self.queue.raw();
         let id = self.request_id.get();
-        let len = self.buffer.bytes_total() as u32;
-        // Derived from `&mut self`, at the operation's final address.
-        let ptr = self.buffer.stable_mut_ptr() as *mut core::ffi::c_void;
+        // Derived from `&mut self`, at the operation's final address. Pointer
+        // and length come from one slice, and the slice is `MaybeUninit`, so
+        // the buffer's uninitialised capacity never becomes a `&mut [u8]`.
+        let buffer = self.buffer.as_uninit();
+        let len = match checked_u32_len(buffer.len()) {
+            Ok(len) => len,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        let ptr = buffer.as_mut_ptr() as *mut core::ffi::c_void;
 
         let code =
             unsafe { HttpReceiveRequestEntityBody(queue, id, 0, ptr, len, None, Some(optr)) };

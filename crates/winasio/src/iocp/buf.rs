@@ -36,20 +36,34 @@ pub unsafe trait IoBuf: 'static {
 ///
 /// In addition to [`IoBuf`]'s requirements:
 ///
-/// * [`stable_mut_ptr`](IoBufMut::stable_mut_ptr) must return the same address
-///   as [`IoBuf::stable_ptr`].
-/// * [`bytes_total`](IoBufMut::bytes_total) must not exceed the allocation
-///   length, since Windows may write that many bytes.
+/// * The data pointer of [`as_uninit`](IoBufMut::as_uninit) must be the same
+///   address as [`IoBuf::stable_ptr`], and must stay the same for as long as the
+///   buffer is owned by an operation.
+/// * The returned slice must cover the buffer from its **first** byte, not from
+///   its initialised prefix: [`set_init`](IoBufMut::set_init) publishes an
+///   absolute length, and adapters index from the start.
 /// * [`set_init`](IoBufMut::set_init) must make the first `len` bytes readable.
+///
+/// The old `stable_mut_ptr` returned a bare pointer whose length the caller had
+/// to carry separately, and recombining the two into a `&mut [u8]` produced a
+/// reference over uninitialised spare capacity. Handing out
+/// `&mut [MaybeUninit<u8>]` keeps pointer, length and lifetime together, so that
+/// mistake is no longer expressible. Windows is given the pointer and the length
+/// directly; it never sees a Rust slice.
 pub unsafe trait IoBufMut: IoBuf {
-    /// Mutable address of the first byte. Stable across moves of `self`.
+    /// The whole buffer -- initialised prefix and uninitialised tail alike.
     ///
-    /// A zero-capacity buffer may return a non-null but non-dereferenceable
-    /// pointer; callers must respect [`bytes_total`](IoBufMut::bytes_total).
-    fn stable_mut_ptr(&mut self) -> *mut u8;
+    /// A zero-capacity buffer returns an empty slice, which may have a non-null
+    /// but non-dereferenceable data pointer.
+    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>];
 
     /// Capacity available for Windows to write into.
-    fn bytes_total(&self) -> usize;
+    ///
+    /// Provided rather than required, so it can never disagree with
+    /// [`as_uninit`](IoBufMut::as_uninit).
+    fn bytes_total(&mut self) -> usize {
+        self.as_uninit().len()
+    }
 
     /// Record how many bytes Windows actually initialised.
     ///
@@ -71,12 +85,14 @@ unsafe impl IoBuf for Vec<u8> {
 }
 
 unsafe impl IoBufMut for Vec<u8> {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.as_mut_ptr()
-    }
-
-    fn bytes_total(&self) -> usize {
-        self.capacity()
+    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        let capacity = self.capacity();
+        let ptr = self.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>();
+        // SAFETY: the whole allocation, initialised prefix included. Covering
+        // the buffer from its first byte rather than only the spare capacity is
+        // required: `set_init` publishes an absolute length, and `TailBuf`
+        // indexes from the start.
+        unsafe { std::slice::from_raw_parts_mut(ptr, capacity) }
     }
 
     unsafe fn set_init(&mut self, len: usize) {
@@ -99,12 +115,15 @@ unsafe impl IoBuf for Box<[u8]> {
 }
 
 unsafe impl IoBufMut for Box<[u8]> {
-    fn stable_mut_ptr(&mut self) -> *mut u8 {
-        self.as_mut_ptr()
-    }
-
-    fn bytes_total(&self) -> usize {
-        self.len()
+    fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
+        // SAFETY: a boxed slice is fully initialised, and every initialised
+        // `u8` is a valid `MaybeUninit<u8>`.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                self.len(),
+            )
+        }
     }
 
     unsafe fn set_init(&mut self, _len: usize) {
@@ -176,10 +195,40 @@ mod tests {
         let mut v: Vec<u8> = Vec::with_capacity(64);
         assert_eq!(v.bytes_total(), 64);
         assert_eq!(v.bytes_init(), 0);
-        let ptr = v.stable_mut_ptr();
+        let ptr = v.as_uninit().as_mut_ptr();
         assert!(!ptr.is_null());
         unsafe { v.set_init(10) };
         assert_eq!(v.bytes_init(), 10);
+    }
+
+    /// `bytes_total` is provided in terms of `as_uninit`, so the two cannot
+    /// drift apart -- which is what made the old split pointer/length pair
+    /// recombinable into a slice over uninitialised memory.
+    #[test]
+    fn capacity_always_matches_the_uninit_slice() {
+        let mut v: Vec<u8> = Vec::with_capacity(64);
+        assert_eq!(v.as_uninit().len(), v.bytes_total());
+        unsafe { v.set_init(10) };
+        assert_eq!(
+            v.as_uninit().len(),
+            v.bytes_total(),
+            "publishing an initialised prefix must not shrink the writable region"
+        );
+
+        let mut b: Box<[u8]> = vec![0u8; 24].into_boxed_slice();
+        assert_eq!(b.as_uninit().len(), b.bytes_total());
+    }
+
+    /// The slice must start at the buffer's first byte, not at its initialised
+    /// prefix: `set_init` publishes an absolute length and `TailBuf` indexes
+    /// from the start.
+    #[test]
+    fn uninit_slice_starts_at_the_first_byte() {
+        let mut v: Vec<u8> = Vec::with_capacity(8);
+        let base = v.stable_ptr();
+        unsafe { v.set_init(4) };
+        assert_eq!(v.as_uninit().as_mut_ptr().cast::<u8>().cast_const(), base);
+        assert_eq!(v.as_uninit().len(), 8);
     }
 
     #[test]
