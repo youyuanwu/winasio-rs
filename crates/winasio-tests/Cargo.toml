@@ -12,6 +12,7 @@ publish = false
 [dev-dependencies]
 winasio = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
+futures = { workspace = true }
 warp = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }

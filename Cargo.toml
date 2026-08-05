@@ -25,6 +25,7 @@ windows = { version = "0.62", features = [
 ] }
 
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 warp = { version = "0.4", features = ["server"] }
 serde = "1.0"
 serde_derive = "1.0"
