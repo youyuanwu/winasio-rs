@@ -16,9 +16,19 @@
 //! # The address buffer
 //!
 //! Each address slot must be at least `sizeof(SOCKADDR_STORAGE) + 16`. The
-//! sixteen extra bytes are not padding-by-superstition: the provider is
-//! entitled to use them, and a buffer sized to `SOCKADDR_STORAGE` alone is
-//! rejected. `dwReceiveDataLength` is zero, which is what makes this a pure
+//! sixteen extra bytes are not padding-by-superstition — the provider is
+//! entitled to write into them — but the reason to get this right is worse
+//! than a failed call: measured (M36), `AcceptEx` **accepts** a buffer sized to
+//! `SOCKADDR_STORAGE` alone and returns `WSA_IO_PENDING` exactly as usual. The
+//! undersizing is not diagnosed at submission, so it does not fail loudly; it
+//! is a silent out-of-bounds write waiting for a completion. That is why the
+//! constant is asserted in a test rather than merely commented.
+//!
+//! (An earlier version of this comment claimed the call was rejected. It is
+//! not. The claim was inherited from the documented contract instead of being
+//! measured, which is the same mistake this crate has now made three times.)
+//!
+//! `dwReceiveDataLength` is zero, which is what makes this a pure
 //! accept: a non-zero value would make the operation wait for the client's
 //! first send, turning a completed TCP handshake into an unbounded wait that a
 //! silent client can hold open indefinitely.
@@ -104,11 +114,16 @@ impl AcceptSocket {
 
     /// Apply the context update and decode both addresses.
     ///
-    /// Order matters. `SO_UPDATE_ACCEPT_CONTEXT` first: until it runs the
-    /// accepted socket has no inherited state, and `getsockname` on it fails
-    /// with `WSAEINVAL` while `getpeername` fails with `WSAENOTCONN`. Measured
-    /// (M26): omitting it leaves `getpeername` failing, and passing the wrong
-    /// listener yields `WSAEFAULT`.
+    /// Order matters. `SO_UPDATE_ACCEPT_CONTEXT` first: until it runs, the
+    /// accepted socket has no inherited state. Measured on the accepted socket
+    /// with no update applied: `getsockname` fails with `WSAEINVAL` (M34) and
+    /// `getpeername` fails with `WSAENOTCONN` (M35). M26 adds that passing the
+    /// wrong listener yields `WSAEFAULT` and leaves `getpeername` still
+    /// failing.
+    ///
+    /// Note that this differs from the connect side, where `getsockname`
+    /// succeeds before `SO_UPDATE_CONNECT_CONTEXT` (M8, probe 20) — which is
+    /// why the two were measured separately rather than assumed alike.
     fn decode(&mut self) -> Result<(SocketAddr, SocketAddr)> {
         self.accepted.update_accept_context(&self.listener)?;
 
@@ -219,9 +234,12 @@ mod tests {
     #[test]
     fn an_address_slot_leaves_room_for_the_providers_sixteen_bytes() {
         // Sizing a slot to `SOCKADDR_STORAGE` alone is the classic `AcceptEx`
-        // mistake: the call fails with `WSAEFAULT` and nothing points at the
-        // buffer. Asserting the arithmetic here means the constant cannot be
-        // "simplified" later without this failing.
+        // mistake, and measurement (M36) makes it worse than folklore says:
+        // the call does not fail, it returns `WSA_IO_PENDING` like any other
+        // and the undersizing only shows up as memory the provider was
+        // entitled to write and we did not reserve. Nothing at runtime will
+        // catch it, so this assertion is the only thing standing between the
+        // constant and a later "simplification".
         assert_eq!(ADDR_SLOT, std::mem::size_of::<SOCKADDR_STORAGE>() + 16);
         assert!(ADDR_SLOT >= std::mem::size_of::<SOCKADDR_STORAGE>() + 16);
     }

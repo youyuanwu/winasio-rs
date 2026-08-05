@@ -86,7 +86,17 @@ pub enum SocketError {
 
 impl SocketError {
     /// Classify a platform error from either numbering scheme.
-    pub(crate) fn from_win32(err: Error) -> Self {
+    ///
+    /// Public because callers need it. `bind`, `connect` and `accept` return
+    /// this type already, but [`TcpStream::read`](super::TcpStream::read) and
+    /// [`write`](super::TcpStream::write) resolve to a raw
+    /// [`windows::core::Error`] — the same type files and pipes use — and an
+    /// abruptly lost connection is visible *only* as one of those errors, since
+    /// [`ReadOutcome::ClosedPeer`](super::ReadOutcome::ClosedPeer) is reserved
+    /// for a graceful FIN. Without this, telling a reset from a genuine fault
+    /// would mean decoding `HRESULT`s by hand, and the two numbering schemes
+    /// make that harder than it looks.
+    pub fn from_win32(err: Error) -> Self {
         let Some(code) = win32_code(&err) else {
             return SocketError::Win32(err);
         };

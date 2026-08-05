@@ -9,19 +9,13 @@
 //! Sockets reuse [`ReadOutcome`] rather than defining their own enum, so the
 //! whole-payload helpers in [`crate::io`] work unchanged and files, pipes and
 //! sockets share one vocabulary. What is socket-specific is the
-//! *classification*, and one case of it is load-bearing.
+//! *classification*, and two cases of it are load-bearing: the zero-length
+//! request, and the difference between a peer that finished and a peer that
+//! was cut off.
 
 use windows::core::Result;
-use windows::Win32::Foundation::{
-    ERROR_CONNECTION_ABORTED, ERROR_NETNAME_DELETED, ERROR_UNEXP_NET_ERR,
-};
-use windows::Win32::Networking::WinSock::{
-    WSAECONNABORTED, WSAECONNRESET, WSAEDISCON, WSAENETRESET, WSAESHUTDOWN,
-};
 
 use crate::fs::ReadOutcome;
-
-use super::error::win32_code;
 
 /// Turn a completed `WSARecv` into a read outcome.
 ///
@@ -50,28 +44,33 @@ pub(crate) fn classify_socket_read(
         // who simply passed an empty buffer.
         Ok(n) => Some(ReadOutcome::Bytes(*n)),
 
-        Err(e) => match win32_code(e) {
-            // The five Winsock spellings, seen when the failure is inline.
-            Some(code)
-                if code as i32 == WSAECONNRESET.0
-                    || code as i32 == WSAECONNABORTED.0
-                    || code as i32 == WSAENETRESET.0
-                    || code as i32 == WSAESHUTDOWN.0
-                    || code as i32 == WSAEDISCON.0 =>
-            {
-                Some(ReadOutcome::ClosedPeer)
-            }
-            // The three Win32 spellings, seen when the same condition arrives
-            // on a completion packet after `RtlNtStatusToDosError`.
-            Some(code)
-                if code == ERROR_NETNAME_DELETED.0
-                    || code == ERROR_CONNECTION_ABORTED.0
-                    || code == ERROR_UNEXP_NET_ERR.0 =>
-            {
-                Some(ReadOutcome::ClosedPeer)
-            }
-            _ => None,
-        },
+        // Everything else is a failure, and stays one.
+        //
+        // An earlier version folded the reset spellings — `WSAECONNRESET`,
+        // `WSAECONNABORTED`, `WSAENETRESET`, `ERROR_NETNAME_DELETED` and the
+        // rest — into `ClosedPeer` as well, on the grounds that they all mean
+        // "the peer is gone". They do, but they do not all mean the same thing
+        // about the *data*, and `ClosedPeer` is a success:
+        //
+        // * FIN says the peer finished sending. What you have is everything it
+        //   meant to send.
+        // * RST says the connection was destroyed. What you have is whatever
+        //   happened to arrive first.
+        //
+        // `crate::io::read_to_end` stops on `ClosedPeer` and reports success,
+        // so classifying a reset that way returned a silently truncated buffer
+        // with `Ok(())` beside it, and no way for the caller to tell it from a
+        // complete transfer. That is the truncation hazard every read-until-
+        // close protocol steps on. `std::net::TcpStream::read_to_end` returns
+        // `Err(ConnectionReset)` here, and so does this crate now: an abrupt
+        // loss surfaces as an error, and `Ok(0)` is the only thing that
+        // produces `ClosedPeer`.
+        //
+        // This crate's own `io.rs` already made the argument, about a different
+        // code: "reporting it as a peer closure would tell `read_to_end` the
+        // stream ended cleanly and hand back a truncated buffer with no error".
+        // It just was not applied here.
+        Err(_) => None,
     }
 }
 
@@ -109,10 +108,23 @@ mod tests {
     }
 
     #[test]
-    fn every_closed_peer_code_from_either_scheme_agrees() {
-        // The two delivery paths spell the same condition differently, and
-        // which one a caller sees depends on whether the failure was inline or
-        // arrived on a packet.
+    fn an_abrupt_loss_is_an_error_not_a_closed_peer() {
+        use windows::Win32::Foundation::{
+            ERROR_CONNECTION_ABORTED, ERROR_NETNAME_DELETED, ERROR_UNEXP_NET_ERR,
+        };
+        use windows::Win32::Networking::WinSock::{
+            WSAECONNABORTED, WSAECONNRESET, WSAEDISCON, WSAENETRESET, WSAESHUTDOWN,
+        };
+
+        // These all mean "the peer is gone", and it is tempting to fold them
+        // into `ClosedPeer` for that reason. The temptation is wrong, and this
+        // test is here to keep anyone from giving in to it again.
+        //
+        // `ClosedPeer` is a *success*: `read_to_end` stops on it and reports
+        // `Ok`. A FIN earns that, because the peer sent everything it meant to.
+        // A reset does not — what arrived is whatever beat the RST — so folding
+        // these in returns a truncated buffer with no error attached, which the
+        // caller cannot distinguish from a complete one.
         for code in [
             WSAECONNRESET.0,
             WSAECONNABORTED.0,
@@ -125,8 +137,8 @@ mod tests {
         ] {
             assert_eq!(
                 classify_socket_read(&err(code), 4096),
-                Some(ReadOutcome::ClosedPeer),
-                "code {code} should be a closed peer"
+                None,
+                "code {code} must stay an error; only `Ok(0)` is a graceful close"
             );
         }
     }

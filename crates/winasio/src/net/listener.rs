@@ -117,8 +117,16 @@ impl<R: Registrar + Clone> TcpListener<R> {
     ) -> Result<Self, SocketError> {
         let socket = Socket::new_overlapped(family_of(&addr)).map_err(SocketError::from_win32)?;
 
-        if addr.is_ipv6() && !options.only_v6 {
-            socket.set_only_v6(false).map_err(SocketError::from_win32)?;
+        if addr.is_ipv6() {
+            // Set unconditionally, not only when clearing it. `only_v6(true)`
+            // otherwise means "leave the machine's default alone", which is not
+            // what the option says and not what a caller who wrote it wants.
+            // M19 measured the default as 1 on this machine, but the option is
+            // documented as setting the behaviour, not as agreeing with a
+            // default that a system policy is free to change.
+            socket
+                .set_only_v6(options.only_v6)
+                .map_err(SocketError::from_win32)?;
         }
 
         socket.bind_to(addr).map_err(SocketError::from_win32)?;

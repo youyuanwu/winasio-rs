@@ -168,6 +168,49 @@ fn accept_and_connect_complete_on_thread_pool() {
     drop(handle.join().expect("client thread"));
 }
 
+/// T2b — FR-021, FR-022, `ConnectEx` on the system thread pool.
+///
+/// The other `ConnectEx` tests all drive a caller-owned `Proactor`. That is the
+/// backend where the completion is dequeued by the same thread that submitted
+/// it, so a `ConnectEx` that only ever completed inline, or one whose
+/// completion was delivered on the wrong registration, could still pass. The
+/// thread pool delivers on a pool thread, which is a genuinely different path
+/// through `finish` and the `SO_UPDATE_CONNECT_CONTEXT` fix-up.
+///
+/// Both ends are crate sockets here — the connect *and* the accept — so the
+/// whole handshake runs on pool threads.
+#[test]
+fn connect_completes_on_the_thread_pool() {
+    // The socket and operation counters are process-global and cargo runs
+    // these tests concurrently, so the whole binary serialises on one lock.
+    // It also makes the suite deterministic, which the flakiness gate needs.
+    let _guard = winasio::net::socket_guard();
+    let listener = TcpListener::bind(&ThreadPool, v4_any()).expect("bind");
+    let addr = listener.local_addr();
+
+    let accepted = std::thread::spawn(move || {
+        let (stream, peer) = common::block_on(listener.accept()).expect("accept");
+        (stream, peer)
+    });
+
+    let client = common::block_on(TcpStream::connect(&ThreadPool, addr)).expect("connect");
+    let (server, peer) = accepted.join().expect("accept thread");
+
+    // `SO_UPDATE_CONNECT_CONTEXT` is what makes these queryable at all; before
+    // it, `getsockname` on a `ConnectEx` socket fails with `WSAEINVAL`. So this
+    // is not a redundant address assertion — it is the only cheap check that
+    // the fix-up ran on the pool path.
+    assert_eq!(client.peer_addr().expect("client peer_addr"), addr);
+    assert_eq!(client.local_addr().expect("client local_addr"), peer);
+
+    // And it must actually carry data, in both directions.
+    let OpResult(written, _) = common::block_on(client.write(b"ping".to_vec()));
+    assert_eq!(written.expect("client write"), 4);
+    let OpResult(outcome, buf) = common::block_on(server.read(vec![0u8; 8]));
+    assert_eq!(outcome.expect("server read"), ReadOutcome::Bytes(4));
+    assert_eq!(&buf[..4], b"ping");
+}
+
 // ---------------------------------------------------------------------------
 // T3 — both backends
 // ---------------------------------------------------------------------------
@@ -571,18 +614,26 @@ fn read_to_end_terminates_when_the_peer_closes() {
 // T9
 // ---------------------------------------------------------------------------
 
-/// T9 — M13, the inline Winsock failure path.
+/// T9 — FR-018, FR-019.
 ///
-/// An abortive close (`SO_LINGER` with a zero timeout) makes the peer send RST
-/// rather than FIN, which is the other half of FR-018: the same "the peer is
-/// gone" outcome, reached through an error code rather than a zero-byte
-/// success.
+/// An abrupt loss of the connection (RST) must be reported as an **error**,
+/// not as [`ReadOutcome::ClosedPeer`].
+///
+/// This is the distinction the crate is careful about. A graceful close is a
+/// FIN: the peer said "I have sent everything", every byte it sent arrived,
+/// and stopping is correct. A reset says the opposite — the connection died,
+/// and whatever was in flight is gone. Both surface at a `WSARecv` as "no more
+/// data", so it is tempting to fold them together, and the earlier
+/// implementation did. The consequence was silent data loss: `read_to_end`
+/// returned `Ok(())` with a truncated buffer and no way for the caller to
+/// tell. See `read_to_end_after_a_reset_fails_rather_than_truncating` below,
+/// which is the test that would have caught it.
 ///
 /// The connection is accepted *before* the reset is triggered. Resetting first
 /// makes the `AcceptEx` itself fail with `ConnectionAborted` — which is correct
 /// behaviour, but tests the accept path rather than the read path.
 #[test]
-fn read_after_peer_resets_reports_closed_peer() {
+fn read_after_peer_resets_reports_an_error() {
     // The socket and operation counters are process-global and cargo runs
     // these tests concurrently, so the whole binary serialises on one lock.
     // It also makes the suite deterministic, which the flakiness gate needs.
@@ -607,18 +658,72 @@ fn read_after_peer_resets_reports_closed_peer() {
 
     // The reset may not have arrived yet; read until it does, bounded.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    let err = loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "the reset never turned into a ClosedPeer outcome"
+            "the reset never turned into a read error"
         );
         let OpResult(outcome, _) = drive_proactor(&proactor, stream.read(vec![0u8; 16]));
         match outcome {
-            Ok(ReadOutcome::ClosedPeer) => break,
+            Err(e) => break e,
             Ok(ReadOutcome::Bytes(0)) => continue,
+            Ok(ReadOutcome::ClosedPeer) => {
+                panic!("a reset must be an error: reporting it as ClosedPeer tells the caller the stream ended cleanly")
+            }
             Ok(other) => panic!("unexpected outcome {other:?} from a reset connection"),
-            Err(e) => panic!("a reset must classify as ClosedPeer, not {e:?}"),
         }
+    };
+    assert!(
+        matches!(
+            winasio::net::SocketError::from_win32(err),
+            winasio::net::SocketError::ConnectionAborted
+        ),
+        "a reset classifies as a lost connection, so callers can tell it from an unrelated fault"
+    );
+}
+
+/// T9b — FR-018, FR-019, and the reason FR-018 draws the line where it does.
+///
+/// `read_to_end` on a connection that is reset mid-stream must **fail**. It
+/// must not return `Ok(())` with a short buffer.
+///
+/// This is the falsifiable form of the distinction above, and it is the test
+/// that matters: `read_after_peer_resets_reports_an_error` checks the
+/// classifier in isolation, but a caller never sees the classifier — it sees
+/// `read_to_end`. If a reset were treated as a graceful close, this test would
+/// observe a successful call that quietly dropped the tail of the stream,
+/// which is exactly the failure mode that is impossible to debug in the field.
+#[test]
+fn read_to_end_after_a_reset_fails_rather_than_truncating() {
+    // The socket and operation counters are process-global and cargo runs
+    // these tests concurrently, so the whole binary serialises on one lock.
+    // It also makes the suite deterministic, which the flakiness gate needs.
+    let _guard = winasio::net::socket_guard();
+    let proactor = Rc::new(Proactor::new().expect("proactor"));
+    let listener = TcpListener::bind(&proactor, v4_any()).expect("bind");
+    let addr = listener.local_addr();
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let mut c = client::connect(addr);
+        client::set_abortive_close(&c);
+        // Send a prefix, then reset. A caller reading to the end must not be
+        // told that this prefix was the whole message.
+        client::send(&mut c, b"prefix");
+        rx.recv().expect("the server signals once it has accepted");
+        drop(c);
+    });
+
+    let (stream, _) = drive_proactor(&proactor, listener.accept()).expect("accept");
+    tx.send(()).expect("signal the client to reset");
+    handle.join().expect("client thread");
+
+    let transfer = drive_proactor(&proactor, stream.read_to_end(Vec::new()));
+    if transfer.result.is_ok() {
+        panic!(
+            "read_to_end returned Ok on a reset connection, silently truncating the stream to {} bytes",
+            transfer.buffer.len()
+        );
     }
 }
 
@@ -741,12 +846,20 @@ fn a_socket_refusing_the_skip_mode_is_refused_registration() {
     }
 
     // The accept path registers a *second* socket after the operation
-    // completes, which is a different call site from either of the above.
+    // completes, which is a different call site from either of the above. It is
+    // also the only one where the failure happens with a socket already in
+    // hand: FR-027 makes registration the last fallible step precisely so that
+    // this socket is closed on the way out. Reporting the right error while
+    // leaking the accepted socket would satisfy the match below and still be a
+    // bug, so the socket count is asserted too.
     {
         let listener = TcpListener::bind(&proactor, v4_any()).expect("bind");
         let addr = listener.local_addr();
         let handle = std::thread::spawn(move || client::connect(addr));
 
+        // Taken after the listener exists, so it counts only the accepted
+        // socket that the failing registration is supposed to clean up.
+        let sockets_before = winasio::net::live_sockets();
         let result = {
             let _refuse = RefuseSkipMode::new();
             drive_proactor(&proactor, listener.accept())
@@ -756,6 +869,11 @@ fn a_socket_refusing_the_skip_mode_is_refused_registration() {
             Err(other) => panic!("expected SkipModeUnsupported from accept, got {other:?}"),
             Ok(_) => panic!("the accepted socket's registration should have been refused"),
         }
+        assert_eq!(
+            winasio::net::live_sockets(),
+            sockets_before,
+            "a refused registration must close the socket AcceptEx already created"
+        );
         drop(handle.join().expect("client thread"));
     }
 }
@@ -851,6 +969,7 @@ fn shutdown_is_seen_by_the_peer_on_own_port() {
     let proactor = Rc::new(Proactor::new().expect("proactor"));
     let listener = TcpListener::bind(&proactor, v4_any()).expect("bind");
     let addr = listener.local_addr();
+    let addr2 = addr;
 
     let handle = std::thread::spawn(move || {
         use std::io::Read;
@@ -868,8 +987,40 @@ fn shutdown_is_seen_by_the_peer_on_own_port() {
     stream.shutdown(Shutdown::Write).expect("shutdown write");
     assert_eq!(handle.join().expect("client thread"), b"bye");
 
-    // The remaining two must be accepted on an already half-closed socket.
-    stream.shutdown(Shutdown::Read).expect("shutdown read");
+    // `Shutdown::Read` is asserted by its effect, not merely by returning
+    // `Ok`. Accepting the call proves nothing: mapping every direction to
+    // `SD_SEND`, or making `Read` a no-op, would leave that passing. After
+    // `SD_RECEIVE` the socket's receive side is torn down, so a subsequent
+    // read must report the peer as closed rather than blocking forever.
+    let peer = std::thread::spawn(move || {
+        let mut c = client::connect(addr2);
+        client::send(&mut c, b"unread");
+        c
+    });
+    let (other, _) = drive_proactor(&proactor, listener.accept()).expect("accept");
+    other.shutdown(Shutdown::Read).expect("shutdown read");
+    let OpResult(outcome, _) = drive_proactor(&proactor, other.read(vec![0u8; 16]));
+    // Measured: Windows fails the read with `WSAECONNABORTED` (0x80072745)
+    // rather than completing it with zero bytes. Note what that means for the
+    // classifier — this is an *error*, not `ClosedPeer`, and rightly so: the
+    // receive side was torn down locally, the peer did nothing, and there are
+    // six unread bytes sitting in the buffer that the caller will never see.
+    // Calling that a graceful close would tell `read_to_end` the stream ended
+    // cleanly.
+    //
+    // The assertion is on the failure, not on `Ok(_)`: a `Read` shutdown that
+    // was silently a no-op would return the six bytes and fail here.
+    let err = outcome.expect_err("a read after SD_RECEIVE must not succeed");
+    assert!(
+        matches!(
+            winasio::net::SocketError::from_win32(err),
+            winasio::net::SocketError::ConnectionAborted
+        ),
+        "a read after SD_RECEIVE reports the connection as aborted"
+    );
+    drop(peer.join().expect("peer thread"));
+
+    // `Both` is accepted on an already half-closed socket.
     stream.shutdown(Shutdown::Both).expect("shutdown both");
 }
 
@@ -1049,10 +1200,25 @@ fn a_dropped_write_future_returns_no_buffer_and_leaks_nothing() {
 
     let baseline = winasio::iocp::live_operations();
     {
-        let mut writing = Box::pin(stream.write(vec![0u8; 8 * 1024 * 1024]));
-        // It may or may not complete inline depending on buffer sizes; if it
-        // does, there is nothing to leak and the loop below is a no-op.
-        let _ = poll_once(&proactor, writing.as_mut());
+        // The write that gets dropped must actually be *pending*. A send that
+        // completes inline has nothing to cancel, so dropping it exercises none
+        // of the teardown path and the drain loop below becomes a no-op that
+        // passes unconditionally. Windows decides that on send-buffer space, so
+        // rather than assume a large enough buffer pends, keep sending — and
+        // letting each inline send stand — until one does not resolve. The peer
+        // never reads, so the socket's send buffer fills and this terminates.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no write ever pended, so the drop was never measured"
+            );
+            let mut writing = Box::pin(stream.write(vec![0u8; 1024 * 1024]));
+            if poll_once(&proactor, writing.as_mut()).is_none() {
+                // Pending: drop it here, which is the case under test.
+                break;
+            }
+        }
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1117,12 +1283,23 @@ fn a_dropped_write_future_returns_no_buffer_and_leaks_nothing_on_thread_pool() {
 
     let baseline = winasio::iocp::live_operations();
     {
-        let mut writing = Box::pin(stream.write(vec![0u8; 8 * 1024 * 1024]));
-        // It may or may not complete inline depending on buffer sizes; if it
-        // does, there is nothing to leak and the wait below is a no-op.
-        let _ = common::block_on(std::future::poll_fn(|cx| {
-            Poll::Ready(writing.as_mut().poll(cx).is_ready())
-        }));
+        // As in the own-port variant: keep sending until one send genuinely
+        // pends, and drop that one. Dropping an inline completion would measure
+        // nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no write ever pended, so the drop was never measured"
+            );
+            let mut writing = Box::pin(stream.write(vec![0u8; 1024 * 1024]));
+            let ready = common::block_on(std::future::poll_fn(|cx| {
+                Poll::Ready(writing.as_mut().poll(cx).is_ready())
+            }));
+            if !ready {
+                break;
+            }
+        }
     }
 
     await_operations_drained(baseline, "write");
@@ -1150,6 +1327,15 @@ fn await_operations_drained(baseline: usize, what: &str) {
 // T17 / T18
 // ---------------------------------------------------------------------------
 
+/// Whether this machine has a usable IPv6 loopback.
+///
+/// Decided with `std`, deliberately: the point is to skip only for a genuine
+/// platform limitation, using an instrument that cannot be broken by the code
+/// under test.
+fn ipv6_loopback_available() -> bool {
+    std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+}
+
 /// T17 — FR-028, M27. IPv6 end to end.
 #[test]
 fn an_ipv6_listener_round_trips() {
@@ -1158,13 +1344,15 @@ fn an_ipv6_listener_round_trips() {
     // It also makes the suite deterministic, which the flakiness gate needs.
     let _guard = winasio::net::socket_guard();
     let proactor = Rc::new(Proactor::new().expect("proactor"));
-    let listener = match TcpListener::bind(&proactor, v6_any()) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("skipping: no IPv6 loopback on this machine: {e}");
-            return;
-        }
-    };
+    // Only a machine genuinely without IPv6 may skip, and that is decided by
+    // `std`, independently of the code under test. Catching every bind error
+    // here would turn an address-conversion, `IPV6_V6ONLY`, registration or
+    // bind regression into a silent pass of the mandatory IPv6 coverage.
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: no IPv6 loopback on this machine");
+        return;
+    }
+    let listener = TcpListener::bind(&proactor, v6_any()).expect("bind v6");
     let addr = listener.local_addr();
     assert!(addr.is_ipv6());
 
@@ -1199,13 +1387,12 @@ fn a_dual_stack_listener_accepts_an_ipv4_client() {
     let mut options = TcpListenerOptions::new();
     options.only_v6(false);
     let unspecified = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-    let listener = match TcpListener::bind_with(&proactor, unspecified, &options) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("skipping: no dual-stack listener on this machine: {e}");
-            return;
-        }
-    };
+    if !ipv6_loopback_available() {
+        eprintln!("skipping: no IPv6 loopback on this machine");
+        return;
+    }
+    let listener =
+        TcpListener::bind_with(&proactor, unspecified, &options).expect("bind dual-stack");
     let port = listener.local_addr().port();
     let v4_target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
@@ -1236,7 +1423,8 @@ fn a_dual_stack_listener_accepts_an_ipv4_client() {
 /// deleting the option's plumbing entirely would leave this test passing. It
 /// checks that the option is accepted and does not break `bind`. The part that
 /// *is* falsifiable — that the requested value reaches `listen`, including the
-/// `i32::MAX` saturation — is a unit test in `net::listener`. A non-default backlog binds, listens and accepts.
+/// `i32::MAX` saturation — lives in the `backlog_argument` unit tests in
+/// `net::listener`, which is where it can actually be observed.
 #[test]
 fn a_custom_backlog_is_accepted() {
     // The socket and operation counters are process-global and cargo runs

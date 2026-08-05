@@ -22,7 +22,8 @@
 
 use std::task::Poll;
 
-use windows::core::Result;
+use windows::core::{Error, Result, HRESULT};
+use windows::Win32::Networking::WinSock::WSAENOTCONN;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use crate::iocp::{win32_result, IntoInner, OpCode};
@@ -72,9 +73,17 @@ impl ConnectSocket {
         match self.updated {
             Some(update) => update,
             // Unreachable in practice — the driver calls `on_complete` on every
-            // path that resolves an operation — but silently returning `Ok`
-            // here would mean shipping an unusable socket if that ever changed.
-            None => Ok(()),
+            // path that resolves an operation — but this arm exists precisely
+            // as insurance against that changing, and insurance that returns
+            // `Ok` pays out to the wrong party: the caller would get a
+            // `TcpStream` whose `peer_addr`, `shutdown` and socket options all
+            // misbehave, because `SO_UPDATE_CONNECT_CONTEXT` never ran.
+            //
+            // `AcceptSocket::finish` refuses in the same situation. The two
+            // must agree.
+            None => Err(Error::from_hresult(HRESULT::from_win32(
+                WSAENOTCONN.0 as u32,
+            ))),
         }
     }
 

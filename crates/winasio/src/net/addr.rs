@@ -150,8 +150,18 @@ pub(crate) unsafe fn decode_raw(ptr: *const SOCKADDR, len: i32) -> Option<Socket
             copy,
         );
     }
-    // SAFETY: `ptr` is readable for at least a `SOCKADDR`, checked above.
-    let family = unsafe { (*ptr).sa_family };
+    // Read the family from the *copy*, not from `ptr`.
+    //
+    // `ptr` points into the accept operation's `Box<[u8; N]>`, whose Rust-level
+    // alignment is 1. `SOCKADDR` wants 2. Windows in practice hands back a
+    // well-aligned address, but "in practice" is not what the abstract machine
+    // asks for, and a dereference through an underaligned pointer is undefined
+    // behaviour whatever the hardware does. `storage` is a properly aligned
+    // local, which is exactly why it was copied into.
+    //
+    // SAFETY: `storage` is a live, aligned `SOCKADDR_STORAGE` whose leading
+    // bytes were just filled from `ptr`; `SOCKADDR` is a prefix of it.
+    let family = unsafe { std::ptr::addr_of!(storage).cast::<SOCKADDR>().read() }.sa_family;
     decode(&storage, family)
 }
 

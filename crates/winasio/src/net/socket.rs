@@ -39,7 +39,7 @@ use windows::Win32::Networking::WinSock::{
     bind, closesocket, getpeername, getsockname, listen, setsockopt, shutdown, WSASocketW,
     ADDRESS_FAMILY, INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SD_BOTH, SD_RECEIVE,
     SD_SEND, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    WSAEAFNOSUPPORT, WSA_FLAG_OVERLAPPED,
+    WSAEAFNOSUPPORT, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 
 use super::addr::SockAddrBytes;
@@ -132,6 +132,12 @@ impl Socket {
     /// Create an overlapped TCP socket of the given family.
     pub(crate) fn new_overlapped(family: ADDRESS_FAMILY) -> Result<Socket> {
         ensure_winsock()?;
+        // `WSA_FLAG_NO_HANDLE_INHERIT` alongside the overlapped flag: without
+        // it a child process spawned while a connection is open inherits the
+        // socket, and the connection then stays half-alive until that child
+        // exits — the peer never sees FIN and the port is not released.
+        // `std::net` sets the equivalent for the same reason.
+        //
         // SAFETY: a plain socket creation with no provider info; the returned
         // socket is owned solely by this call.
         let raw = unsafe {
@@ -141,7 +147,7 @@ impl Socket {
                 IPPROTO_TCP.0,
                 None,
                 0,
-                WSA_FLAG_OVERLAPPED,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
             )
         }?;
         // SAFETY: `WSASocketW` returned a socket owned by this frame and

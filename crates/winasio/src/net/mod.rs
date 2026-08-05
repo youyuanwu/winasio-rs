@@ -36,6 +36,18 @@
 //!   A caller-driven stream requests cancellation and returns without driving
 //!   the proactor; the caller must keep polling their proactor until the
 //!   outstanding records are reclaimed.
+//! * **A clean end of stream and a lost connection are different results.**
+//!   [`ReadOutcome::ClosedPeer`] means the peer sent FIN: the stream ended and
+//!   you have all of it. A connection that is *reset* resolves the read as an
+//!   `Err` instead, never as `ClosedPeer`, and the whole-payload helpers
+//!   ([`TcpStream::read_to_end`], [`read_exact`](TcpStream::read_exact)) fail
+//!   rather than returning what they managed to collect. This distinction is
+//!   deliberate and is the one thing in this module worth reading twice: the
+//!   alternative is a `read_to_end` that returns `Ok` with a silently
+//!   truncated buffer, which the caller has no way to detect. To act on the
+//!   difference, classify the error with
+//!   [`SocketError::from_win32`] — `read` and `write` resolve to a raw
+//!   [`windows::core::Error`], the same as files and pipes.
 //! * **Closing is not graceful, and this differs from `fs` and `pipe`.**
 //!   Dropping a [`TcpStream`] calls `closesocket`, which is an abrupt close.
 //!   A file or a pipe has no equivalent of a half-open connection, so their
