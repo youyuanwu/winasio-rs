@@ -325,8 +325,8 @@ fn unsupported_family() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Networking::WinSock::AF_INET6;
     use windows::Win32::Networking::WinSock::AF_INET;
+    use windows::Win32::Networking::WinSock::AF_INET6;
 
     fn is_send_sync<T: Send + Sync>() {}
 

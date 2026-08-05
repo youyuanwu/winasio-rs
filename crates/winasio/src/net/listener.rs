@@ -17,35 +17,55 @@ use super::socket::Socket;
 use super::stream::TcpStream;
 
 /// Options for [`TcpListener::bind_with`].
+///
+/// Fields are private with setter methods, matching
+/// [`crate::pipe::ServerOptions`]: a new option can then be added without
+/// breaking callers who constructed this by hand.
 #[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
 pub struct TcpListenerOptions {
-    /// The `listen` backlog.
+    backlog: u32,
+    only_v6: bool,
+}
+
+impl TcpListenerOptions {
+    /// Options matching the platform defaults.
+    pub fn new() -> Self {
+        TcpListenerOptions {
+            // The conventional "as much as the system allows" value; Windows
+            // clamps it to the provider's maximum.
+            backlog: 128,
+            // Matches the Windows default, so `new` changes nothing about how a
+            // v6 listener behaves.
+            only_v6: true,
+        }
+    }
+
+    /// Set the `listen` backlog.
     ///
-    /// Saturated into the platform's `i32` rather than truncated: a caller who
-    /// asks for more than the platform can express should get the largest
+    /// Saturated into the platform's `i32` rather than truncated: a caller
+    /// asking for more than the platform can express should get the largest
     /// backlog available, not a wrapped-around small one.
-    pub backlog: u32,
-    /// Whether an IPv6 listener refuses IPv4 connections.
+    pub fn backlog(&mut self, backlog: u32) -> &mut Self {
+        self.backlog = backlog;
+        self
+    }
+
+    /// Set whether an IPv6 listener refuses IPv4 connections.
     ///
     /// Windows defaults this to `true`. Clearing it makes the listener
     /// dual-stack, and IPv4 peers are then reported as v4-mapped
     /// [`SocketAddr::V6`] — see the [module docs](super).
     ///
-    /// Ignored for IPv4 listeners.
-    pub only_v6: bool,
+    /// Ignored for an IPv4 listener.
+    pub fn only_v6(&mut self, only_v6: bool) -> &mut Self {
+        self.only_v6 = only_v6;
+        self
+    }
 }
 
 impl Default for TcpListenerOptions {
     fn default() -> Self {
-        TcpListenerOptions {
-            // The conventional "as much as the system allows" value; Windows
-            // clamps it to the provider's maximum.
-            backlog: 128,
-            // Matches the platform default, so `Default` changes nothing about
-            // how a v6 listener behaves.
-            only_v6: true,
-        }
+        TcpListenerOptions::new()
     }
 }
 
@@ -77,14 +97,14 @@ pub struct TcpListener<R: Registrar + Clone> {
 impl<R: Registrar + Clone> TcpListener<R> {
     /// Bind and listen on `addr` with the default options.
     pub fn bind(registrar: &R, addr: SocketAddr) -> Result<Self, SocketError> {
-        Self::bind_with(registrar, addr, TcpListenerOptions::default())
+        Self::bind_with(registrar, addr, &TcpListenerOptions::new())
     }
 
     /// Bind and listen on `addr`.
     pub fn bind_with(
         registrar: &R,
         addr: SocketAddr,
-        options: TcpListenerOptions,
+        options: &TcpListenerOptions,
     ) -> Result<Self, SocketError> {
         let socket = Socket::new_overlapped(family_of(&addr)).map_err(SocketError::from_win32)?;
 
