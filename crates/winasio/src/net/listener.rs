@@ -76,9 +76,10 @@ impl Default for TcpListenerOptions {
 /// submitted on it. See the [module docs](super) for why the two socket types
 /// differ in this.
 ///
-/// `Clone` is required on `R` because each accepted [`TcpStream`] takes its own
-/// submitter; [`Registrar`] does not require `Clone` itself, so the bound is
-/// stated here.
+/// `Clone` is required on `R` because the listener keeps a clone of the
+/// registrar for its whole life, so that every later accept can register its
+/// socket with the same backend. [`Registrar`] does not require `Clone`
+/// itself, so the bound is stated here.
 ///
 /// **Field order is load-bearing.** Fields drop in declaration order, and the
 /// submitter's drop cancels and drains outstanding I/O on the listening socket
@@ -122,7 +123,7 @@ impl<R: Registrar + Clone> TcpListener<R> {
 
         socket.bind_to(addr).map_err(SocketError::from_win32)?;
         socket
-            .listen_on(options.backlog.min(i32::MAX as u32) as i32)
+            .listen_on(backlog_argument(options.backlog))
             .map_err(SocketError::from_win32)?;
 
         let local = socket.local_addr().map_err(SocketError::from_win32)?;
@@ -195,5 +196,47 @@ impl<R: Registrar + Clone> Drop for TcpListener<R> {
         // The submitter and the registrar are then dropped by field order,
         // before the socket. See the note on the struct.
         let _ = self.socket.cancel_all();
+    }
+}
+
+/// The `listen` argument for a requested backlog.
+///
+/// `listen` takes an `i32`; the option is a `u32` so that callers need not
+/// think about the signedness of a queue length. Saturating rather than
+/// wrapping matters: `as i32` alone would turn a large request into a negative
+/// number, and a negative backlog is not an error — Winsock reinterprets it,
+/// so an oversized request would silently become a small queue.
+fn backlog_argument(requested: u32) -> i32 {
+    requested.min(i32::MAX as u32) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_requested_backlog_reaches_listen_unchanged() {
+        assert_eq!(backlog_argument(0), 0);
+        assert_eq!(backlog_argument(4), 4);
+        assert_eq!(backlog_argument(TcpListenerOptions::new().backlog), 128);
+    }
+
+    #[test]
+    fn an_oversized_backlog_saturates_rather_than_going_negative() {
+        assert_eq!(backlog_argument(i32::MAX as u32), i32::MAX);
+        assert_eq!(backlog_argument(u32::MAX), i32::MAX);
+        assert!(
+            backlog_argument(u32::MAX) > 0,
+            "a wrapped backlog would be negative, which Winsock silently \
+             reinterprets instead of rejecting"
+        );
+    }
+
+    #[test]
+    fn the_builder_records_what_it_was_given() {
+        let mut options = TcpListenerOptions::new();
+        options.backlog(4).only_v6(false);
+        assert_eq!(options.backlog, 4);
+        assert!(!options.only_v6);
     }
 }

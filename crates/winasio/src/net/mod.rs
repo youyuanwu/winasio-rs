@@ -115,8 +115,11 @@
 //!     match outcome? {
 //!         ReadOutcome::ClosedPeer => break,
 //!         ReadOutcome::Bytes(n) => {
-//!             let OpResult(written, _) = stream.write(buf[..n].to_vec()).await;
-//!             written?;
+//!             // `write_all`, not `write`: a single write may transfer fewer
+//!             // bytes than it was given, and an echo that drops the rest is
+//!             // not an echo.
+//!             let (sent, _, _) = stream.write_all(buf[..n].to_vec()).await.into_parts();
+//!             sent?;
 //!         }
 //!         other => panic!("a socket cannot report {other:?}"),
 //!     }

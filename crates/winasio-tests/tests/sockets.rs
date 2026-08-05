@@ -18,8 +18,10 @@
 
 mod common;
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use winasio::iocp::{OpResult, Proactor, ThreadPool};
@@ -250,10 +252,14 @@ fn peer_and_local_addresses_are_reported() {
     let listener = TcpListener::bind(&proactor, v4_any()).expect("bind");
     let listen_addr = listener.local_addr();
 
-    // Both sides are asynchronous and neither can finish alone: the connect
-    // needs the accept and vice versa. They therefore run on two proactors,
-    // polled alternately, with each future dropped as soon as it resolves — a
-    // completed future must not be polled again.
+    // Two proactors, polled alternately, with each future dropped as soon as it
+    // resolves — a completed future must not be polled again.
+    //
+    // Not because the handshake needs both sides running: TCP completes it into
+    // the listener's backlog whether or not anything is accepting. It is that
+    // each proactor only makes progress when *its* owner polls it, so a single
+    // caller awaiting the connect to completion first would never drive the
+    // accept, and vice versa.
     let connector = Rc::new(Proactor::new().expect("connector proactor"));
     let mut connecting = Box::pin(TcpStream::connect(&connector, listen_addr));
     let mut accepting = Box::pin(listener.accept());
@@ -327,13 +333,31 @@ fn concurrent_accepts_all_complete_on_own_port() {
     let listener = TcpListener::bind(&proactor, v4_any()).expect("bind");
     let addr = listener.local_addr();
 
+    // Constructing the futures starts nothing — `accept` is an `async fn`, so no
+    // socket exists and no `AcceptEx` is issued until the first poll.
+    let baseline = winasio::iocp::live_operations();
+    let mut pending: Vec<_> = (0..N).map(|_| Box::pin(listener.accept())).collect();
+
+    // Post all eight *before* any client connects, so none of them can resolve
+    // yet and the in-flight count is unambiguous. This is the assertion the
+    // test turns on: an implementation that could hold only one accept at a
+    // time would read 1 here. Without it the test would pass just as happily on
+    // eight sequential accepts.
+    for fut in pending.iter_mut() {
+        assert!(
+            poll_once(&proactor, fut.as_mut()).is_none(),
+            "no client has connected, so no accept can resolve"
+        );
+    }
+    assert_eq!(
+        winasio::iocp::live_operations() - baseline,
+        N,
+        "all {N} accepts must be in flight at once"
+    );
+
     let clients =
         std::thread::spawn(move || (0..N).map(|_| client::connect(addr)).collect::<Vec<_>>());
 
-    // All eight accepts are started before any of them is awaited, which is the
-    // point: a listener that could only have one accept in flight would
-    // deadlock here rather than merely being slow.
-    let mut pending: Vec<_> = (0..N).map(|_| Box::pin(listener.accept())).collect();
     let mut done = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !pending.is_empty() {
@@ -371,19 +395,57 @@ fn concurrent_accepts_all_complete_on_thread_pool() {
     let listener = TcpListener::bind(&ThreadPool, v4_any()).expect("bind");
     let addr = listener.local_addr();
 
+    // `accept` is an `async fn`, so these futures are inert until polled:
+    // awaiting them one at a time would submit the second `AcceptEx` only after
+    // the first had resolved, and a listener that could hold just one accept in
+    // flight would pass. They are therefore all polled once, with no client yet
+    // connected — so none can resolve — and the in-flight count is checked
+    // before anything is allowed to complete.
+    let baseline = winasio::iocp::live_operations();
+    let mut pending: Vec<_> = (0..N).map(|_| Box::pin(listener.accept())).collect();
+    common::block_on(std::future::poll_fn(|cx| {
+        for fut in pending.iter_mut() {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "no client has connected, so no accept can resolve"
+            );
+        }
+        Poll::Ready(())
+    }));
+    assert_eq!(
+        winasio::iocp::live_operations() - baseline,
+        N,
+        "all {N} accepts must be in flight at once"
+    );
+
     let clients =
         std::thread::spawn(move || (0..N).map(|_| client::connect(addr)).collect::<Vec<_>>());
 
     let accepted = common::block_on(async {
-        let futures: Vec<_> = (0..N).map(|_| listener.accept()).collect();
         let mut out = Vec::new();
-        for fut in futures {
-            out.push(fut.await.expect("accept"));
-        }
+        std::future::poll_fn(|cx| {
+            pending.retain_mut(|fut| match fut.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    out.push(result.expect("accept"));
+                    false
+                }
+                Poll::Pending => true,
+            });
+            if pending.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
         out
     });
 
     assert_eq!(accepted.len(), N);
+    let mut ports: Vec<u16> = accepted.iter().map(|(_, peer)| peer.port()).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    assert_eq!(ports.len(), N, "each accept must yield a distinct peer");
     drop(clients.join().expect("client thread"));
 }
 
@@ -605,7 +667,16 @@ fn an_inline_send_queues_no_completion_packet() {
 
     // A small send on a fresh connection completes inline: it fits in the
     // socket's send buffer and never has to wait for the network.
-    let OpResult(written, _) = drive_proactor(&proactor, stream.write(b"ping".to_vec()));
+    //
+    // That it *did* complete inline is asserted, not assumed. `write` submits
+    // eagerly, so one poll resolving proves the inline path was taken. Without
+    // this guard the test would still pass if the send went pending — the
+    // packet would be claimed by the normal path, leaving `unclaimed` and
+    // `pending_count` at zero — which is precisely the "passes for the wrong
+    // reason forever" failure the rest of this test exists to avoid.
+    let mut writing = Box::pin(stream.write(b"ping".to_vec()));
+    let OpResult(written, _) = poll_once(&proactor, writing.as_mut())
+        .expect("a 4-byte send on a fresh connection must complete inline");
     assert_eq!(written.expect("write"), 4);
 
     // Give a packet, if one were queued, every chance to arrive.
@@ -854,10 +925,12 @@ fn write_all_and_read_exact_move_a_large_payload_on_own_port() {
     let expected = payload.clone();
 
     let handle = std::thread::spawn(move || {
-        use std::io::Read;
+        use std::io::{Read, Write};
         let mut c = client::connect(addr);
         let mut buf = vec![0u8; BIG];
         c.read_exact(&mut buf).expect("client reads the payload");
+        c.write_all(&buf).expect("client echoes the payload");
+        c.flush().expect("flush");
         buf
     });
 
@@ -866,6 +939,15 @@ fn write_all_and_read_exact_move_a_large_payload_on_own_port() {
     let (outcome, _, transferred) = result.into_parts();
     outcome.expect("write_all");
     assert_eq!(transferred, BIG);
+
+    // Read the echo back, so `read_exact` is exercised on this backend too.
+    // Both helpers are resubmission loops and the two backends deliver
+    // completions differently, which is exactly where a loop breaks.
+    let result = drive_proactor(&proactor, stream.read_exact(vec![0u8; BIG]));
+    let (outcome, buffer, transferred) = result.into_parts();
+    outcome.expect("read_exact");
+    assert_eq!(transferred, BIG);
+    assert_eq!(buffer, expected);
 
     assert_eq!(handle.join().expect("client thread"), expected);
 }
@@ -884,10 +966,13 @@ fn write_all_and_read_exact_move_a_large_payload_on_thread_pool() {
     let expected = payload.clone();
 
     let handle = std::thread::spawn(move || {
-        use std::io::Write;
+        use std::io::{Read, Write};
         let mut c = client::connect(addr);
         c.write_all(&payload).expect("client writes the payload");
         c.flush().expect("flush");
+        let mut echoed = vec![0u8; BIG];
+        c.read_exact(&mut echoed).expect("client reads the echo");
+        echoed
     });
 
     let (stream, _) = common::block_on(listener.accept()).expect("accept");
@@ -897,7 +982,13 @@ fn write_all_and_read_exact_move_a_large_payload_on_thread_pool() {
     assert_eq!(transferred, BIG);
     assert_eq!(buffer, expected);
 
-    handle.join().expect("client thread");
+    // Echo it back, so `write_all` is exercised on this backend too.
+    let result = common::block_on(stream.write_all(buffer));
+    let (outcome, _, transferred) = result.into_parts();
+    outcome.expect("write_all");
+    assert_eq!(transferred, BIG);
+
+    assert_eq!(handle.join().expect("client thread"), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1066,84 @@ fn a_dropped_write_future_returns_no_buffer_and_leaks_nothing() {
     }
 
     drop(handle.join().expect("client thread"));
+}
+
+/// T15 — FR-017, the read half, on the system thread pool.
+///
+/// Worth having separately from the own-port variant rather than assumed from
+/// it: drop-time teardown is the largest behavioural difference between the two
+/// backends. The thread pool's registration drop cancels and then waits for
+/// callbacks to drain, while the proactor's returns immediately and leaves the
+/// draining to the caller's `poll`. A leak that only the pool exhibits would be
+/// invisible to the test above.
+#[test]
+fn a_dropped_read_future_returns_no_buffer_and_leaks_nothing_on_thread_pool() {
+    // The socket and operation counters are process-global and cargo runs
+    // these tests concurrently, so the whole binary serialises on one lock.
+    // It also makes the suite deterministic, which the flakiness gate needs.
+    let _guard = winasio::net::socket_guard();
+    let listener = TcpListener::bind(&ThreadPool, v4_any()).expect("bind");
+    let addr = listener.local_addr();
+
+    let handle = std::thread::spawn(move || client::connect(addr));
+    let (stream, _) = common::block_on(listener.accept()).expect("accept");
+
+    let baseline = winasio::iocp::live_operations();
+    {
+        // The peer sends nothing, so this read cannot resolve.
+        let mut reading = Box::pin(stream.read(vec![0u8; 64]));
+        let polled = common::block_on(std::future::poll_fn(|cx| {
+            Poll::Ready(reading.as_mut().poll(cx).is_ready())
+        }));
+        assert!(!polled, "a read with no data available must not resolve");
+    }
+
+    await_operations_drained(baseline, "read");
+    drop(handle.join().expect("client thread"));
+}
+
+/// T16 — FR-017, the write half, on the system thread pool.
+#[test]
+fn a_dropped_write_future_returns_no_buffer_and_leaks_nothing_on_thread_pool() {
+    // The socket and operation counters are process-global and cargo runs
+    // these tests concurrently, so the whole binary serialises on one lock.
+    // It also makes the suite deterministic, which the flakiness gate needs.
+    let _guard = winasio::net::socket_guard();
+    let listener = TcpListener::bind(&ThreadPool, v4_any()).expect("bind");
+    let addr = listener.local_addr();
+
+    let handle = std::thread::spawn(move || client::connect(addr));
+    let (stream, _) = common::block_on(listener.accept()).expect("accept");
+
+    let baseline = winasio::iocp::live_operations();
+    {
+        let mut writing = Box::pin(stream.write(vec![0u8; 8 * 1024 * 1024]));
+        // It may or may not complete inline depending on buffer sizes; if it
+        // does, there is nothing to leak and the wait below is a no-op.
+        let _ = common::block_on(std::future::poll_fn(|cx| {
+            Poll::Ready(writing.as_mut().poll(cx).is_ready())
+        }));
+    }
+
+    await_operations_drained(baseline, "write");
+    drop(handle.join().expect("client thread"));
+}
+
+/// Wait for the operation count to fall back to `baseline`.
+///
+/// Nothing is driven here: on the thread pool the cancellation callback runs on
+/// a pool thread, so the test only has to wait for it. A leak shows up as the
+/// count never coming back down.
+fn await_operations_drained(baseline: usize, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while winasio::iocp::live_operations() > baseline {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a dropped {what} leaked {} operations",
+            winasio::iocp::live_operations() - baseline
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,7 +1228,15 @@ fn a_dual_stack_listener_accepts_an_ipv4_client() {
 // T19 / T20
 // ---------------------------------------------------------------------------
 
-/// T19 — FR-002. A non-default backlog binds, listens and accepts.
+/// T19 — FR-002, smoke only.
+///
+/// Deliberately weak, and labelled so. Windows clamps and rounds the backlog
+/// inside the provider, and exposes no way to read back the value it settled
+/// on, so nothing observable here distinguishes `backlog(4)` from the default:
+/// deleting the option's plumbing entirely would leave this test passing. It
+/// checks that the option is accepted and does not break `bind`. The part that
+/// *is* falsifiable — that the requested value reaches `listen`, including the
+/// `i32::MAX` saturation — is a unit test in `net::listener`. A non-default backlog binds, listens and accepts.
 #[test]
 fn a_custom_backlog_is_accepted() {
     // The socket and operation counters are process-global and cargo runs
