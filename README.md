@@ -120,6 +120,34 @@ assert_eq!(read?, ReadOutcome::Bytes(payload.len()));
 assert_eq!(&buf, b"ping");
 ```
 
+# Net
+Asynchronous TCP on top of the same completion machinery: `TcpListener` accepts
+with `AcceptEx`, `TcpStream` connects with `ConnectEx` and transfers with
+`WSARecv`/`WSASend`. Both are generic over the backend, so the same code runs on
+an owned `Proactor` or on the system thread pool.
+
+Closing is abrupt, unlike a file or a pipe, because a socket is the only one of
+the three with a half-open state worth distinguishing. Call `shutdown` if the
+peer needs to tell "done sending" from "gone".
+
+```rs
+let listener = TcpListener::bind(&ThreadPool, "127.0.0.1:0".parse()?)?;
+let addr = listener.local_addr();
+
+let client = TcpStream::connect(&ThreadPool, addr).await?;
+let (server, _peer) = listener.accept().await?;
+
+let OpResult(written, _) = client.write(b"ping".to_vec()).await;
+written?;
+
+let OpResult(read, buf) = server.read(vec![0u8; 4]).await;
+assert_eq!(read?, ReadOutcome::Bytes(4));
+assert_eq!(&buf, b"ping");
+```
+
+UDP, `WSARecvFrom`/`WSASendTo`, `WSARecvMsg`, `TransmitFile` and vectored I/O
+are out of scope.
+
 # Winhttp
 Winhttp in async mode with rust async await wrapper.
 Example snippit:

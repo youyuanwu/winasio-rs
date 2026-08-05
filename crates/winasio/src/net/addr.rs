@@ -286,6 +286,8 @@ mod tests {
         // Getting this wrong is silent: the round trip would still pass if both
         // directions were byte-swapped. Check the wire bytes directly.
         let encoded = SockAddrBytes::from_socket_addr("127.0.0.1:8080".parse().unwrap());
+        // SAFETY: `from_socket_addr` wrote a `SOCKADDR_IN`, whose `sin_port`
+        // occupies bytes 2..4 of the storage; both reads are in bounds.
         let bytes: [u8; 2] = unsafe {
             let p = encoded.as_ptr().cast::<u8>().add(2);
             [*p, *p.add(1)]
