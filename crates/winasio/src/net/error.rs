@@ -30,8 +30,8 @@
 use windows::core::Error;
 use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_CONNECTION_ABORTED, ERROR_CONNECTION_REFUSED,
-    ERROR_CONNECTION_UNAVAIL, ERROR_HOST_UNREACHABLE, ERROR_NETNAME_DELETED,
-    ERROR_NETWORK_UNREACHABLE, ERROR_OPERATION_ABORTED, ERROR_SEM_TIMEOUT, ERROR_UNEXP_NET_ERR,
+    ERROR_HOST_UNREACHABLE, ERROR_NETNAME_DELETED, ERROR_NETWORK_UNREACHABLE,
+    ERROR_OPERATION_ABORTED, ERROR_SEM_TIMEOUT, ERROR_UNEXP_NET_ERR,
 };
 use windows::Win32::Networking::WinSock::{
     WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET,
@@ -136,11 +136,6 @@ impl SocketError {
             // Cancellation. Only ever arrives on the completion path — the
             // packet a cancelled operation still delivers.
             c if c == ERROR_OPERATION_ABORTED.0 as i32 => SocketError::Cancelled,
-
-            // `WSAECONNUNAVAIL` has no Winsock spelling in scope; the Win32
-            // side is a plausible packet code for a refused connection on some
-            // providers, so it is classified rather than left opaque.
-            c if c == ERROR_CONNECTION_UNAVAIL.0 as i32 => SocketError::Unreachable,
 
             _ => SocketError::Win32(err),
         }

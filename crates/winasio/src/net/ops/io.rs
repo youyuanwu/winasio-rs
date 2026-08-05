@@ -77,6 +77,13 @@ pub(crate) struct RecvSocket<B: IoBufMut> {
     /// Load-bearing, not decoration: the classifier cannot tell a graceful
     /// close from a caller who passed an empty buffer without it.
     requested: usize,
+    /// The in/out flags slot `WSARecv` is given.
+    ///
+    /// It lives here for the same reason `wsabuf` does. `WSARecv` documents
+    /// this as an in/out parameter, and for a pending overlapped receive the
+    /// kernel may write to it after `operate` has returned — at which point a
+    /// stack slot would be someone else's frame.
+    flags: u32,
     outcome: Option<ReadOutcome>,
 }
 
@@ -87,6 +94,7 @@ impl<B: IoBufMut> RecvSocket<B> {
             buffer,
             wsabuf: OwnedWsaBuf::zeroed(),
             requested: 0,
+            flags: 0,
             outcome: None,
         }
     }
@@ -138,17 +146,19 @@ unsafe impl<B: IoBufMut + Send> OpCode for RecvSocket<B> {
             buf: PSTR(slice.as_mut_ptr().cast::<u8>()),
         });
 
-        let mut flags = 0u32;
-        // SAFETY: the descriptor and the storage it points at are owned by this
-        // operation, whose allocation is retained until completion. `None` for
-        // the count is measured-safe (M24); the count is recovered from
+        self.flags = 0;
+        // SAFETY: the descriptor, the storage it points at and the flags slot
+        // are all owned by this operation, whose allocation is retained until
+        // completion — nothing here is borrowed from `operate`'s frame, which
+        // is gone by the time a pending `WSARecv` completes. `None` for the
+        // count is measured-safe (M24); the count is recovered from
         // `InternalHigh` by `win32_result`, or from the completion packet.
         let started = unsafe {
             WSARecv(
                 self.socket.raw(),
                 std::slice::from_mut(&mut self.wsabuf.0),
                 None,
-                &mut flags,
+                &mut self.flags,
                 Some(optr),
                 None,
             )

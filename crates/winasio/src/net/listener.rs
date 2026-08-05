@@ -79,13 +79,21 @@ impl Default for TcpListenerOptions {
 /// `Clone` is required on `R` because each accepted [`TcpStream`] takes its own
 /// submitter; [`Registrar`] does not require `Clone` itself, so the bound is
 /// stated here.
+///
+/// **Field order is load-bearing.** Fields drop in declaration order, and the
+/// submitter's drop cancels and drains outstanding I/O on the listening socket
+/// — so it has to run while that socket is still open. Closing first would
+/// leave the drain calling `CancelIoEx` on a descriptor the system is free to
+/// have handed to someone else. `TcpStream` states the same order explicitly in
+/// its `Drop`; here the declaration order is the statement, hence this note.
 pub struct TcpListener<R: Registrar + Clone> {
-    socket: Socket,
     /// The listener's own submitter, from registering the listening socket.
+    /// Declared first so it is dropped first. See above.
     io: R::Io,
     /// Kept so each accepted socket can be registered with the same backend.
     /// This is the reason the type is registrar-generic at all.
     registrar: R,
+    socket: Socket,
     /// The bound address, cached at construction.
     ///
     /// Not just a convenience: the family it names decides what family each
@@ -173,5 +181,19 @@ impl<R: Registrar + Clone> TcpListener<R> {
         let io = self.registrar.register(parts.socket.as_handle())?;
 
         Ok((TcpStream::from_parts(parts.socket, io), parts.peer))
+    }
+}
+
+impl<R: Registrar + Clone> Drop for TcpListener<R> {
+    fn drop(&mut self) {
+        // Ask the kernel to abandon any accept still in flight before the
+        // submitter goes away, exactly as `TcpStream::drop` does. The socket is
+        // not closed here: the `Socket` clones held by in-flight accepts keep
+        // it alive until their completions arrive, which is what stops a late
+        // completion naming a recycled socket.
+        //
+        // The submitter and the registrar are then dropped by field order,
+        // before the socket. See the note on the struct.
+        let _ = self.socket.cancel_all();
     }
 }

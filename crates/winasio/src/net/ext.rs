@@ -80,16 +80,6 @@ pub(crate) struct Extensions {
     pub(crate) get_accept_ex_sockaddrs: GetAcceptExSockaddrsFn,
 }
 
-// SAFETY: the fields are `Option<unsafe extern "system" fn(..)>` — plain code
-// pointers into a loaded provider DLL, with no interior state. They are valid
-// on every thread for the life of the process, which is exactly what `Sync`
-// asserts. `windows` does not derive these on the `LPFN_*` aliases because a
-// function pointer's thread-safety depends on what it points at; here it points
-// at a Winsock provider entry point, which is reentrant by contract.
-unsafe impl Send for Extensions {}
-// SAFETY: as above.
-unsafe impl Sync for Extensions {}
-
 static EXTENSIONS: OnceLock<Extensions> = OnceLock::new();
 
 /// The process-wide extension function table, resolving it on first use.
