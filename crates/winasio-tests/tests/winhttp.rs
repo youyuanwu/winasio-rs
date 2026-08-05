@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use windows::core::HSTRING;
 
-use winasio::iocp::OpResult;
+use winasio::iocp::{IoBuf, OpResult};
 use winasio::winhttp::{
     encode_headers, live_context_count, CertificateRelaxations, Session, WinHttpError,
 };
@@ -189,7 +189,7 @@ fn get(server: &Server, path: &str) -> (u32, String, Vec<u8>) {
         .unwrap();
 
     futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
 
         let status = request.status_code().unwrap();
@@ -253,7 +253,7 @@ fn a_header_the_server_sent_is_returned_by_name() {
         .unwrap();
 
     futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
     });
 
@@ -279,7 +279,7 @@ fn an_absent_header_is_none_rather_than_an_error() {
         .unwrap();
 
     futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
     });
 
@@ -313,7 +313,7 @@ fn query_data_available_reports_zero_exactly_once_at_the_end_of_the_body() {
         .unwrap();
 
     let (body, zeros) = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
 
         let mut body = Vec::new();
@@ -357,8 +357,10 @@ fn a_request_body_reaches_the_server_through_send_and_write_data() {
 
     futures::executor::block_on(async {
         // Send with no inline body, declaring the total length, then stream it.
-        let OpResult(sent, _) = request.send(Some(headers), Vec::new(), total).await;
-        sent.unwrap();
+        request
+            .send(Some(headers), Vec::new(), total)
+            .await
+            .unwrap();
 
         let OpResult(written, buffer) = request.write_data(first).await;
         assert_eq!(written.unwrap(), buffer.len());
@@ -383,9 +385,37 @@ fn a_request_body_reaches_the_server_through_send_and_write_data() {
 }
 
 #[test]
-fn a_send_returns_its_body_buffer_on_success() {
-    // The buffer comes back on every path, so a caller can reuse it. Losing it
-    // silently is the defect the owned-buffer discipline exists to prevent.
+fn a_send_body_is_held_until_the_response_is_received_not_until_the_send_completes() {
+    // WinHTTP may re-read `lpOptional` after the send completes — to follow a
+    // redirect, or to replay the request against an authentication challenge —
+    // so the body must outlive `send`. This test watches the body's destructor
+    // to prove it does: the flag must still be clear once the send has
+    // completed, and set only after the response has been received.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TrackedBody {
+        bytes: Vec<u8>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    // SAFETY: `stable_ptr` returns the `Vec`'s heap allocation, which does not
+    // move when the `TrackedBody` value is moved, and `bytes_init` is that
+    // allocation's initialised length.
+    unsafe impl IoBuf for TrackedBody {
+        fn stable_ptr(&self) -> *const u8 {
+            self.bytes.as_ptr()
+        }
+        fn bytes_init(&self) -> usize {
+            self.bytes.len()
+        }
+    }
+
+    impl Drop for TrackedBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
     let server = spawn_server(ServerMode::Respond, "ok");
     let session = Session::new(&agent()).unwrap();
     let connection = session.connect(&server.host(), server.port).unwrap();
@@ -393,16 +423,28 @@ fn a_send_returns_its_body_buffer_on_success() {
         .open_request(&HSTRING::from("POST"), &HSTRING::from("/"), &[], false)
         .unwrap();
 
-    let body = b"payload".to_vec();
-    let length = body.len() as u32;
-    let returned = futures::executor::block_on(async {
-        let OpResult(result, returned) = request.send(None, body, length).await;
-        result.unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let body = TrackedBody {
+        bytes: b"payload".to_vec(),
+        dropped: Arc::clone(&dropped),
+    };
+    let length = body.bytes.len() as u32;
+
+    futures::executor::block_on(async {
+        request.send(None, body, length).await.unwrap();
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the body must still be alive after the send completes, because \
+             WinHTTP may re-send it before the response is received"
+        );
+
         request.receive_response().await.unwrap();
-        returned
     });
 
-    assert_eq!(returned, b"payload");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the body should be released once the response has been received"
+    );
     assert!(server.first_request().ends_with("payload"));
 }
 
@@ -419,7 +461,7 @@ fn a_zero_capacity_read_is_refused_rather_than_reported_as_end_of_body() {
         .unwrap();
 
     let result = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
         let OpResult(result, buffer) = request.read_data(Vec::<u8>::new()).await;
         // The buffer is returned even though nothing was submitted.
@@ -448,7 +490,7 @@ fn a_receive_deadline_that_elapses_is_an_error_not_an_empty_body() {
         .unwrap();
 
     let outcome = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0?;
+        request.send(None, Vec::new(), 0).await?;
         request.receive_response().await
     });
 
@@ -467,7 +509,7 @@ fn a_server_that_closes_without_answering_is_an_error_not_an_empty_body() {
         .unwrap();
 
     let outcome = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0?;
+        request.send(None, Vec::new(), 0).await?;
         request.receive_response().await
     });
 
@@ -497,7 +539,7 @@ fn a_second_operation_started_behind_an_abandoned_one_is_refused() {
         .unwrap();
 
     let error = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
 
         // Poll a read once, so it is genuinely submitted, then drop it.
@@ -585,7 +627,7 @@ fn a_request_keeps_working_after_its_session_and_connection_values_are_dropped()
     };
 
     let body = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0.unwrap();
+        request.send(None, Vec::new(), 0).await.unwrap();
         request.receive_response().await.unwrap();
         let available = request.query_data_available().await.unwrap();
         let OpResult(read, chunk) = request
@@ -617,7 +659,7 @@ fn a_secure_request_to_a_server_speaking_plain_http_fails() {
         })
         .unwrap();
 
-    let outcome = futures::executor::block_on(async { request.send(None, Vec::new(), 0).await.0 });
+    let outcome = futures::executor::block_on(async { request.send(None, Vec::new(), 0).await });
     assert!(
         outcome.is_err(),
         "TLS to a plain-HTTP listener must not succeed"
@@ -694,7 +736,7 @@ fn the_documented_example_fetches_a_body() -> Result<(), windows::core::Error> {
         connection.open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)?;
 
     let body = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0?;
+        request.send(None, Vec::new(), 0).await?;
         request.receive_response().await?;
         let status = request.status_code()?;
         assert_eq!(status, 200);

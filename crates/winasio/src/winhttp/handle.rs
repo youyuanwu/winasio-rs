@@ -24,9 +24,25 @@ pub(crate) struct Handle(*mut c_void);
 unsafe impl Send for Handle {}
 
 // SAFETY: as above, and additionally every method reachable through a `&Handle`
-// only reads the pointer and passes it to a WinHTTP function. WinHTTP
-// serialises its own access to the handle — a second transfer submitted while
-// one is outstanding is refused with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`
+// only reads the pointer and passes it to a WinHTTP function. The complete set
+// of such methods is small and each is safe to call concurrently:
+//
+// * `Session::connect` and `Connection::open_request` derive a new handle. Both
+//   are documented as thread-safe and neither mutates the parent.
+// * `Request::status_code`, `header` and `raw_headers` call
+//   `WinHttpQueryHeaders`, which was measured to be fully synchronous even on
+//   an async handle and reads a response buffer WinHTTP has already finished
+//   writing.
+// * `Session::set_timeouts` and `Request::set_timeouts` call
+//   `WinHttpSetTimeouts`, which is a write, but of four independent scalars
+//   that WinHTTP guards internally; concurrent calls can interleave to produce
+//   either caller's values, which is the ordinary outcome of racing setters and
+//   not memory-unsafe.
+//
+// Every operation that actually transfers data takes `&mut Request`, so the
+// borrow checker — not this impl — is what prevents two transfers overlapping.
+// Where that is bypassed by cloning a handle across threads, WinHTTP still
+// refuses the second submission with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`
 // rather than corrupting anything.
 unsafe impl Sync for Handle {}
 

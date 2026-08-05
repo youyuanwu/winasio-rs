@@ -137,18 +137,33 @@ impl Request {
         };
         self.context.lock().abandon(generation, buffer);
     }
+
+    /// Hand a request body or header block to the context for safekeeping.
+    ///
+    /// See [`Inner::send_retention`](crate::winhttp::context::Inner) for why
+    /// these outlive the send that submitted them.
+    fn retain_send_buffer(&self, buffer: Box<dyn Any + Send>) {
+        self.context.lock().send_retention.push(buffer);
+    }
 }
 
 // ------------------------------------------------------------------ send
 
 /// Future returned by [`Request::send`].
 ///
-/// Owns the request body and the header block for the whole of the send.
-/// WinHTTP reads both asynchronously, so a borrow would let the caller free
-/// memory the platform is still reading — the same defect as an abandoned read
-/// buffer, and the one that is easiest to overlook because a request body does
-/// not look like an I/O buffer.
-#[must_use = "the buffer is returned here and would otherwise be dropped"]
+/// Owns the request body and the header block, and does **not** give them back.
+/// WinHTTP is documented as reading `lpOptional` until the response is
+/// received, not merely until the send completes — it may re-send the body
+/// unprompted to follow a redirect or answer an authentication challenge — so
+/// both are moved into the request's context on submission and released when
+/// [`Request::receive_response`] completes or the handle closes.
+///
+/// This is why the output is `Result<(), Error>` and not the `OpResult<_, B>`
+/// that every other operation here returns. Handing the buffer back at
+/// send-complete would let the caller free memory the platform still reads,
+/// which is the defect this type exists to prevent; the asymmetry is the honest
+/// signature for the underlying lifetime.
+#[must_use = "a send does nothing until it is awaited"]
 pub struct SendRequest<'a, B: Send + 'static> {
     request: &'a Request,
     body: Option<B>,
@@ -175,15 +190,27 @@ impl<'a, B: IoBuf + Send> SendRequest<'a, B> {
 }
 
 impl<B: IoBuf + Send + Unpin> Future for SendRequest<'_, B> {
-    type Output = OpResult<(), B>;
+    type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let handle = this.request.handle.as_raw();
         let context_value = this.request.context_value();
-        let (body_ptr, body_len) = match &this.body {
+        let (body_ptr, initialised) = match &this.body {
             Some(body) => (body.stable_ptr(), body.bytes_init()),
             None => (std::ptr::null(), 0),
+        };
+        // A body that does not fit in a `DWORD` is refused rather than
+        // truncated. Unlike a read or a write, a short send is not a legitimate
+        // partial outcome: the caller asked for these bytes to be the request,
+        // and silently sending a prefix would produce a valid-looking HTTP
+        // request with the wrong content.
+        let Ok(body_len) = u32::try_from(initialised) else {
+            return Poll::Ready(Err(Error::from_hresult(
+                windows::core::HRESULT::from_win32(
+                    windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0,
+                ),
+            )));
         };
         let headers = this.headers.as_deref();
         let total_length = this.total_length;
@@ -202,16 +229,16 @@ impl<B: IoBuf + Send + Unpin> Future for SendRequest<'_, B> {
                 } else {
                     Some(body_ptr.cast::<core::ffi::c_void>())
                 };
-                // SAFETY: the handle is live for the whole of this call, the
-                // header slice and the body are owned by this future and are
-                // not freed until the completion arrives or the buffer is
-                // retired into the context.
+                // SAFETY: the handle is live for the whole of this call, and
+                // the header slice and the body are owned by this future here
+                // and moved into the request context — never freed — the
+                // moment the submission is accepted.
                 let call = unsafe {
                     WinHttpSendRequest(
                         handle,
                         headers,
                         optional,
-                        body_len as u32,
+                        body_len,
                         total_length,
                         context_value,
                     )
@@ -222,34 +249,38 @@ impl<B: IoBuf + Send + Unpin> Future for SendRequest<'_, B> {
                 }
             });
 
+        // Once a generation exists the submission was attempted, so WinHTTP may
+        // hold `body_ptr` — including on the synchronous-failure path, where
+        // nothing says it did not record the pointer first. The body and the
+        // headers move into the context and stay there until the response is
+        // received or the handle closes.
+        //
+        // Moving the `B` value into a box is sound because `IoBuf` requires
+        // `stable_ptr` to survive moves of the buffer value; that is exactly the
+        // guarantee `Vec<u8>` provides and a fixed-size array does not.
+        if this.generation.is_some() {
+            if let Some(body) = this.body.take() {
+                this.request.retain_send_buffer(Box::new(body));
+            }
+            if let Some(headers) = this.headers.take() {
+                this.request.retain_send_buffer(Box::new(headers));
+            }
+        }
+
         match outcome {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                let body = this.body.take().unwrap_or_else(|| {
-                    // Unreachable: the buffer is only taken here and in `Drop`,
-                    // and `Drop` cannot run while this method is executing.
-                    unreachable!("send body taken twice")
-                });
-                Poll::Ready(OpResult(result.map(|_| ()), body))
-            }
+            Poll::Ready(result) => Poll::Ready(result.map(|_| ())),
         }
     }
 }
 
 impl<B: Send + 'static> Drop for SendRequest<'_, B> {
     fn drop(&mut self) {
-        // Both the body and the header block are read by WinHTTP for the whole
-        // of the send, so both are retired together. Retiring the body but not
-        // the headers would leave the platform reading freed memory — the same
-        // defect, one indirection further away.
-        let body = self.body.take();
-        let headers = self.headers.take();
-        let retired: Option<Box<dyn Any + Send>> = if self.generation.is_some() {
-            Some(Box::new((body, headers)))
-        } else {
-            None
-        };
-        self.request.abandon(self.generation, retired);
+        // No buffer is retired here. Either the submission never happened, in
+        // which case the body and headers are still owned by this future and
+        // are dropped with it, or it did, in which case `poll` already moved
+        // them into the request context where they outlive this future.
+        self.request.abandon(self.generation, None);
     }
 }
 
@@ -279,15 +310,26 @@ impl<B: IoBuf + Send + Unpin> Future for WriteData<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let handle = this.request.handle.as_raw();
-        let (pointer, length) = match &this.buffer {
+        let (pointer, initialised) = match &this.buffer {
             Some(buffer) => (buffer.stable_ptr(), buffer.bytes_init()),
             None => (std::ptr::null(), 0),
         };
+        // A single WinHTTP write is a `u32` of bytes. Clamping rather than
+        // casting keeps a buffer larger than 4 GiB from wrapping to a *smaller*
+        // length — or, at exactly 4 GiB, to zero, which would be reported as a
+        // successful write of nothing. A short write is a legitimate outcome
+        // that the returned count already expresses.
+        let length = u32::try_from(initialised).unwrap_or(u32::MAX);
 
         let outcome = this
             .request
             .poll_operation(OpKind::Write, &mut this.generation, cx, || {
-                let mut written = 0u32;
+                // `lpdwNumberOfBytesWritten` is deliberately null. On an
+                // asynchronous handle WinHTTP may write through that pointer
+                // *after* the call returns, and the only place to put a `u32`
+                // here would be this closure's stack frame, which is gone by
+                // then. The byte count arrives with `WRITE_COMPLETE` instead.
+                //
                 // SAFETY: the buffer is owned by this future for the whole
                 // of the operation; if the future is dropped the buffer is
                 // retired into the context rather than freed.
@@ -295,8 +337,8 @@ impl<B: IoBuf + Send + Unpin> Future for WriteData<'_, B> {
                     WinHttpWriteData(
                         handle,
                         Some(pointer.cast::<core::ffi::c_void>()),
-                        length as u32,
-                        &mut written,
+                        length,
+                        std::ptr::null_mut(),
                     )
                 };
                 match call {
@@ -315,7 +357,7 @@ impl<B: IoBuf + Send + Unpin> Future for WriteData<'_, B> {
                 // A write cannot report more than it was given. Clamping rather
                 // than trusting keeps a platform over-report from becoming a
                 // caller-visible lie about how much was sent.
-                let written = result.map(|reported| (reported as usize).min(length));
+                let written = result.map(|reported| (reported as usize).min(length as usize));
                 Poll::Ready(OpResult(written, buffer))
             }
         }
@@ -446,7 +488,12 @@ impl<B: IoBufMut + Send + Unpin> Future for ReadData<'_, B> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let handle = this.request.handle.as_raw();
-        let capacity = this.capacity;
+        // Clamped, never cast. A buffer of 4 GiB or more would otherwise wrap
+        // to a smaller length — at exactly 4 GiB, to zero, which WinHTTP would
+        // complete immediately with no bytes and a caller would read as the end
+        // of the body. Asking for less than the buffer holds is always safe.
+        let requested = u32::try_from(this.capacity).unwrap_or(u32::MAX);
+        let capacity = requested as usize;
 
         // A zero-capacity read is rejected here rather than submitted. WinHTTP
         // would complete it immediately with zero bytes, which a caller looping
@@ -484,7 +531,7 @@ impl<B: IoBufMut + Send + Unpin> Future for ReadData<'_, B> {
                     WinHttpReadData(
                         handle,
                         pointer.cast::<core::ffi::c_void>(),
-                        capacity as u32,
+                        requested,
                         std::ptr::null_mut(),
                     )
                 };

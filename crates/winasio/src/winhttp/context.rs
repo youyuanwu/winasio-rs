@@ -12,6 +12,7 @@
 use std::any::Any;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
@@ -108,6 +109,19 @@ pub(crate) struct Inner {
     /// until the matching completion arrives — or until `HANDLE_CLOSING`, which
     /// is the backstop for a handle closed before the completion landed.
     pub(crate) retired: Vec<(u64, Box<dyn Any + Send>)>,
+    /// Request bodies and header blocks handed to `WinHttpSendRequest`.
+    ///
+    /// WinHTTP documents `lpOptional` as having to remain valid until
+    /// `WinHttpReceiveResponse` completes, not merely until
+    /// `SENDREQUEST_COMPLETE` arrives — it may re-send the body without asking,
+    /// for instance to follow a redirect or to answer an authentication
+    /// challenge. Releasing at send-complete therefore leaves the platform
+    /// reading freed memory on exactly the paths that are hardest to provoke in
+    /// a test, so the body is held here for the longer of the two lifetimes.
+    ///
+    /// Cleared when a receive-response completes, and again at
+    /// `HANDLE_CLOSING` for requests whose response was never received.
+    pub(crate) send_retention: Vec<Box<dyn Any + Send>>,
 }
 
 /// State shared between the awaiting task and whichever thread runs the
@@ -202,6 +216,7 @@ impl RequestContext {
                 op: OpState::Idle,
                 waker: None,
                 retired: Vec::new(),
+                send_retention: Vec::new(),
             }),
         })
     }
@@ -241,7 +256,17 @@ fn record(
     outcome: Completion,
 ) -> Option<Waker> {
     let mut inner = context.lock();
-    match inner.op {
+    // A completed receive-response is the point at which WinHTTP is documented
+    // to be finished with the request body it was given at send time. Freeing
+    // here rather than at send-complete is the whole reason `send_retention`
+    // exists; freeing is deferred to the end of the borrow so that no user
+    // destructor runs while the lock is held.
+    let release = if expected == Some(OpKind::ReceiveResponse) {
+        std::mem::take(&mut inner.send_retention)
+    } else {
+        Vec::new()
+    };
+    let waker = match inner.op {
         OpState::Pending { kind, generation } if expected.is_none_or(|k| k == kind) => {
             inner.op = OpState::Complete {
                 generation,
@@ -265,7 +290,13 @@ fn record(
             inner.waker.take()
         }
         _ => None,
-    }
+    };
+    drop(inner);
+    // Outside the lock: dropping these runs caller-supplied destructors, and a
+    // destructor that re-entered this context would deadlock against a lock
+    // still held here.
+    drop(release);
+    waker
 }
 
 /// The WinHTTP status callback.
@@ -290,6 +321,33 @@ fn record(
 /// or the value installed with `WINHTTP_OPTION_CONTEXT_VALUE`, which is a
 /// pointer produced by `Arc::into_raw` on a `RequestContext`.
 pub(crate) unsafe extern "system" fn status_callback(
+    handle: *mut c_void,
+    context: usize,
+    status: u32,
+    information: *mut c_void,
+    information_length: u32,
+) {
+    // The body is entirely panic-free by construction, but "entirely" spans
+    // two destructors that run caller-supplied code: dropping a retired buffer
+    // runs `B`'s `Drop`, and `waker.wake()` runs the executor. Neither is this
+    // module's to audit, and an unwind out of an `extern "system"` function is
+    // undefined behaviour, so the boundary is sealed here rather than argued
+    // about. A panic is swallowed: there is no thread to propagate it to and
+    // aborting the user's process is a worse outcome than a lost notification.
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: forwarded unchanged from this function's own contract.
+        unsafe { dispatch_callback(handle, context, status, information, information_length) }
+    }));
+    drop(outcome);
+}
+
+/// The body of [`status_callback`], separated so the unwind guard above wraps
+/// every path through it including its destructors.
+///
+/// # Safety
+///
+/// See [`status_callback`].
+unsafe fn dispatch_callback(
     _handle: *mut c_void,
     context: usize,
     status: u32,
@@ -306,12 +364,18 @@ pub(crate) unsafe extern "system" fn status_callback(
     // Borrow WinHTTP's reference without consuming it, then take our own
     // strong reference for the duration of this invocation.
     //
-    // The clone is not decoration. `HANDLE_CLOSING` is the last notification
-    // for a handle, but nothing measured proves that every *earlier* callback
-    // invocation has already returned. Holding an independent strong reference
-    // here means a concurrent `HANDLE_CLOSING` on another thread can release
-    // WinHTTP's reference without freeing the context out from under this
-    // invocation; whichever callback returns last performs the free.
+    // The clone is defence in depth rather than a fix for a demonstrated race.
+    // A probe deliberately parked a callback for two seconds on a pool thread
+    // and closed the handle 300 ms into that window: `WinHttpCloseHandle`
+    // returned in 0.3 ms, and `HANDLE_CLOSING` was not delivered until the
+    // parked callback returned — on that same thread. WinHTTP appears to
+    // serialise callbacks per handle and to drain in-flight invocations before
+    // delivering `HANDLE_CLOSING`, so the interleaving this clone guards
+    // against was not reproducible.
+    //
+    // It is kept anyway because that serialisation is an observation, not a
+    // documented guarantee, and the cost is one uncontended atomic against a
+    // use-after-free in a callback that cannot be made to fail safe.
     //
     // SAFETY: `raw` came from `Arc::into_raw` and WinHTTP's reference is still
     // live at entry — it is only released in the `HANDLE_CLOSING` arm below,
@@ -338,7 +402,13 @@ pub(crate) unsafe extern "system" fn status_callback(
             // be writing into them.
             let mut inner = context.lock();
             inner.retired.clear();
-            inner.waker.take()
+            // Likewise for a request body whose response was never received:
+            // the handle is gone, so WinHTTP cannot re-send it.
+            let release = std::mem::take(&mut inner.send_retention);
+            let waker = inner.waker.take();
+            drop(inner);
+            drop(release);
+            waker
         }
 
         WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {

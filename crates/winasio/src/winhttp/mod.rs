@@ -102,6 +102,17 @@
 //!   recovery is to drop the request; retrying is possible but the timing is
 //!   the platform's to decide, not yours.
 //!
+//! **The send body is a deliberate exception.** [`Request::send`] takes
+//! ownership of the request body and never gives it back, which is why it
+//! resolves to `Result<(), Error>` rather than the `OpResult<_, B>` every other
+//! operation here returns. WinHTTP is documented as reading that body until the
+//! *response* has been received, not merely until the send completes, because
+//! it may re-send it unprompted to follow a redirect or answer an
+//! authentication challenge. Returning the buffer at send-complete would
+//! therefore hand the caller memory the platform is still reading. The body is
+//! held in the request's context instead, and released when
+//! [`Request::receive_response`] completes or the handle closes.
+//!
 //! **The alternative that was rejected.** The obvious other answer is to make
 //! operations non-cancel-safe by construction: have the future's `Drop` block
 //! until WinHTTP signals completion, so the buffer can be handed back every
@@ -150,7 +161,7 @@
 //!     connection.open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)?;
 //!
 //! futures::executor::block_on(async {
-//!     request.send(None, Vec::new(), 0).await.0?;
+//!     request.send(None, Vec::new(), 0).await?;
 //!     request.receive_response().await?;
 //!
 //!     let status = request.status_code()?;
@@ -568,10 +579,21 @@ impl Request {
     /// reads it asynchronously for the duration of the send — the same reason
     /// the body is.
     ///
-    /// `body` is returned when the future resolves. Pass an empty `Vec<u8>` for
-    /// a request with no body. `total_length` is the total size of the body
-    /// across this call and any subsequent [`Request::write_data`] calls; pass
-    /// the length of `body` when there will be no further writes.
+    /// `body` is **consumed, not returned** — unlike every other operation in
+    /// this module. WinHTTP may re-read it after the send completes (to follow
+    /// a redirect, or to answer an authentication challenge), so it is held in
+    /// the request's context until [`Request::receive_response`] completes or
+    /// the handle closes. Pass an empty `Vec<u8>` for a request with no body.
+    ///
+    /// `total_length` is the total size of the body across this call and any
+    /// subsequent [`Request::write_data`] calls; pass the length of `body` when
+    /// there will be no further writes.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `ERROR_INVALID_PARAMETER` if `body` is larger than
+    /// `u32::MAX`. A send is refused rather than truncated: a short send is not
+    /// a partial success but a different request.
     pub fn send<B: IoBuf + Send>(
         &mut self,
         headers: Option<Vec<u16>>,

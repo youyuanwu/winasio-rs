@@ -171,6 +171,11 @@ here: dropping a pending future ends the borrow, but WinHTTP still owns the
 pointer and will write through it. Abandoning a transfer therefore costs you the
 buffer, and parks the request until the abandoned completion lands.
 
+`send` is the one exception: it consumes the request body and never returns it,
+because WinHTTP may re-read the body after the send completes in order to follow
+a redirect or answer an authentication challenge. The body is released once the
+response has been received.
+
 Header queries are ordinary synchronous methods, not futures, because
 `WinHttpQueryHeaders` answers on the calling thread even on an async handle.
 
@@ -185,7 +190,7 @@ let session = Session::new(&HSTRING::from("winasio-example"))?;
         connection.open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)?;
 
     let body = futures::executor::block_on(async {
-        request.send(None, Vec::new(), 0).await.0?;
+        request.send(None, Vec::new(), 0).await?;
         request.receive_response().await?;
         let status = request.status_code()?;
         assert_eq!(status, 200);
