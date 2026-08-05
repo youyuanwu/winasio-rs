@@ -4,18 +4,23 @@
 // license information.
 // ------------------------------------------------------------
 
-//! Whole-payload I/O helpers shared by files and pipes.
+//! Whole-payload I/O helpers shared by files, pipes and sockets.
 //!
 //! The public result types in this module are returned by helper methods on
-//! [`crate::fs::File`] and [`crate::pipe::NamedPipe`]. The helper loops
-//! themselves are defined once here, so files and pipes share the same
-//! progress-accounting and failure classification.
+//! [`crate::fs::File`], [`crate::pipe::NamedPipe`] and
+//! [`crate::net::TcpStream`]. The helper loops themselves are defined once
+//! here, so all three share the same progress-accounting and failure
+//! classification.
 
 use std::future::Future;
 
-use windows::core::Error;
+use windows::core::{Error, HRESULT};
 use windows::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_NETNAME_DELETED, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    ERROR_BROKEN_PIPE, ERROR_CONNECTION_ABORTED, ERROR_NETNAME_DELETED, ERROR_NO_DATA,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_UNEXP_NET_ERR,
+};
+use windows::Win32::Networking::WinSock::{
+    WSAECONNABORTED, WSAECONNRESET, WSAEDISCON, WSAENETRESET, WSAESHUTDOWN,
 };
 
 use crate::fs::ReadOutcome;
@@ -145,6 +150,29 @@ impl<S: Submitter> WholePayloadIo for crate::pipe::NamedPipe<S> {
     fn advance_position(_position: &mut u64, _transferred: usize) {}
 }
 
+impl<S: Submitter> WholePayloadIo for crate::net::TcpStream<S> {
+    fn read_once<B>(
+        &self,
+        _position: u64,
+        buffer: B,
+    ) -> impl Future<Output = OpResult<ReadOutcome, B>>
+    where
+        B: IoBufMut + Send,
+    {
+        self.read(buffer)
+    }
+
+    fn write_once<B>(&self, _position: u64, buffer: B) -> impl Future<Output = OpResult<usize, B>>
+    where
+        B: IoBuf + Send,
+    {
+        self.write(buffer)
+    }
+
+    /// A socket has no cursor, so there is no position to advance.
+    fn advance_position(_position: &mut u64, _transferred: usize) {}
+}
+
 pub(crate) async fn write_all<T, B>(io: &T, mut position: u64, mut buffer: B) -> TransferResult<B>
 where
     T: WholePayloadIo,
@@ -266,11 +294,39 @@ where
     }
 }
 
+/// Map a raw platform error onto the transfer-level vocabulary.
+///
+/// The list is longer than it looks like it needs to be because the same
+/// condition reaches this function under different names depending on the
+/// transport *and* on which path resolved the operation. A socket
+/// disconnection is `WSAECONNRESET` when it fails inline and
+/// `ERROR_NETNAME_DELETED` when it arrives on a completion packet, having gone
+/// through `RtlNtStatusToDosError`. Recognising only one spelling would make
+/// `read_to_end` return a `Win32` error for a perfectly ordinary close, and
+/// only on whichever path the test did not exercise.
 fn classify_platform_error(error: Error) -> TransferError {
-    if error.code() == ERROR_BROKEN_PIPE.to_hresult()
-        || error.code() == ERROR_NO_DATA.to_hresult()
-        || error.code() == ERROR_PIPE_NOT_CONNECTED.to_hresult()
-        || error.code() == ERROR_NETNAME_DELETED.to_hresult()
+    // Pipe spellings, plus the eight ways a TCP disconnection can be named.
+    const CLOSED: [u32; 11] = [
+        ERROR_BROKEN_PIPE.0,
+        ERROR_NO_DATA.0,
+        ERROR_PIPE_NOT_CONNECTED.0,
+        // Socket failures that arrived on a completion packet, having been
+        // translated by `RtlNtStatusToDosError`.
+        ERROR_NETNAME_DELETED.0,
+        ERROR_CONNECTION_ABORTED.0,
+        ERROR_UNEXP_NET_ERR.0,
+        // The same conditions when the call failed inline and Winsock's own
+        // numbering survived.
+        WSAECONNRESET.0 as u32,
+        WSAECONNABORTED.0 as u32,
+        WSAENETRESET.0 as u32,
+        WSAESHUTDOWN.0 as u32,
+        WSAEDISCON.0 as u32,
+    ];
+
+    if CLOSED
+        .iter()
+        .any(|code| error.code() == HRESULT::from_win32(*code))
     {
         TransferError::ClosedPeer
     } else {
@@ -336,5 +392,65 @@ unsafe impl<B: IoBufMut> IoBufMut for TailBuf<B> {
         // this tail's writable capacity, so publishing `offset + len` stays
         // within the underlying buffer's total capacity.
         unsafe { self.inner.set_init(self.offset + len) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn classify(code: u32) -> TransferError {
+        classify_platform_error(Error::from_hresult(HRESULT::from_win32(code)))
+    }
+
+    #[test]
+    fn every_way_a_peer_can_vanish_is_recognised() {
+        // The table exists because the same disconnection reaches this function
+        // under a different name depending on the transport and on whether the
+        // operation failed inline or on a completion packet. A missing entry
+        // does not crash — it quietly turns an orderly close into a `Win32`
+        // error on one code path only, which is exactly the kind of bug that
+        // survives a passing test suite.
+        for code in [
+            ERROR_BROKEN_PIPE.0,
+            ERROR_NO_DATA.0,
+            ERROR_PIPE_NOT_CONNECTED.0,
+            ERROR_NETNAME_DELETED.0,
+            ERROR_CONNECTION_ABORTED.0,
+            ERROR_UNEXP_NET_ERR.0,
+            WSAECONNRESET.0 as u32,
+            WSAECONNABORTED.0 as u32,
+            WSAENETRESET.0 as u32,
+            WSAESHUTDOWN.0 as u32,
+            WSAEDISCON.0 as u32,
+        ] {
+            assert!(
+                matches!(classify(code), TransferError::ClosedPeer),
+                "code {code} should classify as a closed peer"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_failure_stays_a_win32_error() {
+        // A control. Without it the table above could be satisfied by a
+        // classifier that called everything a closed peer.
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+        assert!(matches!(
+            classify(ERROR_ACCESS_DENIED.0),
+            TransferError::Win32(_)
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_transfer_is_not_a_closed_peer() {
+        // Cancellation is the caller's own doing. Reporting it as a peer
+        // closure would tell `read_to_end` the stream ended cleanly and hand
+        // back a truncated buffer with no error.
+        use windows::Win32::Foundation::ERROR_OPERATION_ABORTED;
+        assert!(matches!(
+            classify(ERROR_OPERATION_ABORTED.0),
+            TransferError::Win32(_)
+        ));
     }
 }
