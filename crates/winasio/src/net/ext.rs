@@ -6,10 +6,28 @@
 
 //! The Winsock extension functions, resolved once per process.
 //!
-//! `AcceptEx`, `ConnectEx` and `GetAcceptExSockaddrs` are not exported by
-//! `ws2_32.dll`. They belong to the transport provider and must be fetched
-//! through `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` with the function's
-//! GUID, using a socket of the provider you intend to call them on.
+//! `ConnectEx` has no binding to use: `mswsock.dll` does not export it, and the
+//! `windows` crate offers only the `LPFN_CONNECTEX` signature. It can be
+//! reached *only* through `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` with
+//! the function's GUID, on a socket of the provider you intend to call it on.
+//!
+//! `AcceptEx` and `GetAcceptExSockaddrs` are a different case, and worth
+//! stating plainly because the obvious reading is wrong: `mswsock.dll` *does*
+//! export both, and the `windows` crate binds both, so calling them directly
+//! would compile. This module deliberately does not — not because the export is
+//! missing, but because it is a **different function**. Measured on this
+//! platform, `GetProcAddress(mswsock, "AcceptEx")` and the pointer the default
+//! provider returns for `WSAID_ACCEPTEX` are two distinct addresses whose
+//! opening bytes are two distinct prologues, so neither is a thunk forwarding
+//! to the other. The export is the generic entry point that must still find the
+//! provider; the ioctl hands back the provider's own implementation. Winsock
+//! documents the runtime lookup for precisely this reason.
+//!
+//! The distinction is not academic here. A non-IFS layered provider is the one
+//! realistic socket that can refuse the mandatory inline-success skip mode
+//! (see `iocp::port`) — exactly the case where "generic entry point" and "this
+//! provider's implementation" stop coinciding. Resolving all three the same way
+//! also leaves one mechanism to reason about instead of two.
 //!
 //! # Why one cache is enough
 //!
