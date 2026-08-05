@@ -15,9 +15,8 @@
 //! Windows requires `StartThreadpoolIo` before *each* operation is initiated —
 //! omitting it "will cause the thread pool to ignore an I/O operation when it
 //! completes and will cause memory corruption". If the operation then fails to
-//! start, or completes inline on a handle that skips the completion port,
-//! `CancelThreadpoolIo` must balance it, or the pending-I/O count leaks and
-//! teardown blocks forever.
+//! start, or completes inline, `CancelThreadpoolIo` must balance it, or the
+//! pending-I/O count leaks and teardown blocks forever.
 //!
 //! # Teardown
 //!
@@ -31,7 +30,6 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows::Win32::System::Threading::{
     CancelThreadpoolIo, CloseThreadpoolIo, CreateThreadpoolIo, StartThreadpoolIo,
     WaitForThreadpoolIoCallbacks, PTP_CALLBACK_INSTANCE, PTP_IO,
@@ -40,12 +38,8 @@ use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
 use super::future::Submit;
 use super::op::OpCode;
-use super::port::RegistrationError;
+use super::port::{skip_notification_on_inline_success, RegistrationError};
 use super::raw::{dispatch_completion_with, Key};
-
-/// See `port.rs`; not exported by the `windows` crate.
-const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
-const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 
 /// A handle registered with the Win32 thread pool.
 ///
@@ -63,8 +57,6 @@ pub struct ThreadPoolIo {
 struct Registration {
     handle: HANDLE,
     io: PTP_IO,
-    /// Whether an inline success skips the completion notification.
-    skips_on_success: bool,
 }
 
 // SAFETY: `HANDLE` and `PTP_IO` are opaque kernel/pool identifiers usable from
@@ -119,6 +111,19 @@ impl ThreadPoolIo {
     /// A handle may be registered with exactly one completion mechanism, for its
     /// whole lifetime. A second attempt — with either backend, in either order —
     /// fails with [`RegistrationError::AlreadyRegistered`].
+    ///
+    /// Registration also suppresses the completion callback for operations that
+    /// succeed inline, so that [`submit`](ThreadPoolIo::submit) can treat an
+    /// inline success as final. A handle that does not support that mode fails
+    /// with [`RegistrationError::SkipModeUnsupported`].
+    ///
+    /// # On failure the handle is spent
+    ///
+    /// Binding a handle to a completion mechanism is permanent. Creating the
+    /// pool's I/O object happens before the mode is set, and closing it again
+    /// does not release the handle, so an error here may leave `handle`
+    /// unusable: registering it again — with either backend — fails, and
+    /// submitting operations for it is unsound. Close it.
     pub fn new(handle: HANDLE) -> std::result::Result<Self, RegistrationError> {
         // No context is passed: the callback needs nothing but the OVERLAPPED,
         // which keeps the registration's lifetime independent of in-flight
@@ -126,31 +131,20 @@ impl ThreadPoolIo {
         let io = unsafe { CreateThreadpoolIo(handle, Some(io_callback), None, None) }
             .map_err(RegistrationError::from_association)?;
 
-        let skips_on_success = unsafe {
-            SetFileCompletionNotificationModes(
-                handle,
-                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
-            )
-        }
-        .is_ok();
+        // Owned before the next fallible step, so that failure closes the pool
+        // object through `Registration::drop` instead of leaking it.
+        let registration = ThreadPoolIo {
+            inner: Arc::new(Registration { handle, io }),
+        };
 
-        Ok(ThreadPoolIo {
-            inner: Arc::new(Registration {
-                handle,
-                io,
-                skips_on_success,
-            }),
-        })
+        skip_notification_on_inline_success(handle)?;
+
+        Ok(registration)
     }
 
     /// The registered handle.
     pub fn handle(&self) -> HANDLE {
         self.inner.handle
-    }
-
-    /// Whether inline successes on this handle skip the completion callback.
-    pub fn skips_on_success(&self) -> bool {
-        self.inner.skips_on_success
     }
 
     /// Submit an operation.
@@ -191,18 +185,15 @@ impl ThreadPoolIo {
                 Submit::ready(key, Err(e))
             }
             Poll::Ready(Ok(n)) => {
-                if self.inner.skips_on_success {
-                    // No callback will run for an inline success on this handle.
-                    unsafe { CancelThreadpoolIo(self.inner.io) };
-                    let result = Ok(n);
-                    key.on_complete_inline(&result);
-                    // SAFETY: matches the leak above; no callback will arrive.
-                    unsafe { Key::<T>::unleak(optr) };
-                    Submit::ready(key, result)
-                } else {
-                    // A callback is still coming and owns the leaked reference.
-                    Submit::pending(key)
-                }
+                // No callback will run: every registered handle suppresses the
+                // notification for an inline success, so the start must be
+                // balanced here or teardown blocks on it forever.
+                unsafe { CancelThreadpoolIo(self.inner.io) };
+                let result = Ok(n);
+                key.on_complete_inline(&result);
+                // SAFETY: matches the leak above; no callback will arrive.
+                unsafe { Key::<T>::unleak(optr) };
+                Submit::ready(key, result)
             }
         }
     }

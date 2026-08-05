@@ -28,6 +28,57 @@ const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
 /// uses. Value from `winbase.h`.
 const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 
+/// Test support: pretend a handle refuses the inline-success skip mode.
+///
+/// No handle that accepts association has been found to refuse the mode, so the
+/// [`RegistrationError::SkipModeUnsupported`] path — and the teardown both
+/// backends perform when registration fails partway — would otherwise be
+/// unreachable and untested.
+///
+/// The switch is **thread-local**, so arming it cannot disturb tests running
+/// concurrently in the same process.
+#[cfg(any(test, feature = "test-util"))]
+mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSE_SKIP_MODE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn armed() -> bool {
+        REFUSE_SKIP_MODE.with(|f| f.get())
+    }
+
+    fn set(on: bool) {
+        REFUSE_SKIP_MODE.with(|f| f.set(on));
+    }
+
+    /// While alive, registration on this thread fails as though the handle did
+    /// not support suppressing the completion for an inline success.
+    ///
+    /// Restores the previous setting on drop, so it nests.
+    #[derive(Debug)]
+    pub struct RefuseSkipMode(bool);
+
+    impl RefuseSkipMode {
+        #[allow(clippy::new_without_default)]
+        pub fn new() -> Self {
+            let previous = armed();
+            set(true);
+            RefuseSkipMode(previous)
+        }
+    }
+
+    impl Drop for RefuseSkipMode {
+        fn drop(&mut self) {
+            set(self.0);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub use fault::RefuseSkipMode;
+
 /// `WAIT_TIMEOUT` as returned by `GetQueuedCompletionStatusEx`.
 const WAIT_TIMEOUT_CODE: u32 = 258;
 
@@ -42,6 +93,10 @@ pub(crate) const KEY_WAKEUP: usize = 0x7761_7332;
 /// A handle can be associated with exactly one completion mechanism, for its
 /// entire lifetime. Attempting to register twice — with either backend, in
 /// either order — is reported as [`RegistrationError::AlreadyRegistered`].
+///
+/// Non-exhaustive: registration can fail in platform-specific ways that may be
+/// distinguished in future versions.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum RegistrationError {
     /// The handle is already associated with a completion port or thread-pool
@@ -51,6 +106,14 @@ pub enum RegistrationError {
     /// not by itself specific. This crate controls every argument at the
     /// registration call, so that failure is attributed here.
     AlreadyRegistered(Error),
+    /// The handle does not support suppressing the completion notification for
+    /// an operation that succeeds inline.
+    ///
+    /// Both backends depend on this: an operation that reports inline success
+    /// is treated as complete, and nothing is left to consume a notification
+    /// that arrives anyway. Rather than track the exception per handle, a
+    /// handle that refuses the mode is refused registration.
+    SkipModeUnsupported(Error),
     /// Any other failure.
     Os(Error),
 }
@@ -67,7 +130,9 @@ impl RegistrationError {
     /// The underlying Windows error.
     pub fn as_error(&self) -> &Error {
         match self {
-            RegistrationError::AlreadyRegistered(e) | RegistrationError::Os(e) => e,
+            RegistrationError::AlreadyRegistered(e)
+            | RegistrationError::SkipModeUnsupported(e)
+            | RegistrationError::Os(e) => e,
         }
     }
 }
@@ -79,6 +144,10 @@ impl std::fmt::Display for RegistrationError {
                 f,
                 "handle is already registered with a completion mechanism: {e}"
             ),
+            RegistrationError::SkipModeUnsupported(e) => write!(
+                f,
+                "handle does not support skipping the completion notification on inline success: {e}"
+            ),
             RegistrationError::Os(e) => write!(f, "handle registration failed: {e}"),
         }
     }
@@ -89,9 +158,48 @@ impl std::error::Error for RegistrationError {}
 impl From<RegistrationError> for Error {
     fn from(value: RegistrationError) -> Self {
         match value {
-            RegistrationError::AlreadyRegistered(e) | RegistrationError::Os(e) => e,
+            RegistrationError::AlreadyRegistered(e)
+            | RegistrationError::SkipModeUnsupported(e)
+            | RegistrationError::Os(e) => e,
         }
     }
+}
+
+/// Suppress the completion notification for operations that succeed inline.
+///
+/// Both backends require this, so that "the initiating call reported success"
+/// and "no completion will be delivered" are the same condition on every
+/// registered handle. Without it each backend would have to remember, per
+/// handle, which contract applies — state with no natural lifetime, since a
+/// closed handle cannot be distinguished from one whose value has been reused.
+///
+/// `FILE_SKIP_SET_EVENT_ON_HANDLE` rides along because completion-port code
+/// never waits on the handle's event, and leaving it set costs a signal per
+/// operation.
+///
+/// Called only after the handle is associated, so that a handle already owned
+/// by another completion mechanism is rejected before its notification
+/// behaviour is altered.
+pub(crate) fn skip_notification_on_inline_success(
+    handle: HANDLE,
+) -> std::result::Result<(), RegistrationError> {
+    // Windows reports a refusal as `ERROR_INVALID_PARAMETER`. Constructing the
+    // variant directly rather than through `from_association` is deliberate:
+    // that helper would misattribute the same code to `AlreadyRegistered`.
+    #[cfg(any(test, feature = "test-util"))]
+    if fault::armed() {
+        return Err(RegistrationError::SkipModeUnsupported(Error::from_hresult(
+            ERROR_INVALID_PARAMETER.to_hresult(),
+        )));
+    }
+
+    unsafe {
+        SetFileCompletionNotificationModes(
+            handle,
+            FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+        )
+    }
+    .map_err(RegistrationError::SkipModeUnsupported)
 }
 
 /// An owned completion port.
@@ -112,53 +220,33 @@ impl CompletionPort {
     }
 
     /// The raw port handle. Needed by the thread-pool backend in a later phase.
-    #[allow(dead_code)]
     pub(crate) fn raw(&self) -> HANDLE {
         self.handle
     }
 
     /// Associate a handle with this port.
     ///
-    /// Returns whether synchronous completions will bypass the port. When
-    /// [`SetFileCompletionNotificationModes`] is unsupported for the handle
-    /// type, this is `false` and an inline success still produces a packet, so
-    /// the caller must treat it as pending.
-    pub(crate) fn attach(&self, handle: HANDLE) -> std::result::Result<bool, RegistrationError> {
+    /// Also suppresses the completion packet for operations that succeed
+    /// inline, which [`Proactor::submit`](crate::iocp::Proactor::submit)
+    /// depends on. A handle that does not support that mode is refused rather
+    /// than registered under a second contract.
+    ///
+    /// On that failure the handle is left associated with this port — the
+    /// association is permanent and cannot be undone — so it can no longer be
+    /// registered anywhere. Callers that own the handle should close it.
+    pub(crate) fn attach(&self, handle: HANDLE) -> std::result::Result<(), RegistrationError> {
         unsafe { CreateIoCompletionPort(handle, Some(self.handle), KEY_OPERATION, 0) }
             .map_err(RegistrationError::from_association)?;
 
-        // Skipping the port on inline success avoids a second delivery for an
-        // operation the submitter already saw complete. Not every handle type
-        // supports it; failure is not fatal, it just changes the contract.
-        let skip = unsafe {
-            SetFileCompletionNotificationModes(
-                handle,
-                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
-            )
-        }
-        .is_ok();
-
-        Ok(skip)
+        skip_notification_on_inline_success(handle)
     }
 
     /// Post the wakeup sentinel, unblocking a waiting [`CompletionPort::poll`].
     ///
     /// The public path is [`Notify`](crate::iocp::Notify), which can cross
     /// threads; this is the direct form.
-    #[allow(dead_code)]
     pub(crate) fn wake(&self) -> Result<()> {
         unsafe { PostQueuedCompletionStatus(self.handle, 0, KEY_WAKEUP, None) }
-    }
-
-    /// Post a completion packet for an operation that did not originate in the
-    /// I/O subsystem. Used by event waits, which are driven by the Win32 wait
-    /// infrastructure but must surface through the same completion path.
-    #[allow(dead_code)]
-    pub(crate) fn post_operation(
-        &self,
-        optr: *mut windows::Win32::System::IO::OVERLAPPED,
-    ) -> Result<()> {
-        unsafe { PostQueuedCompletionStatus(self.handle, 0, KEY_OPERATION, Some(optr)) }
     }
 
     /// Retrieve up to `entries.len()` completions.

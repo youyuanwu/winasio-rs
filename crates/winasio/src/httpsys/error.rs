@@ -29,7 +29,6 @@ pub(crate) fn check(code: u32) -> Result<()> {
 /// undersized receive, `ERROR_HANDLE_EOF` at the end of a body -- without
 /// string matching.
 // Consumed by the receive retry path and the body reader.
-#[allow(dead_code)]
 pub(crate) fn win32_code(err: &Error) -> Option<u32> {
     let HRESULT(raw) = err.code();
     // Win32 codes are mapped into HRESULT as 0x8007xxxx.

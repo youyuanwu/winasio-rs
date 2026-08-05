@@ -9,7 +9,6 @@
 use std::task::Poll;
 
 use windows::core::Result;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::HttpServer::HttpCancelHttpRequest;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
@@ -40,10 +39,6 @@ impl CancelRequest {
 }
 
 unsafe impl OpCode for CancelRequest {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let code =
             unsafe { HttpCancelHttpRequest(self.queue.raw(), self.request_id.get(), Some(optr)) };

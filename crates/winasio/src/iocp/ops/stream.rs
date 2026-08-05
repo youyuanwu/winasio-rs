@@ -14,7 +14,7 @@
 use std::task::Poll;
 
 use windows::core::Result;
-use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE};
+use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_PIPE_CONNECTED};
 use windows::Win32::System::Pipes::ConnectNamedPipe;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
@@ -88,10 +88,6 @@ impl<B: IoBufMut> IntoInner for ReadHandleAt<B> {
 }
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReadHandleAt<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.handle.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         unsafe { set_offset(optr, self.offset) };
 
@@ -152,10 +148,6 @@ impl<B: IoBuf> IntoInner for WriteHandleAt<B> {
 }
 
 unsafe impl<B: IoBuf + Send> OpCode for WriteHandleAt<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.handle.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         unsafe { set_offset(optr, self.offset) };
 
@@ -207,10 +199,6 @@ impl<B: IoBufMut> IntoInner for ReadHandle<B> {
 }
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReadHandle<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        self.inner.handle()
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
         unsafe { set_offset(optr, 0) };
@@ -276,10 +264,6 @@ impl<B: IoBuf> IntoInner for WriteHandle<B> {
 }
 
 unsafe impl<B: IoBuf + Send> OpCode for WriteHandle<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        self.inner.handle()
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore the offset fields, but they must still be initialised.
         unsafe { set_offset(optr, 0) };
@@ -331,10 +315,6 @@ impl IntoInner for ConnectPipe {
 }
 
 unsafe impl OpCode for ConnectPipe {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.handle.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         // Pipes ignore offsets, but the driver reuses the common OVERLAPPED
         // allocation and the fields must not contain garbage.
@@ -367,7 +347,7 @@ unsafe impl OpCode for ConnectPipe {
 mod tests {
     use super::*;
     use windows::core::Error;
-    use windows::Win32::Foundation::ERROR_MORE_DATA;
+    use windows::Win32::Foundation::{ERROR_MORE_DATA, HANDLE};
 
     #[test]
     fn inline_more_data_uses_internal_high_for_count_and_init() {

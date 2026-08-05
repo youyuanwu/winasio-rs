@@ -42,7 +42,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::IO::{PostQueuedCompletionStatus, OVERLAPPED};
 
-use crate::iocp::op::{IntoInner, OpCode, OpType};
+use crate::iocp::op::{IntoInner, OpCode};
 use crate::iocp::port::KEY_OPERATION;
 
 /// Shared between the wait callback and the operation.
@@ -107,7 +107,7 @@ unsafe extern "system" fn wait_callback(context: *mut core::ffi::c_void, timed_o
 ///
 /// The handle is borrowed, not owned: this does not close it. It must stay valid
 /// until the operation reaches a terminal state, which is part of [`OpCode`]'s
-/// safety contract for [`OpType::Event`].
+/// safety contract.
 ///
 /// A wait belongs to the proactor that will drive it, because the wait callback
 /// must post its completion to that proactor's port.
@@ -150,17 +150,8 @@ impl WaitForHandle {
 }
 
 unsafe impl OpCode for WaitForHandle {
-    fn op_type(&self) -> OpType {
-        OpType::Event(self.target)
-    }
-
-    /// `None`: a wait never completes inline. `operate` either registers the
-    /// wait and returns pending, or fails outright, so the question of a
-    /// following completion packet does not arise.
-    fn handle(&self) -> Option<HANDLE> {
-        None
-    }
-
+    /// A wait never completes inline: this either registers the wait and
+    /// returns pending, or fails outright.
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let ctx = Arc::new(WaitContext {
             port: self.port,

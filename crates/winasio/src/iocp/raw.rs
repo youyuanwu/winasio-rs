@@ -45,11 +45,6 @@
 //! therefore guaranteed a written result. Doing this in the other order is a
 //! data race that hands uninitialised memory to the caller.
 
-// The driver in `proactor.rs` and `threadpool.rs` is the only consumer of this
-// module. Until those land, the unit tests are the sole callers, so the
-// non-test build sees these items as unused.
-#![allow(dead_code)]
-
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -59,7 +54,7 @@ use std::task::Waker;
 use windows::core::Result;
 use windows::Win32::System::IO::OVERLAPPED;
 
-use super::op::{OpCode, OpType};
+use super::op::OpCode;
 
 /// Guards against acting on a packet whose memory has been corrupted.
 ///
@@ -446,21 +441,6 @@ impl<T: OpCode> Key<T> {
         }
     }
 
-    /// Read the operation's declared type.
-    pub(crate) fn op_type(&self) -> Option<OpType> {
-        self.inner.op.lock().unwrap().as_ref().map(|o| o.op_type())
-    }
-
-    /// The handle this operation targets, if it reports one.
-    pub(crate) fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-        self.inner
-            .op
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|o| o.handle())
-    }
-
     /// Run the operation's completion hook for a result produced inline.
     ///
     /// The completion path does this itself; this is for the synchronous case,
@@ -577,6 +557,10 @@ impl<T: OpCode> Key<T> {
 ///
 /// `optr` may be any pointer, including one this crate has never seen. It is
 /// only dereferenced once membership has been established.
+///
+/// Test-only: both backends call [`dispatch_completion_with`], because a real
+/// completion always reports its transferred count separately.
+#[cfg(test)]
 pub(crate) unsafe fn dispatch_completion(optr: *mut OVERLAPPED, result: Result<usize>) -> bool {
     // Without a separately reported count, the only count available is the one
     // in the result itself, which is zero for a failure.
@@ -660,10 +644,6 @@ mod tests {
     }
 
     unsafe impl OpCode for NoopOp {
-        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-            None
-        }
-
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }
@@ -674,10 +654,6 @@ mod tests {
     }
 
     unsafe impl OpCode for BigOp {
-        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-            None
-        }
-
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }
@@ -690,10 +666,6 @@ mod tests {
     struct ObservingOp;
 
     unsafe impl OpCode for ObservingOp {
-        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-            None
-        }
-
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }
@@ -757,10 +729,6 @@ mod tests {
     struct CountingOp;
 
     unsafe impl OpCode for CountingOp {
-        fn handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
-            None
-        }
-
         unsafe fn operate(&mut self, _optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
             Poll::Pending
         }

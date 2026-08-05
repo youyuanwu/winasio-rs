@@ -9,7 +9,6 @@
 use std::task::Poll;
 
 use windows::core::Result;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::HttpServer::HttpReceiveRequestEntityBody;
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
@@ -38,10 +37,6 @@ impl<B: IoBufMut> ReceiveBody<B> {
 }
 
 unsafe impl<B: IoBufMut + Send> OpCode for ReceiveBody<B> {
-    fn handle(&self) -> Option<HANDLE> {
-        Some(self.queue.raw())
-    }
-
     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
         let queue = self.queue.raw();
         let id = self.request_id.get();

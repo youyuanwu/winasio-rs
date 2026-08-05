@@ -21,7 +21,6 @@
 //! ```no_run
 //! use std::task::Poll;
 //! use winasio::iocp::{win32_result, IntoInner, OpCode};
-//! use windows::Win32::Foundation::HANDLE;
 //! use windows::Win32::System::IO::OVERLAPPED;
 //!
 //! struct MyOp {
@@ -30,10 +29,6 @@
 //! }
 //!
 //! unsafe impl OpCode for MyOp {
-//!     // Required: says whether a completion packet can follow an inline
-//!     // success. `None` means this operation never completes inline.
-//!     fn handle(&self) -> Option<HANDLE> { None }
-//!
 //!     unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<windows::core::Result<usize>> {
 //!         // Call the overlapped API here, deriving every pointer from `self`.
 //!         unsafe { win32_result(false, optr) }
@@ -107,7 +102,7 @@ pub use backend::{Registrar, Submitter, ThreadPool};
 pub use buf::{IoBuf, IoBufMut, OpResult, UninitSlice};
 pub use future::Submit;
 pub use handle::Handle;
-pub use op::{win32_result, IntoInner, OpCode, OpType};
+pub use op::{win32_result, IntoInner, OpCode};
 pub use ops::{
     ConnectPipe, ReadAt, ReadHandle, ReadHandleAt, SendHandle, WaitForHandle, WriteAt, WriteHandle,
     WriteHandleAt,
@@ -116,6 +111,8 @@ pub use port::RegistrationError;
 pub use proactor::{Notify, Proactor};
 pub use threadpool::ThreadPoolIo;
 
+#[cfg(any(test, feature = "test-util"))]
+pub use port::RefuseSkipMode;
 #[cfg(any(test, feature = "test-util"))]
 pub use raw::live_operations;
 

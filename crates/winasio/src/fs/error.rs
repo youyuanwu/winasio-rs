@@ -54,6 +54,10 @@ impl From<RegistrationError> for SetupError {
     fn from(value: RegistrationError) -> Self {
         match value {
             RegistrationError::AlreadyRegistered(_) => SetupError::AlreadyRegistered,
+            // Not classified further: every handle type this crate opens
+            // supports the mode, so reaching here means an unusual driver
+            // rather than one of the ordinary open failures.
+            RegistrationError::SkipModeUnsupported(e) => SetupError::Win32(e),
             RegistrationError::Os(e) => SetupError::from_windows(e),
         }
     }
