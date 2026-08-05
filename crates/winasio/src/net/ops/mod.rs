@@ -4,12 +4,8 @@
 // license information.
 // ------------------------------------------------------------
 
-pub mod fs;
-pub mod httpsys;
-pub mod io;
-pub mod iocp;
-pub mod net;
-pub mod pipe;
-pub mod winhttp;
+//! Socket operations.
 
-pub mod sys;
+pub(crate) mod accept;
+pub(crate) mod connect;
+pub(crate) mod io;
