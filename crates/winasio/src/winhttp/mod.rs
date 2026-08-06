@@ -47,6 +47,17 @@
 //!   [`Request::header`] and [`Request::raw_headers`] are ordinary methods, not
 //!   futures. `WinHttpQueryHeaders` answers on the calling thread even on an
 //!   async handle. Making them `async` would be a lie about what they do.
+//! * **An empty header block means no headers.** `Some(Vec::new())` passed to
+//!   [`Request::send`] is normalised to "no additional headers" before it
+//!   reaches the platform. Forwarding it verbatim faults the process: the
+//!   empty `Vec`'s dangling pointer is handed to `WinHttpSendRequest`, which
+//!   dereferences it whatever the stated length says. A caller assembling a
+//!   header block from a loop that happened to produce nothing should not have
+//!   to know that, so the module absorbs it.
+//! * **Redirects are followed by default, and that is rarely what you want.**
+//!   The platform default rewrites a `POST` into a `GET` across a `301` without
+//!   telling the caller, and fails outright on any request whose body was
+//!   streamed. [`Session::set_redirect_policy`] turns it off.
 //!
 //! # Why this module is not built on the IOCP core
 //!
@@ -199,6 +210,8 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpSetStatusCallback, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE,
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_FLAG_ASYNC,
     WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_CONTEXT_VALUE,
+    WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
+    WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
     WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_RAW_HEADERS_CRLF,
     WINHTTP_QUERY_STATUS_CODE,
 };
@@ -232,6 +245,44 @@ impl From<AccessType> for WINHTTP_ACCESS_TYPE {
         match access {
             AccessType::AutomaticProxy => WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             AccessType::NamedProxy => WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+        }
+    }
+}
+
+/// Whether WinHTTP follows redirects on the caller's behalf.
+///
+/// The platform default is [`RedirectPolicy::Always`], and that default is
+/// surprising enough to be worth stating plainly. Measured behaviour:
+///
+/// - A `301` answering a `POST` is replayed as a `GET` with the body dropped.
+///   The caller never sees the `301`; it sees the final response and has no way
+///   to tell that the method it asked for is not the method that was used.
+/// - A redirect arriving for a request whose body was written with
+///   [`Request::write_data`] — or which declared `Transfer-Encoding: chunked` —
+///   fails the transfer outright with `ERROR_WINHTTP_RESEND_REQUEST` (12032),
+///   because the platform cannot replay a body it never held.
+///
+/// A caller that wants to implement its own redirect policy, or that streams
+/// request bodies, wants [`RedirectPolicy::Never`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectPolicy {
+    /// Return the redirect response to the caller; follow nothing.
+    Never,
+    /// Follow redirects, except from `https` to `http`.
+    DisallowHttpsToHttp,
+    /// Follow every redirect, including a downgrade to `http`. The platform
+    /// default.
+    Always,
+}
+
+impl RedirectPolicy {
+    fn value(self) -> u32 {
+        match self {
+            RedirectPolicy::Never => WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
+            RedirectPolicy::DisallowHttpsToHttp => {
+                WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+            }
+            RedirectPolicy::Always => WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
         }
     }
 }
@@ -349,6 +400,29 @@ impl Session {
                 connect_ms,
                 send_ms,
                 receive_ms,
+            )
+        }
+    }
+
+    /// Choose whether WinHTTP follows redirects on its own.
+    ///
+    /// Set on the session, and inherited by every request derived from it —
+    /// measured, not assumed: setting the option on the session handle before
+    /// `connect` governs requests opened afterwards, so there is no need to
+    /// touch each request. The equivalent per-request option exists and works
+    /// too, but a session-wide setting is one call instead of one per transfer.
+    ///
+    /// See [`RedirectPolicy`] for what each choice means and why the platform
+    /// default is worth overriding.
+    pub fn set_redirect_policy(&self, policy: RedirectPolicy) -> Result<(), Error> {
+        let bytes = policy.value().to_ne_bytes();
+        // SAFETY: the handle is owned by `self` and the buffer outlives the
+        // call.
+        unsafe {
+            WinHttpSetOption(
+                Some(self.handle.as_raw().cast_const()),
+                WINHTTP_OPTION_REDIRECT_POLICY,
+                Some(&bytes),
             )
         }
     }
@@ -769,6 +843,16 @@ pub fn encode_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_redirect_policy_maps_to_its_own_platform_value() {
+        // Three constants that differ by one, in a header where two of them
+        // share a value with something else. A transposition here would be a
+        // silent behaviour change, not a compile error.
+        assert_eq!(RedirectPolicy::Never.value(), 0);
+        assert_eq!(RedirectPolicy::DisallowHttpsToHttp.value(), 1);
+        assert_eq!(RedirectPolicy::Always.value(), 2);
+    }
 
     #[test]
     fn each_certificate_relaxation_sets_only_its_own_bit() {

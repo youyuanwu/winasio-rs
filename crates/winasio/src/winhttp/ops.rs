@@ -212,7 +212,13 @@ impl<B: IoBuf + Send + Unpin> Future for SendRequest<'_, B> {
                 ),
             )));
         };
-        let headers = this.headers.as_deref();
+        // An *empty* header block is not the same as no headers. `as_deref` on
+        // `Some(Vec::new())` yields `Some(&[])`, and windows-rs forwards that
+        // slice's dangling pointer with a length of zero. WinHTTP dereferences
+        // it regardless of the length and the process dies with an access
+        // violation — measured, not theorised. Since an empty block means "no
+        // additional headers", say exactly that to the platform.
+        let headers = this.headers.as_deref().filter(|block| !block.is_empty());
         let total_length = this.total_length;
 
         let outcome = this
