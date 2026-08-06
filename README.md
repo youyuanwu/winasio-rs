@@ -149,43 +149,68 @@ UDP, `WSARecvFrom`/`WSASendTo`, `WSARecvMsg`, `TransmitFile` and vectored I/O
 are out of scope.
 
 # Winhttp
-Winhttp in async mode with rust async await wrapper.
-Example snippit:
+An asynchronous HTTP and HTTPS client on top of WinHTTP. `Session` holds
+process-scoped configuration and timeouts, `Connection` names a server, and
+`Request` is the handle every transfer happens on.
+
+Async is the only mode. Every session is opened with `WINHTTP_FLAG_ASYNC`, the
+flag is not a parameter, and there is no synchronous surface to fall back to.
+
+Unlike every other I/O module here, this one is **not** generic over a
+`Submitter`. WinHTTP exposes no `OVERLAPPED` and cannot be associated with a
+completion port -- it runs its own thread pool and delivers completions through a
+status callback -- so there is nothing to hand a `Proactor`. What falls out of
+that is a self-contained `Waker`-driven state machine, which means the client
+runs under **any** executor, including a bare `futures::executor::block_on`
+with no reactor and no worker threads. The module docs explain the asymmetry in
+full.
+
+Transfers take their buffers **by value** and hand them back in an `OpResult`,
+the same discipline the IOCP modules use. A borrowed buffer cannot be made sound
+here: dropping a pending future ends the borrow, but WinHTTP still owns the
+pointer and will write through it. Abandoning a transfer therefore costs you the
+buffer, and parks the request until the abandoned completion lands.
+
+`send` is the one exception: it consumes the request body and never returns it,
+because WinHTTP may re-read the body after the send completes in order to follow
+a redirect or answer an authentication challenge. The body is released once the
+response has been received.
+
+Header queries are ordinary synchronous methods, not futures, because
+`WinHttpQueryHeaders` answers on the calling thread even on an async handle.
+
+WinHTTP WebSockets, a higher-level request builder and URL parsing are out of
+scope.
+
 ```rs
-  let req = conn
-    .open_request(
-        HSTRING::from("GET"),
-        HSTRING::from("hello/world"),
-        HSTRING::from("HTTP/1.1"),
-        HSTRING::new(),
-        Some(vec![HSTRING::from("application/json")]),
-        WINHTTP_OPEN_REQUEST_FLAGS(0), // not use WINHTTP_FLAG_SECURE
-    )
-    .unwrap();
+let session = Session::new(&HSTRING::from("winasio-example"))?;
+    session.set_timeouts(5_000, 5_000, 5_000, 5_000)?;
+    let connection = session.connect(&host, port)?;
+    let mut request =
+        connection.open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)?;
 
-  let mut async_req: HRequestAsync = HRequestAsync::new(req);
+    let body = futures::executor::block_on(async {
+        request.send(None, Vec::new(), 0).await?;
+        request.receive_response().await?;
+        let status = request.status_code()?;
+        assert_eq!(status, 200);
 
-  async_req.async_send(HSTRING::new(), &[], 0).await.unwrap();
-
-  async_req.async_receive_response().await.unwrap();
-
-  loop {
-      let len = async_req.async_query_data_available().await.unwrap();
-      if len == 0 {
-          break;
-      }
-      let mut buffer: Vec<u8> = vec![0; len as usize];
-      let len_read = async_req
-          .async_read_data(buffer.as_mut_slice(), len)
-          .await
-          .unwrap();
-      assert!(len == len_read);
-      let s = String::from_utf8_lossy(&buffer);
-      print!("{}", s);
-  }
+        let mut body = Vec::new();
+        loop {
+            let available = request.query_data_available().await?;
+            if available == 0 {
+                break;
+            }
+            let OpResult(read, chunk) = request
+                .read_data(Vec::with_capacity(available as usize))
+                .await;
+            body.extend_from_slice(&chunk[..read?]);
+        }
+        Ok::<_, windows::core::Error>(body)
+    })?;
 ```
-See full working code in [example test](./crates/winasio-tests/tests/winhttp.rs)
-
+The snippet above is a literal, line-for-line copy of a test that runs in CI; see
+the [example test](./crates/winasio-tests/tests/winhttp.rs).
 # Layout
 This repo is a cargo workspace:
 - `crates/winasio`: the library crate.

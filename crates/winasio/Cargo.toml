@@ -9,6 +9,11 @@ repository.workspace = true
 [dependencies]
 windows = { workspace = true }
 
+[dev-dependencies]
+# Only for doc examples, which demonstrate that the `winhttp` client needs no
+# runtime by driving it on `futures::executor::block_on`.
+futures = { workspace = true }
+
 [features]
 # Exposes allocation accounting used by the integration test suite.
 test-util = []
