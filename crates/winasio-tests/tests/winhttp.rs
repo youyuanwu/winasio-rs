@@ -20,7 +20,8 @@ use windows::core::HSTRING;
 
 use winasio::iocp::{IoBuf, OpResult};
 use winasio::winhttp::{
-    encode_headers, live_context_count, CertificateRelaxations, Session, WinHttpError,
+    encode_headers, live_context_count, CertificateRelaxations, RedirectPolicy, Session,
+    WinHttpError,
 };
 
 // ------------------------------------------------------------------ server
@@ -46,6 +47,11 @@ enum ServerMode {
     SlowBody,
     /// Read the request, then close without writing any response.
     AcceptThenClose,
+    /// Answer `301` pointing at `/moved`, and answer `200` for `/moved`.
+    ///
+    /// Two requests on two connections, because `Connection: close` ends each
+    /// one. What the client reports depends entirely on its redirect policy.
+    Redirect,
 }
 
 struct Server {
@@ -134,6 +140,23 @@ fn serve(
             let _ = stream.flush();
             std::thread::sleep(Duration::from_millis(1_500));
             let _ = stream.write_all(body.as_bytes());
+        }
+        ServerMode::Redirect => {
+            let head =
+                String::from_utf8_lossy(&sink.lock().unwrap().last().cloned().unwrap_or_default())
+                    .into_owned();
+            let response = if head.starts_with("GET /moved") {
+                let body = "arrived after a redirect";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: /moved\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            };
+            let _ = stream.write_all(response.as_bytes());
         }
         // Handled before the request was read.
         ServerMode::Silent => {}
@@ -758,4 +781,65 @@ fn the_documented_example_fetches_a_body() -> Result<(), windows::core::Error> {
 
     assert_eq!(body, b"hello, winasio");
     Ok(())
+}
+
+#[test]
+fn an_empty_header_block_is_not_a_crash() {
+    // `Some(Vec::new())` is what a caller gets from encoding an empty header
+    // map. Forwarded verbatim it faults the process with an access violation,
+    // because windows-rs hands WinHTTP the empty `Vec`'s dangling pointer and
+    // WinHTTP dereferences it whatever the length says. The module normalises
+    // it to "no headers"; this test is here so nobody undoes that.
+    let server = spawn_server(ServerMode::Respond, "no headers of my own");
+
+    let session = Session::new(&agent()).unwrap();
+    session.set_timeouts(5_000, 5_000, 5_000, 5_000).unwrap();
+    let connection = session.connect(&server.host(), server.port).unwrap();
+    let mut request = connection
+        .open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)
+        .unwrap();
+
+    let status = futures::executor::block_on(async {
+        request.send(Some(Vec::new()), Vec::new(), 0).await.unwrap();
+        request.receive_response().await.unwrap();
+        request.status_code().unwrap()
+    });
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn a_session_with_redirects_disabled_returns_the_redirect() {
+    // The platform default follows the redirect and shows the caller only the
+    // final response. With the policy set on the *session*, every request
+    // derived from it sees the redirect itself.
+    let server = spawn_server(ServerMode::Redirect, "");
+
+    let session = Session::new(&agent()).unwrap();
+    session.set_timeouts(5_000, 5_000, 5_000, 5_000).unwrap();
+    session.set_redirect_policy(RedirectPolicy::Never).unwrap();
+    let connection = session.connect(&server.host(), server.port).unwrap();
+    let mut request = connection
+        .open_request(&HSTRING::from("GET"), &HSTRING::from("/"), &[], false)
+        .unwrap();
+
+    let (status, headers) = futures::executor::block_on(async {
+        request.send(None, Vec::new(), 0).await.unwrap();
+        request.receive_response().await.unwrap();
+        (
+            request.status_code().unwrap(),
+            request.raw_headers().unwrap(),
+        )
+    });
+    assert_eq!(status, 301);
+    assert!(headers.contains("/moved"), "headers were {headers:?}");
+}
+
+#[test]
+fn the_platform_follows_a_redirect_unless_told_not_to() {
+    // The counterpart of the test above, and the reason it exists: left alone,
+    // WinHTTP swallows the 301 and reports only the 200 that followed it.
+    let server = spawn_server(ServerMode::Redirect, "");
+    let (status, _, body) = get(&server, "/");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"arrived after a redirect");
 }

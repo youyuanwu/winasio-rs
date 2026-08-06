@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/winasio", "crates/winasio-tests"]
+members = ["crates/winasio", "crates/winasio-tests", "crates/winasio-util"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,14 @@ repository = "https://github.com/youyuanwu/winasio-rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [workspace.dependencies]
 winasio = { path = "crates/winasio" }
+winasio-util = { path = "crates/winasio-util" }
+
+# Versions chosen to match hyper 1.x, so that a hyper user's `http` types are
+# the same types this workspace's client accepts.
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1.2"
 
 windows = { version = "0.62", features = [
     "Win32_Foundation",
