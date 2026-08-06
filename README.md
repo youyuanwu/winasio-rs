@@ -211,9 +211,68 @@ let session = Session::new(&HSTRING::from("winasio-example"))?;
 ```
 The snippet above is a literal, line-for-line copy of a test that runs in CI; see
 the [example test](./crates/winasio-tests/tests/winhttp.rs).
+
+Redirects are followed by the platform unless told otherwise, and the default is
+worth knowing about: a `301` answering a `POST` is silently replayed as a `GET`
+with the body dropped, and a redirect arriving for a request whose body was
+streamed fails the transfer outright. `Session::set_redirect_policy` turns it
+off.
+
+# Winasio-util
+A higher-level HTTP **client** over `winasio::winhttp`, shaped around the `http`
+crate. Send an `http::Request`, get back an `http::Response` whose body
+implements `http_body::Body` over `bytes::Bytes` -- the same types hyper uses, so
+a hyper user should find nothing surprising in the shape of the API, only in what
+it deliberately does not have.
+
+```rs
+let client = Client::new("winasio-util/0.1")?;
+let request = http::Request::get("http://example.com/").body(Empty::<Bytes>::new())?;
+
+// No runtime anywhere: `block_on` is a bare single-threaded executor.
+let response = futures::executor::block_on(client.request(request))?;
+assert!(response.status().is_success());
+
+let body = futures::executor::block_on(response.into_body().collect())?.to_bytes();
+```
+
+The crate owns message framing: `Content-Length` and `Transfer-Encoding` are
+derived from the request body's `size_hint`, and a caller that sets either is
+refused. A known length is declared up front; an unknown one is streamed with
+chunked framing rather than buffered, so a body larger than memory still works.
+
+A request header whose value is not printable ASCII is **rejected**, naming the
+header, rather than lossily converted -- `http::HeaderValue` holds arbitrary
+bytes and WinHTTP wants UTF-16, and sending something the caller did not write
+would be worse than failing. Response headers are parsed from the raw header
+block rather than queried by name, so repeated headers such as `Set-Cookie`
+survive as multiple `HeaderMap` entries.
+
+**A body that was cut off is never a body that ended.** WinHTTP reports a
+connection closed gracefully mid-body as a clean end of body, which is exactly
+the trap `crates/winasio/src/net/outcome.rs` was written to avoid one level down.
+This crate counts delivered bytes against the declared `Content-Length` and
+reports `Error::TruncatedBody`. A chunked or close-delimited response has no
+declared length and cannot be checked; that is a property of HTTP and is
+documented rather than guessed around.
+
+Redirect following is off, because the platform's rewrites a `POST` into a `GET`
+without saying so and breaks every streamed body. Connection pooling, cookie
+jars, retry policy, the server side, and implementations of hyper's own
+client/server traits are all out of scope.
+
+The response body is an explicit state machine that **owns** its `Request` and
+holds one boxed operation future across polls. Every operation in the lower crate
+borrows the request mutably, so a `Body` holding both would be self-referential;
+inverting the ownership solves it in safe Rust. Recreating the future on each
+poll -- the obvious alternative -- was measured to retire a buffer per poll and
+then park the request with `ERROR_BUSY`. The module docs record the rejected
+alternatives in full.
+
 # Layout
 This repo is a cargo workspace:
 - `crates/winasio`: the library crate.
+- `crates/winasio-util`: higher-level HTTP client built on `winasio::winhttp`.
 - `crates/winasio-tests`: test only crate holding the integration tests.
 
 # MISC
