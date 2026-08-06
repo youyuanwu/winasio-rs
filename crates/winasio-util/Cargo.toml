@@ -1,0 +1,20 @@
+[package]
+name = "winasio-util"
+description = "Higher-level HTTP client over winasio's WinHTTP bindings, shaped around the http crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+winasio = { workspace = true }
+windows = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+# Deliberately not tokio. The client is runtime-agnostic and the doc examples
+# and unit tests prove it by running on `futures::executor::block_on`.
+futures = { workspace = true }
+http-body-util = { workspace = true }

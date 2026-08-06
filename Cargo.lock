@@ -1058,14 +1058,32 @@ dependencies = [
 name = "winasio-tests"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "rand",
  "serde",
  "serde_derive",
  "serde_json",
  "tokio",
  "warp",
+ "winasio",
+ "winasio-util",
+ "windows",
+]
+
+[[package]]
+name = "winasio-util"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "http",
+ "http-body",
+ "http-body-util",
  "winasio",
  "windows",
 ]

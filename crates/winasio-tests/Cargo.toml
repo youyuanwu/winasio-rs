@@ -11,6 +11,11 @@ publish = false
 
 [dev-dependencies]
 winasio = { workspace = true, features = ["test-util"] }
+winasio-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 warp = { workspace = true }
@@ -18,7 +23,7 @@ serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
-windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes"] }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock"] }
 criterion = { workspace = true }
 
 [[bench]]
