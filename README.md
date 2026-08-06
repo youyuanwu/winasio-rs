@@ -257,9 +257,21 @@ declared length and cannot be checked; that is a property of HTTP and is
 documented rather than guessed around.
 
 Redirect following is off, because the platform's rewrites a `POST` into a `GET`
-without saying so and breaks every streamed body. Connection pooling, cookie
-jars, retry policy, the server side, and implementations of hyper's own
-client/server traits are all out of scope.
+without saying so and breaks every streamed body. Cookie jars, retry policy, the
+server side, and implementations of hyper's own client/server traits are all out
+of scope.
+
+This crate implements no connection pool -- but WinHTTP keeps one anyway, and it
+was measured to be **process-wide**, not per-session: a brand new `Client` per
+request reuses sockets exactly as often as a shared one does. WinHTTP does not
+retry a pooled connection the server has since closed, in synchronous or
+asynchronous mode, so a healthy server reaping an idle keep-alive connection can
+occasionally surface a transport error. That is reported rather than papered
+over: a retry would be out of scope, unsafe for a non-idempotent request, and
+impossible anyway once `WinHttpSendRequest` has consumed the body. The failure is
+always a visible `Stage::ReceiveResponse` error carrying
+`WinHttpError::ConnectionError`, never a silent truncation, so a caller who knows
+its request is idempotent can retry on exactly that.
 
 The response body is an explicit state machine that **owns** its `Request` and
 holds one boxed operation future across polls. Every operation in the lower crate

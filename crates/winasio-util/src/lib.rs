@@ -35,11 +35,16 @@
 //!
 //! Deliberately absent, each because doing it badly is worse than not doing it:
 //!
-//! * **No connection pooling.** Every request opens its own connection.
+//! * **No connection pooling of its own.** This crate never reuses a
+//!   connection deliberately — but WinHTTP does, in a process-wide keep-alive
+//!   pool that no option here turns off. The [`Client`] documentation records
+//!   what was measured about it and the one consequence callers must handle.
 //! * **No redirect following.** A `3xx` is returned as the response it is. The
 //!   [`Client`] documentation explains why the platform's own redirect handling
 //!   is switched off rather than left alone.
-//! * **No cookie jar, no retry policy, no authentication helpers.**
+//! * **No cookie jar, no retry policy, no authentication helpers.** The absence
+//!   of a retry is load-bearing rather than merely unimplemented: see
+//!   [`Client`] on why a stale pooled connection is reported instead.
 //! * **No server side, and no hyper trait implementations.** This crate does
 //!   not let hyper drive WinHTTP; it offers hyper's *types* over WinHTTP.
 //!

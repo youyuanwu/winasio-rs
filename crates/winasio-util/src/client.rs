@@ -8,12 +8,12 @@
 //!
 //! # Invariants and obligations
 //!
-//! * **One request per transfer.** There is no connection pool and no reuse.
-//!   Each call to [`Client::request`] opens a connection, sends one request and
-//!   returns one response. Keeping a pool honest needs an idle-timeout policy,
-//!   a per-origin limit and a story about what happens when the server closes a
-//!   pooled connection between requests — none of which this crate has, and all
-//!   of which are worse than absent when they are half-present.
+//! * **One request per call, but not one connection per call.** Each call to
+//!   [`Client::request`] sends one request and returns one response. It does
+//!   *not* follow that each call gets its own socket: WinHTTP keeps a keep-alive
+//!   connection pool underneath, and that pool is outside this crate's control.
+//!   See "Connection reuse belongs to the platform" below, because it has a
+//!   consequence callers have to know about.
 //! * **The client owns message framing.** `Content-Length` and
 //!   `Transfer-Encoding` are derived from the body's
 //!   [`size_hint`](http_body::Body::size_hint). A caller that sets either is
@@ -27,6 +27,44 @@
 //! * **No runtime is required.** Nothing here spawns a task, blocks a thread or
 //!   touches a reactor; the returned futures run on any executor, including
 //!   `futures::executor::block_on`.
+//!
+//! # Connection reuse belongs to the platform
+//!
+//! This crate implements no connection pool, and an earlier draft of these docs
+//! said flatly that there was "no pool and no reuse". That was wrong, and the
+//! measurement that corrected it is worth recording, because the difference is
+//! visible to callers.
+//!
+//! WinHTTP maintains its own keep-alive pool. Measured, against a server that
+//! answers an HTTP/1.1 request without `Connection: close` and then closes:
+//!
+//! * The pool is **process-wide, not per-session**. Building a brand new
+//!   [`Client`] for every request — a fresh `WinHttpOpen` session, closed again
+//!   afterwards — reused sockets exactly as often as sharing one client did.
+//!   Dropping the client does not drop the pooled connection.
+//! * WinHTTP does **not retry** a pooled socket that turns out to be dead. The
+//!   request fails with `ERROR_WINHTTP_CONNECTION_ERROR` at
+//!   [`receive_response`](winasio::winhttp::Request::receive_response), which
+//!   arrives here as [`Error::Transport`] with [`Stage::ReceiveResponse`].
+//! * That is WinHTTP's own behaviour, not something this crate provokes: a
+//!   hand-written *synchronous* WinHTTP client, sharing nothing with this crate
+//!   but the platform, failed identically, and the failure is unaffected by
+//!   this crate's redirect-policy setting.
+//!
+//! The consequence is that a perfectly healthy server which closes an idle
+//! keep-alive connection can occasionally hand a caller a transport error that
+//! a retry would have made disappear. This crate does not retry, for three
+//! reasons. Retry policy is out of its scope. Replaying a request that is not
+//! idempotent is unsafe, because the server may already have acted on it. And
+//! structurally it could not: `WinHttpSendRequest` consumes the request body
+//! and never returns it, so by the time the failure is visible there is nothing
+//! left to replay.
+//!
+//! What a caller is owed instead is the ability to *see* it, and that is
+//! guaranteed: the failure is a [`Stage::ReceiveResponse`] transport error
+//! whose [`Error::win_http`] is [`WinHttpError::ConnectionError`], never a
+//! silent truncation and never a hang. A caller that knows its own request is
+//! idempotent can retry on exactly that.
 //!
 //! # Why redirects are off
 //!

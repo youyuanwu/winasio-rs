@@ -31,6 +31,13 @@ use winasio_util::{Client, Error, ResponseBody, WinHttpError};
 // ------------------------------------------------------------------ server
 
 /// What the server does once it has read a request.
+///
+/// Every variant here answers once and then closes, so every response it writes
+/// must carry `Connection: close`. That is not politeness: HTTP/1.1 defaults to
+/// a persistent connection, WinHTTP keeps a **process-wide** keep-alive pool,
+/// and a socket returned to that pool by a server that then closes it will fail
+/// the *next* request with `ERROR_WINHTTP_CONNECTION_ERROR`. `check_announces_close`
+/// enforces it; [`Reply::PretendsPersistent`] is the one deliberate exception.
 #[derive(Clone)]
 enum Reply {
     /// Write these bytes, then close.
@@ -46,6 +53,12 @@ enum Reply {
     Redirect,
     /// Read the request and never answer.
     Silent,
+    /// Answer *without* announcing the close, wait, and then close anyway —
+    /// the incorrect-but-common server behaviour that leaves a dead socket in
+    /// WinHTTP's pool. The pause is what makes it deterministic: it guarantees
+    /// the socket is still open, and so still poolable, when the client
+    /// finishes reading the response.
+    PretendsPersistent(&'static str, Duration),
 }
 
 struct Server {
@@ -69,6 +82,7 @@ impl Server {
 }
 
 fn spawn(reply: Reply) -> Server {
+    check_announces_close(&reply);
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -84,6 +98,33 @@ fn spawn(reply: Reply) -> Server {
     });
 
     Server { port, requests }
+}
+
+/// Refuse to start a server whose response would advertise a connection it is
+/// about to close.
+///
+/// This is checked on the calling thread, so a mistake names the test that made
+/// it rather than quietly killing a server thread. It exists because the
+/// omission is invisible until it is not: `a_client_is_shared_across_threads`
+/// passed locally and in isolation for an entire PR, then failed CI roughly one
+/// run in fifteen, because WinHTTP had pooled a socket this server had already
+/// closed. The pool is process-wide — measured, not assumed — so every server
+/// here was exposed, not merely the one test that shares a `Client`.
+fn check_announces_close(reply: &Reply) {
+    let head = match reply {
+        Reply::Raw(bytes) | Reply::RawThenReset(bytes) | Reply::Split(bytes, _, _) => *bytes,
+        // Both of `Redirect`'s responses announce it; `Silent` never answers.
+        Reply::Redirect | Reply::Silent => return,
+        // The deliberate exception: this variant exists to reproduce the fault.
+        Reply::PretendsPersistent(..) => return,
+    };
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "this server answers once and then closes, so its response must say \
+         `Connection: close`. Without it WinHTTP returns the socket to its \
+         process-wide keep-alive pool and the next request to use it dies with \
+         ERROR_WINHTTP_CONNECTION_ERROR. Offending response: {head:?}"
+    );
 }
 
 fn serve(mut stream: TcpStream, reply: Reply, sink: Arc<Mutex<Vec<Vec<u8>>>>) {
@@ -129,6 +170,15 @@ fn serve(mut stream: TcpStream, reply: Reply, sink: Arc<Mutex<Vec<Vec<u8>>>>) {
             let _ = stream.shutdown(Shutdown::Both);
         }
         Reply::Silent => std::thread::sleep(Duration::from_secs(30)),
+        Reply::PretendsPersistent(bytes, pause) => {
+            let _ = stream.write_all(bytes.as_bytes());
+            let _ = stream.flush();
+            // Staying open across the client's read is the whole point: the
+            // socket looks reusable at exactly the moment WinHTTP decides
+            // whether to keep it.
+            std::thread::sleep(pause);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -249,7 +299,7 @@ fn a_get_completes_on_a_bare_executor_with_no_runtime() {
     // The server is a plain thread, so nothing in the fixture supplies one
     // either.
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 26\r\n\r\nhello from a bare executor",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 26\r\nConnection: close\r\n\r\nhello from a bare executor",
     ));
     let client = client();
     let request = Request::get(server.uri("/")).body(empty()).unwrap();
@@ -263,7 +313,7 @@ fn a_get_completes_on_a_bare_executor_with_no_runtime() {
 #[test]
 fn a_response_carries_its_status_version_headers_and_body() {
     let server = spawn(Reply::Raw(
-        "HTTP/1.0 201 Created\r\nContent-Type: application/json\r\nX-Note: kept\r\nContent-Length: 2\r\n\r\n{}",
+        "HTTP/1.0 201 Created\r\nContent-Type: application/json\r\nX-Note: kept\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     ));
     let response = block_on(
         client().request(
@@ -292,7 +342,7 @@ fn duplicate_response_headers_survive_as_separate_entries() {
     // Parsing the raw block is what keeps both, and this is the test that says
     // so.
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nSet-Cookie: c=3\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nSet-Cookie: c=3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
@@ -312,7 +362,7 @@ fn a_truncated_body_is_an_error_not_a_body_that_ended() {
     // sends three, and closes *gracefully*. WinHTTP reports that as a body
     // that ended: `query_data_available` returns zero and nothing fails.
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc",
     ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
@@ -336,7 +386,7 @@ fn a_body_cut_off_by_a_reset_is_also_an_error() {
     // The other half of the same story: an RST does reach the caller as a
     // platform error, and must not be mistaken for a clean end either.
     let server = spawn(Reply::RawThenReset(
-        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc",
     ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
@@ -355,7 +405,9 @@ fn a_body_cut_off_by_a_reset_is_also_an_error() {
 fn a_close_delimited_body_ends_cleanly() {
     // No `Content-Length`, so nothing was promised and nothing can be owed.
     // The body must end rather than invent a truncation.
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\n\r\nno length declared"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nno length declared",
+    ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
     assert_eq!(
@@ -367,7 +419,7 @@ fn a_close_delimited_body_ends_cleanly() {
 #[test]
 fn a_chunked_response_is_dechunked_and_ends_cleanly() {
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
     ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
@@ -387,7 +439,7 @@ fn a_body_polled_while_pending_is_never_abandoned() {
     // with `ERROR_BUSY`. This polls hard across a real pause and must still
     // deliver both halves.
     let server = spawn(Reply::Split(
-        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcde",
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcde",
         Duration::from_millis(600),
         "fghij",
     ));
@@ -427,7 +479,9 @@ fn a_body_polled_while_pending_is_never_abandoned() {
 
 #[test]
 fn a_finished_body_keeps_reporting_end_of_stream() {
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+    ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
 
@@ -450,7 +504,9 @@ fn a_finished_body_keeps_reporting_end_of_stream() {
 fn a_head_response_has_an_exactly_zero_size_hint() {
     // Measured: a `HEAD` response carrying `Content-Length: 10` reports zero
     // bytes available. Believing the header would invent a truncation.
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
+    ));
     let response = block_on(
         client().request(
             Request::builder()
@@ -472,7 +528,7 @@ fn a_head_response_has_an_exactly_zero_size_hint() {
 #[test]
 fn a_no_content_response_has_no_body_whatever_it_declares() {
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nContent-Length: 10\r\nConnection: close\r\n\r\n",
     ));
     let response =
         block_on(client().request(Request::get(server.uri("/")).body(empty()).unwrap())).unwrap();
@@ -482,7 +538,9 @@ fn a_no_content_response_has_no_body_whatever_it_declares() {
 
 #[test]
 fn a_post_with_a_known_length_body_arrives_complete() {
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    ));
     let response = block_on(
         client().request(
             Request::post(server.uri("/submit"))
@@ -506,7 +564,9 @@ fn a_large_known_length_body_is_written_in_full() {
     // Larger than the crate's own write ceiling, so the write loop runs more
     // than once.
     let payload = vec![b'x'; 200 * 1024];
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let response = block_on(
         client().request(
             Request::post(server.uri("/big"))
@@ -530,7 +590,9 @@ fn a_large_known_length_body_is_written_in_full() {
 fn a_body_of_unknown_length_is_sent_chunked() {
     // `StreamBody` cannot know its own length, so the client must choose
     // chunked framing and do the framing itself.
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let frames = futures::stream::iter(vec![
         Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::from_static(b"one"))),
         Ok(http_body::Frame::data(Bytes::from_static(b"two"))),
@@ -557,7 +619,9 @@ fn a_body_of_unknown_length_is_sent_chunked() {
 
 #[test]
 fn an_empty_body_sends_no_body_at_all() {
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let response = block_on(
         client().request(
             Request::post(server.uri("/nothing"))
@@ -576,7 +640,9 @@ fn an_empty_body_sends_no_body_at_all() {
 fn a_non_ascii_request_header_is_rejected_before_anything_is_sent() {
     // Rejecting rather than lossily converting, and rejecting *early* so that
     // the error can name the header rather than being an opaque platform code.
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let request = Request::get(server.uri("/"))
         .header("x-note", HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap())
         .body(empty())
@@ -596,7 +662,9 @@ fn a_non_ascii_request_header_is_rejected_before_anything_is_sent() {
 
 #[test]
 fn a_caller_supplied_framing_header_is_refused() {
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     for name in ["content-length", "transfer-encoding"] {
         let request = Request::post(server.uri("/"))
             .header(name, "7")
@@ -665,7 +733,9 @@ fn a_body_larger_than_the_platform_can_declare_is_refused() {
         }
     }
 
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let error = block_on(client().request(Request::post(server.uri("/")).body(Enormous).unwrap()))
         .unwrap_err();
     assert!(
@@ -695,7 +765,9 @@ fn a_body_that_breaks_its_size_hint_promise_is_an_error() {
         }
     }
 
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let error =
         block_on(client().request(Request::post(server.uri("/")).body(Liar).unwrap())).unwrap_err();
     assert!(
@@ -724,7 +796,9 @@ fn a_request_body_that_fails_is_reported_as_a_body_failure() {
         }
     }
 
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let error = block_on(client().request(Request::post(server.uri("/")).body(Broken).unwrap()))
         .unwrap_err();
     // Not folded into a transport error: the caller's own body failed, and
@@ -746,7 +820,9 @@ fn a_scheme_that_is_not_http_is_refused() {
 
 #[test]
 fn a_custom_method_token_reaches_the_wire() {
-    let server = spawn(Reply::Raw("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+    let server = spawn(Reply::Raw(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
     let response = block_on(
         client().request(
             Request::builder()
@@ -775,9 +851,67 @@ fn a_receive_deadline_that_elapses_is_a_timeout_not_an_empty_response() {
 }
 
 #[test]
+fn a_stale_pooled_connection_is_a_visible_error_not_a_silent_wrong_answer() {
+    // WinHTTP keeps a keep-alive connection pool and does not retry a socket
+    // that turns out to be dead. All of that was measured rather than read:
+    // the pool is process-wide (a brand new `Client` per request reuses
+    // sockets just as much as a shared one), and the absence of a retry is the
+    // same in synchronous WinHTTP, so it is neither this crate's async
+    // plumbing nor its redirect policy that suppresses one.
+    //
+    // This crate deliberately does not paper over that. A retry is out of
+    // scope, and it could not be done honestly anyway: `send` consumes the
+    // request body and never gives it back, so there is nothing left to
+    // replay, and replaying a POST the server may already have acted on is
+    // not safe regardless. What the caller is owed instead is the ability to
+    // *see* it, so this pins down that the failure is a recognisable transport
+    // error — never a hang, never a truncated body dressed up as a whole one.
+    //
+    // The server here is the badly behaved one on purpose: it answers without
+    // `Connection: close`, so the socket goes into the pool, and only then
+    // closes.
+    let server = spawn(Reply::PretendsPersistent(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh",
+        Duration::from_millis(250),
+    ));
+    let client = client();
+
+    let mut failures = 0usize;
+    for attempt in 0..8 {
+        let result = block_on(client.request(Request::get(server.uri("/")).body(empty()).unwrap()))
+            .and_then(|response| collect(response.into_body()));
+        match result {
+            // A request that got a fresh socket must be answered in full.
+            Ok(body) => assert_eq!(body, &b"fresh"[..], "attempt {attempt}"),
+            // A request that got the stale one must say so recognisably.
+            Err(error) => {
+                failures += 1;
+                assert!(
+                    matches!(
+                        error.win_http(),
+                        Some(WinHttpError::ConnectionError)
+                            | Some(WinHttpError::InvalidServerResponse)
+                    ),
+                    "attempt {attempt} failed unrecognisably: {error:?}"
+                );
+            }
+        }
+    }
+
+    // If this ever stops holding, WinHTTP has started retrying stale pooled
+    // connections and the documented wart in `winasio_util::client` is stale
+    // too. That is worth finding out about, so it is asserted rather than
+    // tolerated.
+    assert!(
+        failures > 0,
+        "no request hit the stale pooled socket, so this test proved nothing"
+    );
+}
+
+#[test]
 fn a_client_is_shared_across_threads() {
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nshared",
+        "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nshared",
     ));
     let client = Arc::new(client());
     let handles: Vec<_> = (0..4)
@@ -802,7 +936,7 @@ fn dropping_an_unfinished_body_does_not_hang() {
     // Dropping mid-transfer must return promptly rather than waiting for the
     // pause the server is sitting in.
     let server = spawn(Reply::Split(
-        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcde",
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcde",
         Duration::from_secs(5),
         "fghij",
     ));
@@ -824,7 +958,7 @@ fn the_documented_example_works_against_a_real_server() {
     // The crate-level doc example is `no_run`, because it talks to
     // example.com. This is the same code against a server that exists.
     let server = spawn(Reply::Raw(
-        "HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nhello, winasio",
+        "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nhello, winasio",
     ));
     let client = Client::new("winasio-util/0.1").unwrap();
     let request = Request::get(server.uri("/"))
