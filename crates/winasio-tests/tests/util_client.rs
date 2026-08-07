@@ -26,7 +26,9 @@ use futures::executor::block_on;
 use http::{HeaderValue, Method, Request, StatusCode, Version};
 use http_body::Body as _;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
-use winasio_util::{Client, Error, ResponseBody, WinHttpError};
+use winasio_util::{
+    BodyError, Client, RequestError, ResponseBody, ResponseBodyError, WinHttpError,
+};
 
 // ------------------------------------------------------------------ server
 
@@ -277,7 +279,7 @@ fn empty() -> Empty<Bytes> {
 }
 
 /// Read a whole body, or return the error that stopped it.
-fn collect(body: ResponseBody) -> Result<Bytes, Error> {
+fn collect(body: ResponseBody) -> Result<Bytes, ResponseBodyError> {
     block_on(async {
         let mut out = Vec::new();
         let mut body = std::pin::pin!(body);
@@ -372,7 +374,7 @@ fn a_truncated_body_is_an_error_not_a_body_that_ended() {
     assert!(
         matches!(
             error,
-            Error::TruncatedBody {
+            ResponseBodyError::Truncated {
                 expected: 10,
                 received: 3
             }
@@ -395,7 +397,7 @@ fn a_body_cut_off_by_a_reset_is_also_an_error() {
     // Either shape is an error, which is the point; which one depends on
     // whether the reset overtakes the data.
     assert!(
-        matches!(error, Error::TruncatedBody { .. })
+        matches!(error, ResponseBodyError::Truncated { .. })
             || error.win_http() == Some(WinHttpError::ConnectionError),
         "expected a failure, got {error}"
     );
@@ -650,7 +652,7 @@ fn a_non_ascii_request_header_is_rejected_before_anything_is_sent() {
 
     let error = block_on(client().request(request)).unwrap_err();
     assert!(
-        matches!(&error, Error::InvalidRequestHeader { name, .. } if name == "x-note"),
+        matches!(&error, RequestError::InvalidRequestHeader { name, .. } if name == "x-note"),
         "got {error}"
     );
     assert_eq!(
@@ -672,7 +674,7 @@ fn a_caller_supplied_framing_header_is_refused() {
             .unwrap();
         let error = block_on(client().request(request)).unwrap_err();
         assert!(
-            matches!(&error, Error::FramingHeaderNotAllowed { name: n } if n == name),
+            matches!(&error, RequestError::Body(BodyError::FramingHeaderNotAllowed { name: n }) if n == name),
             "{name} produced {error}"
         );
     }
@@ -739,7 +741,7 @@ fn a_body_larger_than_the_platform_can_declare_is_refused() {
     let error = block_on(client().request(Request::post(server.uri("/")).body(Enormous).unwrap()))
         .unwrap_err();
     assert!(
-        matches!(error, Error::BodyTooLarge { .. }),
+        matches!(error, RequestError::BodyTooLarge { .. }),
         "expected a refusal, got {error}"
     );
     assert_eq!(server.request_count(), 0);
@@ -773,10 +775,10 @@ fn a_body_that_breaks_its_size_hint_promise_is_an_error() {
     assert!(
         matches!(
             error,
-            Error::BodyLengthMismatch {
+            RequestError::Body(BodyError::LengthMismatch {
                 declared: 20,
                 actual: 0
-            }
+            })
         ),
         "expected a mismatch, got {error}"
     );
@@ -803,7 +805,10 @@ fn a_request_body_that_fails_is_reported_as_a_body_failure() {
         .unwrap_err();
     // Not folded into a transport error: the caller's own body failed, and
     // the cause is reachable through `source`.
-    assert!(matches!(error, Error::BodyError(_)), "got {error}");
+    assert!(
+        matches!(error, RequestError::Body(BodyError::Source(_))),
+        "got {error}"
+    );
     assert!(std::error::Error::source(&error)
         .unwrap()
         .to_string()
@@ -815,7 +820,10 @@ fn a_scheme_that_is_not_http_is_refused() {
     let error =
         block_on(client().request(Request::get("ftp://example.com/x").body(empty()).unwrap()))
             .unwrap_err();
-    assert!(matches!(error, Error::UnsupportedScheme { .. }), "{error}");
+    assert!(
+        matches!(error, RequestError::UnsupportedScheme { .. }),
+        "{error}"
+    );
 }
 
 #[test]
@@ -878,21 +886,26 @@ fn a_stale_pooled_connection_is_a_visible_error_not_a_silent_wrong_answer() {
 
     let mut failures = 0usize;
     for attempt in 0..8 {
-        let result = block_on(client.request(Request::get(server.uri("/")).body(empty()).unwrap()))
-            .and_then(|response| collect(response.into_body()));
+        let result =
+            match block_on(client.request(Request::get(server.uri("/")).body(empty()).unwrap())) {
+                Ok(response) => {
+                    collect(response.into_body()).map_err(|e| (e.win_http(), format!("{e:?}")))
+                }
+                Err(e) => Err((e.win_http(), format!("{e:?}"))),
+            };
         match result {
             // A request that got a fresh socket must be answered in full.
             Ok(body) => assert_eq!(body, &b"fresh"[..], "attempt {attempt}"),
             // A request that got the stale one must say so recognisably.
-            Err(error) => {
+            Err((code, rendered)) => {
                 failures += 1;
                 assert!(
                     matches!(
-                        error.win_http(),
+                        code,
                         Some(WinHttpError::ConnectionError)
                             | Some(WinHttpError::InvalidServerResponse)
                     ),
-                    "attempt {attempt} failed unrecognisably: {error:?}"
+                    "attempt {attempt} failed unrecognisably: {rendered}"
                 );
             }
         }

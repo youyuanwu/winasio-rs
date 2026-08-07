@@ -255,7 +255,7 @@ survive as multiple `HeaderMap` entries.
 connection closed gracefully mid-body as a clean end of body, which is exactly
 the trap `crates/winasio/src/net/outcome.rs` was written to avoid one level down.
 This crate counts delivered bytes against the declared `Content-Length` and
-reports `Error::TruncatedBody`. A chunked or close-delimited response has no
+reports `ResponseBodyError::Truncated`. A chunked or close-delimited response has no
 declared length and cannot be checked; that is a property of HTTP and is
 documented rather than guessed around.
 
@@ -271,7 +271,7 @@ asynchronous mode, so a healthy server reaping an idle keep-alive connection can
 occasionally surface a transport error. That is reported rather than papered
 over: a retry would be out of scope, unsafe for a non-idempotent request, and
 impossible anyway once `WinHttpSendRequest` has consumed the body. The failure is
-always a visible `Stage::ReceiveResponse` error carrying
+always a visible `RequestError::Transport` at `RequestStage::ReceiveResponse` carrying
 `WinHttpError::ConnectionError`, never a silent truncation, so a caller who knows
 its request is idempotent can retry on exactly that.
 

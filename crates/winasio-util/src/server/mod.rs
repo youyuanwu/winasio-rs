@@ -127,19 +127,19 @@
 //! # Invariants and obligations
 //!
 //! * **The crate owns response framing.** `Transfer-Encoding` is this crate's
-//!   to set; supplying one is [`Error::FramingHeaderNotAllowed`]. A
+//!   to set; supplying one is [`BodyError::FramingHeaderNotAllowed`]. A
 //!   `Content-Length` *may* be supplied — an `axum::Router` sets one, so
 //!   refusing it would make a real router unservable — and is then checked
 //!   against the body's [`size_hint`](http_body::Body::size_hint) rather than
-//!   trusted, with [`Error::BodyLengthMismatch`] if the two disagree and
-//!   [`Error::BadContentLength`] if it is unusable. Measured, HTTP.sys computes
+//!   trusted, with [`BodyError::LengthMismatch`] if the two disagree and
+//!   [`ResponseError::BadContentLength`] if it is unusable. Measured, HTTP.sys computes
 //!   a length only for a fully buffered reply and does **no** framing at all for
 //!   a streamed one — not even on a keep-alive connection, where the result is
 //!   an undelimited body running into the next response.
 //! * **A reply that under-delivers is an error, not a short message.** Measured,
 //!   HTTP.sys accepts five bytes against a declared twenty and emits a silently
 //!   truncated message. This crate counts and reports
-//!   [`Error::BodyLengthMismatch`] instead.
+//!   [`BodyError::LengthMismatch`] instead.
 //! * **A body that may not exist is not sent.** Measured, HTTP.sys sends the
 //!   body of a `HEAD` reply and of a `204` that was given one. This crate
 //!   suppresses both, and never polls a body it will not send.
@@ -148,18 +148,18 @@
 //!   value before this crate sees them. There is nothing here to preserve.
 //! * **Nothing is spawned and nothing is swallowed.** A service that returns
 //!   `Err` gets a bodiless `500` on the wire and the error is still returned as
-//!   [`Error::Service`].
+//!   [`ServeError::Service`].
 //! * **A dropped [`Responder`] answers nothing.** The peer waits for HTTP.sys's
 //!   own request timeout. Other requests on the queue are unaffected —
 //!   measured, and the invariant that matters when a handler panics. The one
 //!   place this crate abandons a request itself is when the head cannot be
 //!   expressed as an [`http::Request`] at all, and even there the peer gets a
-//!   bodiless `400` before [`Error::MalformedRequest`] is returned.
+//!   bodiless `400` before [`AcceptError::MalformedRequest`] is returned.
 //! * **Shutdown is abrupt for work in flight.** [`Server::shutdown`] closes the
 //!   queue. Measured, that surfaces two ways: a `receive` that was already
 //!   waiting fails with `ERROR_OPERATION_ABORTED`, and anything started
 //!   afterwards fails with `ERROR_INVALID_HANDLE`. Both are reported as
-//!   [`Error::is_queue_closed`], promptly and without hanging. Requests already
+//!   [`AcceptError::is_queue_closed`], promptly and without hanging. Requests already
 //!   received keep their heads readable but can no longer be answered.
 //!
 //! # What this module is not
@@ -183,7 +183,7 @@
 //!   already decoded.
 //! * **Detecting a truncated request body.** Measured, HTTP.sys reports it as
 //!   `ERROR_OPERATION_ABORTED` for both a graceful close and a reset — unlike
-//!   WinHTTP, which is why the client half needed [`Error::TruncatedBody`] and
+//!   WinHTTP, which is why the client half needed [`ResponseBodyError::Truncated`](crate::ResponseBodyError::Truncated) and
 //!   this one does not.
 
 pub mod backend;
@@ -207,7 +207,10 @@ pub use backend::Backend;
 pub use head::ConnectionInfo;
 pub use incoming::IncomingBody;
 
-use crate::error::{Error, ServerStage};
+use crate::error::{
+    platform, AcceptError, BodyError, PlatformError, RequestReason, ResponseError, SendStage,
+    ServeError, ServerOperation,
+};
 
 /// The largest piece of a response body written in one call.
 ///
@@ -234,10 +237,9 @@ pub struct ServerSession {
 
 impl ServerSession {
     /// Start the HTTP Server API and create a session in it.
-    pub fn new() -> Result<ServerSession, Error> {
-        let initializer =
-            HttpInitializer::new().map_err(Error::platform(ServerStage::Initialize))?;
-        let inner = PlatformSession::new().map_err(Error::platform(ServerStage::CreateSession))?;
+    pub fn new() -> Result<ServerSession, PlatformError> {
+        let initializer = HttpInitializer::new().map_err(platform(ServerOperation::Initialize))?;
+        let inner = PlatformSession::new().map_err(platform(ServerOperation::CreateSession))?;
         Ok(ServerSession {
             inner,
             _initializer: initializer,
@@ -267,7 +269,7 @@ impl<'a> ServerBuilder<'a> {
     /// claims everything under `/demo/`. Binding one usually requires either an
     /// elevated process or a `netsh http add urlacl` reservation; the failure
     /// arrives from [`build`](ServerBuilder::build) as
-    /// [`Error::Platform`] with [`ServerStage::AddUrl`].
+    /// [`PlatformError`] with [`ServerOperation::AddUrl`].
     pub fn url(mut self, url: &str) -> Self {
         self.urls.push(HSTRING::from(url));
         self
@@ -277,7 +279,7 @@ impl<'a> ServerBuilder<'a> {
     ///
     /// Rarely needed. The default grows the buffer and retries once, then
     /// discards a request that still will not fit — see
-    /// [`Error::RequestTooLarge`] for why the discard happens down there.
+    /// [`AcceptError::RequestTooLarge`] for why the discard happens down there.
     pub fn receive_config(mut self, receive: ReceiveConfig) -> Self {
         self.receive = receive;
         self
@@ -287,23 +289,23 @@ impl<'a> ServerBuilder<'a> {
     ///
     /// `registrar` is the completion backend: `&ThreadPool` for the ordinary
     /// case, or `&Rc<Proactor>` for a single-threaded loop.
-    pub fn build<R, S>(self, registrar: &R) -> Result<Server<'a, S>, Error>
+    pub fn build<R, S>(self, registrar: &R) -> Result<Server<'a, S>, PlatformError>
     where
         R: Registrar<Io = S>,
         S: Backend,
     {
         let group = UrlGroup::new(&self.session.inner)
-            .map_err(Error::platform(ServerStage::CreateUrlGroup))?;
+            .map_err(platform(ServerOperation::CreateUrlGroup))?;
         for url in &self.urls {
             group
                 .add_url(url)
-                .map_err(Error::platform(ServerStage::AddUrl))?;
+                .map_err(platform(ServerOperation::AddUrl))?;
         }
         let queue = RequestQueue::with_config(registrar, self.receive)
-            .map_err(Error::platform(ServerStage::CreateQueue))?;
+            .map_err(platform(ServerOperation::CreateQueue))?;
         queue
             .bind_url_group(&group)
-            .map_err(Error::platform(ServerStage::BindUrlGroup))?;
+            .map_err(platform(ServerOperation::BindUrlGroup))?;
 
         Ok(Server {
             _group: group,
@@ -362,7 +364,7 @@ impl<S: Backend> Server<'_, S> {
     /// already waiting fails promptly with `ERROR_OPERATION_ABORTED`, and every
     /// operation started afterwards — including `read_body` and `send` on a
     /// request that had already been accepted — fails with
-    /// `ERROR_INVALID_HANDLE`. Both read as [`Error::is_queue_closed`]. A
+    /// `ERROR_INVALID_HANDLE`. Both read as [`AcceptError::is_queue_closed`]. A
     /// request already in a handler keeps its head — the accessors read a buffer
     /// this process owns — but can no longer be answered.
     ///
@@ -370,10 +372,10 @@ impl<S: Backend> Server<'_, S> {
     /// this crate tracking it, and tracking it would mean owning the concurrency
     /// it has promised not to own. A caller that wants a drain stops accepting,
     /// finishes what it holds, and then calls this.
-    pub fn shutdown(&self) -> Result<(), Error> {
+    pub fn shutdown(&self) -> Result<(), PlatformError> {
         self.queue
             .close()
-            .map_err(Error::platform(ServerStage::Shutdown))
+            .map_err(platform(ServerOperation::Shutdown))
     }
 
     /// A handle that can shut this server down from elsewhere.
@@ -390,7 +392,7 @@ impl<S: Backend> Server<'_, S> {
     ///
     /// The returned [`Accepted`] owns everything it needs, so it can be moved
     /// onto a task the caller spawned.
-    pub async fn accept(&self) -> Result<Accepted<S>, Error> {
+    pub async fn accept(&self) -> Result<Accepted<S>, AcceptError> {
         let request = match self.queue.receive().await {
             Ok(request) => request,
             Err(ReceiveError::TooLarge {
@@ -398,12 +400,12 @@ impl<S: Backend> Server<'_, S> {
             }) => {
                 // The request is already gone; the layer below discards it
                 // rather than leave an accept loop re-receiving it forever.
-                return Err(Error::RequestTooLarge {
+                return Err(AcceptError::RequestTooLarge {
                     capacity: attempted_capacity,
                 });
             }
             Err(ReceiveError::Failed(error)) => {
-                return Err(Error::platform(ServerStage::Receive)(error));
+                return Err(AcceptError::Receive(error));
             }
         };
         let id = request.id();
@@ -433,7 +435,7 @@ impl<S: Backend> Server<'_, S> {
     /// Readiness is awaited **before** accepting, so a service that is not ready
     /// stops this crate pulling requests out of the kernel queue rather than
     /// accepting work it cannot place. See the [module documentation](self).
-    pub async fn serve_one<Svc, B>(&self, service: &mut Svc) -> Result<(), Error>
+    pub async fn serve_one<Svc, B>(&self, service: &mut Svc) -> Result<(), ServeError>
     where
         Svc: tower_service::Service<HttpRequest<IncomingBody<S>>, Response = HttpResponse<B>>,
         Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -453,7 +455,7 @@ impl<S: Backend> Server<'_, S> {
     /// the first error otherwise — including a malformed request or a failing
     /// service, neither of which is swallowed. A caller who wants to log and
     /// carry on writes the loop themselves over [`serve_one`](Server::serve_one)
-    /// and uses [`Error::is_queue_closed`] to spot the exit:
+    /// and uses [`AcceptError::is_queue_closed`] to spot the exit:
     ///
     /// ```no_run
     /// # async fn example<S: winasio_util::Backend, Svc>(
@@ -475,7 +477,7 @@ impl<S: Backend> Server<'_, S> {
     /// }
     /// # }
     /// ```
-    pub async fn serve<Svc, B>(&self, service: &mut Svc) -> Result<(), Error>
+    pub async fn serve<Svc, B>(&self, service: &mut Svc) -> Result<(), ServeError>
     where
         Svc: tower_service::Service<HttpRequest<IncomingBody<S>>, Response = HttpResponse<B>>,
         Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -494,7 +496,7 @@ impl<S: Backend> Server<'_, S> {
 }
 
 /// Await a service's readiness.
-async fn ready<Svc, R>(service: &mut Svc) -> Result<(), Error>
+async fn ready<Svc, R>(service: &mut Svc) -> Result<(), ServeError>
 where
     Svc: tower_service::Service<R>,
     Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -503,7 +505,7 @@ where
     // dependency stays the trait-only `tower-service`.
     std::future::poll_fn(|context| service.poll_ready(context))
         .await
-        .map_err(|error| Error::Service(error.into()))
+        .map_err(|error| ServeError::Service(error.into()))
 }
 
 /// Shuts a [`Server`] down from somewhere else.
@@ -531,10 +533,10 @@ impl<S: Backend> std::fmt::Debug for ShutdownHandle<S> {
 
 impl<S: Backend> ShutdownHandle<S> {
     /// Close the request queue. See [`Server::shutdown`].
-    pub fn shutdown(&self) -> Result<(), Error> {
+    pub fn shutdown(&self) -> Result<(), PlatformError> {
         self.queue
             .close()
-            .map_err(Error::platform(ServerStage::Shutdown))
+            .map_err(platform(ServerOperation::Shutdown))
     }
 }
 
@@ -559,7 +561,10 @@ impl<S: Backend> std::fmt::Debug for Accepted<S> {
 }
 
 impl<S: Backend> Accepted<S> {
-    fn from_platform(queue: Arc<RequestQueue<S>>, request: Request) -> Result<Accepted<S>, Error> {
+    fn from_platform(
+        queue: Arc<RequestQueue<S>>,
+        request: Request,
+    ) -> Result<Accepted<S>, AcceptError> {
         let head = head::to_http(&request)?;
         let declared = crate::headers::content_length(&head.headers);
         let body = incoming::body_for(
@@ -589,8 +594,8 @@ impl<S: Backend> Accepted<S> {
         }
         let request = builder
             .body(body)
-            .map_err(|error| Error::MalformedRequest {
-                reason: crate::error::RequestReason::Target,
+            .map_err(|error| AcceptError::MalformedRequest {
+                reason: RequestReason::Target,
                 value: error.to_string(),
             })?;
 
@@ -613,7 +618,7 @@ impl<S: Backend> Accepted<S> {
     /// `&mut` across tasks; the idiom is to clone per request, which is what
     /// tower services are for. Readiness is awaited on the service passed in —
     /// see the [module documentation](self) on why that order matters.
-    pub async fn serve<Svc, B>(self, mut service: Svc) -> Result<(), Error>
+    pub async fn serve<Svc, B>(self, mut service: Svc) -> Result<(), ServeError>
     where
         Svc: tower_service::Service<HttpRequest<IncomingBody<S>>, Response = HttpResponse<B>>,
         Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -660,11 +665,11 @@ impl<S: Backend> Responder<S> {
     ///
     /// Measured: the peer receives nothing at all and the connection is closed.
     /// Useful for a request that should not get so much as a status code.
-    pub async fn reject(self) -> Result<(), Error> {
+    pub async fn reject(self) -> Result<(), PlatformError> {
         self.queue
             .reject(self.id)
             .await
-            .map_err(Error::platform(ServerStage::Reject))
+            .map_err(platform(ServerOperation::Reject))
     }
 
     /// Send a response.
@@ -672,7 +677,7 @@ impl<S: Backend> Responder<S> {
     /// Framing is chosen from `body.size_hint()`; see the
     /// [module documentation](self) for the rules and the measurements behind
     /// them.
-    pub async fn send<B>(self, response: HttpResponse<B>) -> Result<(), Error>
+    pub async fn send<B>(self, response: HttpResponse<B>) -> Result<(), ResponseError>
     where
         B: Body,
         B::Data: Buf,
@@ -683,7 +688,7 @@ impl<S: Backend> Responder<S> {
     }
 
     /// Run a service's future and put whatever it produced on the wire.
-    async fn dispatch<F, B, E>(self, call: F) -> Result<(), Error>
+    async fn dispatch<F, B, E>(self, call: F) -> Result<(), ServeError>
     where
         F: Future<Output = Result<HttpResponse<B>, E>>,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -692,20 +697,20 @@ impl<S: Backend> Responder<S> {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         match call.await {
-            Ok(response) => self.send(response).await,
+            Ok(response) => self.send(response).await.map_err(ServeError::Response),
             Err(error) => {
                 // A bodiless 500 so the peer is not left waiting, then the
                 // error itself: the crate does not decide that a failed handler
                 // is nothing worth reporting. A failure to send the 500 is
                 // discarded because the interesting failure is the first one.
                 let _ = self.send_status(StatusCode::INTERNAL_SERVER_ERROR).await;
-                Err(Error::Service(error.into()))
+                Err(ServeError::Service(error.into()))
             }
         }
     }
 
     /// Send a status line and nothing else.
-    async fn send_status(self, status: StatusCode) -> Result<(), Error> {
+    async fn send_status(self, status: StatusCode) -> Result<(), ResponseError> {
         let mut reply = head::from_http(status, &HeaderMap::new())?;
         reply.set_header(ResponseHeader::CONTENT_LENGTH, b"0".to_vec());
         self.finish(reply).await
@@ -716,7 +721,7 @@ impl<S: Backend> Responder<S> {
         status: StatusCode,
         headers: &HeaderMap,
         body: B,
-    ) -> Result<(), Error>
+    ) -> Result<(), ResponseError>
     where
         B: Body,
         B::Data: Buf,
@@ -750,10 +755,11 @@ impl<S: Backend> Responder<S> {
         // messages; there is no honest way to pick one, so neither is sent.
         if let (Some(declared), Some(exact)) = (declared, exact) {
             if declared != exact {
-                return Err(Error::BodyLengthMismatch {
+                return Err(BodyError::LengthMismatch {
                     declared,
                     actual: exact,
-                });
+                }
+                .into());
             }
         }
         let length = exact.or(declared);
@@ -779,10 +785,11 @@ impl<S: Backend> Responder<S> {
             Some(0) => {
                 reply.set_header(ResponseHeader::CONTENT_LENGTH, b"0".to_vec());
                 if produced != 0 {
-                    return Err(Error::BodyLengthMismatch {
+                    return Err(BodyError::LengthMismatch {
                         declared: 0,
                         actual: produced,
-                    });
+                    }
+                    .into());
                 }
                 self.finish(reply).await
             }
@@ -825,14 +832,14 @@ impl<S: Backend> Responder<S> {
         mut body: std::pin::Pin<&mut B>,
         prefix: Vec<Vec<u8>>,
         framing: Framing,
-    ) -> Result<(), Error>
+    ) -> Result<(), ResponseError>
     where
         B: Body,
         B::Data: Buf,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let OpResult(sent, _) = self.queue.send_partial(self.id, reply).await;
-        sent.map_err(Error::platform(ServerStage::SendHead))?;
+        sent.map_err(ResponseError::send(SendStage::Head))?;
 
         let mut written: u64 = 0;
         let mut pending = prefix.into_iter();
@@ -845,10 +852,11 @@ impl<S: Backend> Responder<S> {
                 // and parses the rest as the start of the next response --
                 // a response desync, and worse than an error.
                 if written + piece.len() as u64 > declared {
-                    return Err(Error::BodyLengthMismatch {
+                    return Err(BodyError::LengthMismatch {
                         declared,
                         actual: written + piece.len() as u64,
-                    });
+                    }
+                    .into());
                 }
             }
             written += piece.len() as u64;
@@ -872,10 +880,11 @@ impl<S: Backend> Responder<S> {
                 // Measured: HTTP.sys accepts an under-delivered length and puts
                 // a silently truncated message on the wire. Nothing below this
                 // crate will notice, so this crate has to.
-                return Err(Error::BodyLengthMismatch {
+                return Err(BodyError::LengthMismatch {
                     declared,
                     actual: written,
-                });
+                }
+                .into());
             }
             Framing::Exact(_) => self.write(Vec::new(), true).await?,
             Framing::Chunked => self.write(b"0\r\n\r\n".to_vec(), true).await?,
@@ -883,7 +892,7 @@ impl<S: Backend> Responder<S> {
         Ok(())
     }
 
-    async fn write(&self, buffer: Vec<u8>, last: bool) -> Result<(), Error> {
+    async fn write(&self, buffer: Vec<u8>, last: bool) -> Result<(), ResponseError> {
         // A frame larger than one write is split rather than handed over whole,
         // so that the amount in flight stays bounded whatever the body produces.
         if buffer.len() > MAX_SEND {
@@ -891,21 +900,21 @@ impl<S: Backend> Responder<S> {
             while rest.len() > MAX_SEND {
                 let (now, later) = rest.split_at(MAX_SEND);
                 let OpResult(sent, _) = self.queue.send_body(self.id, now.to_vec(), false).await;
-                sent.map_err(Error::platform(ServerStage::SendBody))?;
+                sent.map_err(ResponseError::send(SendStage::Body))?;
                 rest = later;
             }
             let OpResult(sent, _) = self.queue.send_body(self.id, rest.to_vec(), last).await;
-            sent.map_err(Error::platform(ServerStage::SendBody))?;
+            sent.map_err(ResponseError::send(SendStage::Body))?;
             return Ok(());
         }
         let OpResult(sent, _) = self.queue.send_body(self.id, buffer, last).await;
-        sent.map_err(Error::platform(ServerStage::SendBody))?;
+        sent.map_err(ResponseError::send(SendStage::Body))?;
         Ok(())
     }
 
-    async fn finish(&self, reply: Response) -> Result<(), Error> {
+    async fn finish(&self, reply: Response) -> Result<(), ResponseError> {
         let OpResult(sent, _) = self.queue.send(self.id, reply).await;
-        sent.map_err(Error::platform(ServerStage::SendHead))?;
+        sent.map_err(ResponseError::send(SendStage::Head))?;
         Ok(())
     }
 }
@@ -924,7 +933,7 @@ enum Framing {
 /// Trailers are dropped: HTTP.sys offers no way to send them, and a frame that
 /// cannot be sent is better dropped than reported as a failure of a response
 /// that is otherwise fine.
-async fn next_chunk<B>(mut body: std::pin::Pin<&mut B>) -> Result<Option<Vec<u8>>, Error>
+async fn next_chunk<B>(mut body: std::pin::Pin<&mut B>) -> Result<Option<Vec<u8>>, BodyError>
 where
     B: Body,
     B::Data: Buf,
@@ -935,7 +944,7 @@ where
         let Some(frame) = frame else {
             return Ok(None);
         };
-        let frame = frame.map_err(|error| Error::BodyError(error.into()))?;
+        let frame = frame.map_err(|error| BodyError::Source(error.into()))?;
         match frame.into_data() {
             Ok(mut data) => {
                 let bytes = data.copy_to_bytes(data.remaining());

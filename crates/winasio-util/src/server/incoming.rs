@@ -77,7 +77,7 @@ use winasio::httpsys::{RequestId, RequestQueue};
 use winasio::iocp::ThreadPoolIo;
 
 use super::backend::Backend;
-use crate::error::{Error, ServerStage};
+use crate::error::{PlatformError, ServerOperation};
 
 /// How much of the body is asked for at a time.
 ///
@@ -169,12 +169,12 @@ impl<S: Backend> std::fmt::Debug for IncomingBody<S> {
 
 impl<S: Backend> Body for IncomingBody<S> {
     type Data = Bytes;
-    type Error = Error;
+    type Error = PlatformError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, PlatformError>>> {
         loop {
             match std::mem::replace(&mut self.state, State::Finished) {
                 State::Finished => {
@@ -202,9 +202,9 @@ impl<S: Backend> Body for IncomingBody<S> {
                         Err(error) => {
                             // Includes ERROR_OPERATION_ABORTED, which is how a
                             // peer that abandoned its body arrives here.
-                            return Poll::Ready(Some(Err(Error::platform(ServerStage::ReadBody)(
-                                error,
-                            ))));
+                            return Poll::Ready(Some(Err(crate::error::platform(
+                                ServerOperation::ReadBody,
+                            )(error))));
                         }
                     };
                     if read == 0 {

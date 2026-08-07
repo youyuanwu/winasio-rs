@@ -38,7 +38,7 @@ use http::uri::Scheme;
 use http::Uri;
 use windows::core::HSTRING;
 
-use crate::error::Error;
+use crate::error::RequestError;
 
 /// An [`http::Uri`] in the shape `winasio::winhttp` wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,23 +54,23 @@ pub(crate) struct Target {
 }
 
 /// Take a URI apart, or say why it cannot be used.
-pub(crate) fn decompose(uri: &Uri) -> Result<Target, Error> {
+pub(crate) fn decompose(uri: &Uri) -> Result<Target, RequestError> {
     let secure = match uri.scheme() {
         Some(scheme) if *scheme == Scheme::HTTP => false,
         Some(scheme) if *scheme == Scheme::HTTPS => true,
         Some(scheme) => {
-            return Err(Error::UnsupportedScheme {
+            return Err(RequestError::UnsupportedScheme {
                 scheme: Some(scheme.as_str().to_string()),
             })
         }
-        None => return Err(Error::UnsupportedScheme { scheme: None }),
+        None => return Err(RequestError::UnsupportedScheme { scheme: None }),
     };
 
     // `http://:8080/x` parses, and reports an empty host rather than none —
     // measured. An empty host is not a host.
     let host = match uri.host() {
         Some(host) if !host.is_empty() => host,
-        _ => return Err(Error::MissingHost),
+        _ => return Err(RequestError::MissingHost),
     };
 
     // There is no `Uri::userinfo`. The authority is the only place it shows.
@@ -78,7 +78,7 @@ pub(crate) fn decompose(uri: &Uri) -> Result<Target, Error> {
         .authority()
         .is_some_and(|authority| authority.as_str().contains('@'))
     {
-        return Err(Error::UserinfoNotSupported);
+        return Err(RequestError::UserinfoNotSupported);
     }
 
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
@@ -100,7 +100,7 @@ pub(crate) fn decompose(uri: &Uri) -> Result<Target, Error> {
 mod tests {
     use super::*;
 
-    fn target(text: &str) -> Result<Target, Error> {
+    fn target(text: &str) -> Result<Target, RequestError> {
         decompose(&text.parse::<Uri>().expect("the test URI should parse"))
     }
 
@@ -166,13 +166,13 @@ mod tests {
     fn a_scheme_that_is_not_http_is_refused_rather_than_assumed() {
         assert!(matches!(
             target("ftp://example.com/x"),
-            Err(Error::UnsupportedScheme { scheme: Some(s) }) if s == "ftp"
+            Err(RequestError::UnsupportedScheme { scheme: Some(s) }) if s == "ftp"
         ));
         // A `Uri` with no scheme is the shape a caller gets from writing a
         // bare path, which is exactly the mistake worth catching.
         assert!(matches!(
             target("/just/a/path"),
-            Err(Error::UnsupportedScheme { scheme: None })
+            Err(RequestError::UnsupportedScheme { scheme: None })
         ));
     }
 
@@ -180,18 +180,21 @@ mod tests {
     fn a_uri_with_no_host_is_refused() {
         // `http://:8080/x` parses and reports `Some("")` — a plausible-looking
         // empty string rather than the `None` one would expect.
-        assert!(matches!(target("http://:8080/x"), Err(Error::MissingHost)));
+        assert!(matches!(
+            target("http://:8080/x"),
+            Err(RequestError::MissingHost)
+        ));
     }
 
     #[test]
     fn userinfo_is_refused_rather_than_silently_dropped() {
         assert!(matches!(
             target("http://user:pw@example.com/x"),
-            Err(Error::UserinfoNotSupported)
+            Err(RequestError::UserinfoNotSupported)
         ));
         assert!(matches!(
             target("http://user@example.com/x"),
-            Err(Error::UserinfoNotSupported)
+            Err(RequestError::UserinfoNotSupported)
         ));
     }
 

@@ -17,7 +17,7 @@
 //! * **The client owns message framing.** `Content-Length` and
 //!   `Transfer-Encoding` are derived from the body's
 //!   [`size_hint`](http_body::Body::size_hint). A caller that sets either is
-//!   refused with [`Error::FramingHeaderNotAllowed`], because a caller-supplied
+//!   refused with [`BodyError::FramingHeaderNotAllowed`], because a caller-supplied
 //!   value replaces the computed one on the wire — measured — and would then
 //!   describe a body that was never sent.
 //! * **A header that cannot be sent is refused, not converted.** See
@@ -45,7 +45,7 @@
 //! * WinHTTP does **not retry** a pooled socket that turns out to be dead. The
 //!   request fails with `ERROR_WINHTTP_CONNECTION_ERROR` at
 //!   [`receive_response`](winasio::winhttp::Request::receive_response), which
-//!   arrives here as [`Error::Transport`] with [`Stage::ReceiveResponse`].
+//!   arrives here as [`RequestError::Transport`] with [`RequestStage::ReceiveResponse`].
 //! * That is WinHTTP's own behaviour, not something this crate provokes: a
 //!   hand-written *synchronous* WinHTTP client, sharing nothing with this crate
 //!   but the platform, failed identically, and the failure is unaffected by
@@ -61,8 +61,8 @@
 //! left to replay.
 //!
 //! What a caller is owed instead is the ability to *see* it, and that is
-//! guaranteed: the failure is a [`Stage::ReceiveResponse`] transport error
-//! whose [`Error::win_http`] is [`WinHttpError::ConnectionError`], never a
+//! guaranteed: the failure is a [`RequestStage::ReceiveResponse`] transport error
+//! whose [`RequestError::win_http`] is [`WinHttpError::ConnectionError`], never a
 //! silent truncation and never a hang. A caller that knows its own request is
 //! idempotent can retry on exactly that.
 //!
@@ -114,7 +114,7 @@ use winasio::winhttp::{CertificateRelaxations, RedirectPolicy, Session};
 use windows::core::HSTRING;
 
 use crate::body::ResponseBody;
-use crate::error::{Error, Stage};
+use crate::error::{BodyError, ClientConfigError, ClientConfigStage, RequestError, RequestStage};
 use crate::{headers, uri};
 
 /// The most this crate will write to the platform in one call.
@@ -126,7 +126,7 @@ const MAX_WRITE: usize = 64 * 1024;
 /// Build a [`Client`].
 ///
 /// ```
-/// # fn main() -> Result<(), winasio_util::Error> {
+/// # fn main() -> Result<(), winasio_util::ClientConfigError> {
 /// use winasio_util::Client;
 ///
 /// let client = Client::builder("my-agent/1.0")
@@ -177,12 +177,13 @@ impl ClientBuilder {
     }
 
     /// Open the session.
-    pub fn build(self) -> Result<Client, Error> {
-        let session = Session::new(&self.agent).map_err(Error::transport(Stage::Configure))?;
+    pub fn build(self) -> Result<Client, ClientConfigError> {
+        let session = Session::new(&self.agent)
+            .map_err(ClientConfigError::at(ClientConfigStage::OpenSession))?;
         if let Some((resolve, connect, send, receive)) = self.timeouts {
             session
                 .set_timeouts(resolve, connect, send, receive)
-                .map_err(Error::transport(Stage::Configure))?;
+                .map_err(ClientConfigError::at(ClientConfigStage::SetTimeouts))?;
         }
         // Set unconditionally, so that the platform default is never what
         // decides the behaviour.
@@ -192,7 +193,7 @@ impl ClientBuilder {
             } else {
                 RedirectPolicy::Never
             })
-            .map_err(Error::transport(Stage::Configure))?;
+            .map_err(ClientConfigError::at(ClientConfigStage::SetRedirectPolicy))?;
         Ok(Client {
             session: Arc::new(session),
             relaxations: self.relaxations,
@@ -242,7 +243,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     /// A client with the platform defaults, identifying itself as `agent`.
-    pub fn new(agent: &str) -> Result<Client, Error> {
+    pub fn new(agent: &str) -> Result<Client, ClientConfigError> {
         Client::builder(agent).build()
     }
 
@@ -264,14 +265,18 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Every failure is an [`Error`] naming what went wrong. In particular a
-    /// response body that ends before its declared `Content-Length` is an
-    /// [`Error::TruncatedBody`] from the body's final poll, and never a body
-    /// that appeared to end.
+    /// Every failure is a [`RequestError`] naming what went wrong, and the
+    /// variants are closed, so a caller may match them exhaustively. Note what
+    /// is *not* in that type: a response body that ends before its declared
+    /// `Content-Length` is a [`ResponseBodyError::Truncated`] from the body's
+    /// final poll — never a body that appeared to end — and it happens after
+    /// this call has already returned `Ok`.
+    ///
+    /// [`ResponseBodyError::Truncated`]: crate::ResponseBodyError::Truncated
     pub async fn request<B>(
         &self,
         request: HttpRequest<B>,
-    ) -> Result<HttpResponse<ResponseBody>, Error>
+    ) -> Result<HttpResponse<ResponseBody>, RequestError>
     where
         B: Body + Unpin,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -283,7 +288,7 @@ impl Client {
         // The framing decision, made once and honoured by the writer below.
         let (block, declared) = match body.size_hint().exact() {
             Some(length) if length > u64::from(u32::MAX) => {
-                return Err(Error::BodyTooLarge { length })
+                return Err(RequestError::BodyTooLarge { length })
             }
             Some(length) => (block, Framing::Exact(length)),
             None => (
@@ -295,7 +300,7 @@ impl Client {
         let connection = self
             .session
             .connect(&target.host, target.port)
-            .map_err(Error::transport(Stage::Connect))?;
+            .map_err(RequestError::transport(RequestStage::Connect))?;
         let mut platform = connection
             .open_request(
                 &HSTRING::from(parts.method.as_str()),
@@ -303,12 +308,12 @@ impl Client {
                 &[],
                 target.secure,
             )
-            .map_err(Error::transport(Stage::OpenRequest))?;
+            .map_err(RequestError::transport(RequestStage::OpenRequest))?;
 
         if self.relaxations != CertificateRelaxations::default() {
             platform
                 .relax_certificate_validation(self.relaxations)
-                .map_err(Error::transport(Stage::Configure))?;
+                .map_err(RequestError::transport(RequestStage::Configure))?;
         }
 
         // The body is never handed to `send`. Passing it there would work only
@@ -317,27 +322,27 @@ impl Client {
         platform
             .send(block, Vec::new(), declared.total_length())
             .await
-            .map_err(Error::transport(Stage::Send))?;
+            .map_err(RequestError::transport(RequestStage::Send))?;
 
         write_body(&mut platform, body, declared).await?;
 
         platform
             .receive_response()
             .await
-            .map_err(Error::transport(Stage::ReceiveResponse))?;
+            .map_err(RequestError::transport(RequestStage::ReceiveResponse))?;
 
         let code = platform
             .status_code()
-            .map_err(Error::transport(Stage::ReadHeaders))?;
+            .map_err(RequestError::transport(RequestStage::ReadHeaders))?;
         let status =
             StatusCode::from_u16(u16::try_from(code).unwrap_or(u16::MAX)).map_err(|_| {
-                Error::MalformedResponseHeader {
+                RequestError::MalformedResponseHeader {
                     line: format!("status code {code}"),
                 }
             })?;
         let raw = platform
             .raw_headers()
-            .map_err(Error::transport(Stage::ReadHeaders))?;
+            .map_err(RequestError::transport(RequestStage::ReadHeaders))?;
         let head = headers::parse(&raw)?;
 
         // A response that cannot carry a body reports zero available whatever
@@ -383,7 +388,7 @@ async fn write_body<B>(
     platform: &mut winasio::winhttp::Request,
     mut body: B,
     framing: Framing,
-) -> Result<(), Error>
+) -> Result<(), RequestError>
 where
     B: Body + Unpin,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -392,7 +397,7 @@ where
     loop {
         let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
         let Some(frame) = frame else { break };
-        let frame = frame.map_err(|error| Error::BodyError(error.into()))?;
+        let frame = frame.map_err(|error| RequestError::Body(BodyError::Source(error.into())))?;
         // A trailers frame has nowhere to go: WinHTTP exposes no way to send
         // trailers, and a chunked message can only carry them after the
         // terminating chunk, which the platform does not let us reach. Skipped
@@ -423,10 +428,10 @@ where
             // Caught here rather than left to the platform, which reports an
             // under-written body as a send timeout half a minute later —
             // measured — and an over-written one not at all.
-            return Err(Error::BodyLengthMismatch {
+            return Err(RequestError::Body(BodyError::LengthMismatch {
                 declared,
                 actual: written,
-            });
+            }));
         }
         Framing::Exact(_) => {}
         Framing::Chunked => write_all(platform, b"0\r\n\r\n".to_vec()).await?,
@@ -440,7 +445,10 @@ where
 /// measured to complete whole — but the API reports a count, so it is treated
 /// as one that can be less than the whole. Five lines is a cheap price for not
 /// depending on an unpromised behaviour.
-async fn write_all(platform: &mut winasio::winhttp::Request, buffer: Vec<u8>) -> Result<(), Error> {
+async fn write_all(
+    platform: &mut winasio::winhttp::Request,
+    buffer: Vec<u8>,
+) -> Result<(), RequestError> {
     let mut pending = buffer;
     loop {
         let expected = pending.len();
@@ -448,14 +456,14 @@ async fn write_all(platform: &mut winasio::winhttp::Request, buffer: Vec<u8>) ->
             return Ok(());
         }
         let winasio::iocp::OpResult(written, returned) = platform.write_data(pending).await;
-        let written = written.map_err(Error::transport(Stage::Write))?;
+        let written = written.map_err(RequestError::transport(RequestStage::Write))?;
         if written >= expected {
             return Ok(());
         }
         if written == 0 {
             // Making no progress and reporting no error. Never observed, and
             // the only alternative to reporting it is a loop that never ends.
-            return Err(Error::WriteStalled {
+            return Err(RequestError::WriteStalled {
                 remaining: expected,
             });
         }
