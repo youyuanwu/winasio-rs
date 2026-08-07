@@ -716,11 +716,6 @@ fn read_to_end_after_a_reset_fails_rather_than_truncating() {
     // handle, a cancelled operation — and would go on passing after the reset
     // detection it exists to guard had been removed.
     let err = result.expect_err("checked above");
-    // Assert *why* it failed, not merely that it did. Without this the test
-    // would pass if `read_to_end` broke for an unrelated reason and would go
-    // on passing after the reset detection it exists to guard had been
-    // removed.
-    //
     // `TransferError::ClosedPeer` is the *abrupt* variant, which reads oddly
     // until you notice that a clean end of stream never reaches here at all:
     // `read_to_end` returns `Ok` for that. Reaching the error path with this
@@ -799,7 +794,8 @@ fn a_failed_read_exact_still_returns_what_it_collected() {
     );
 }
 
-/// The classifier's view of the same event, in isolation.///
+/// The classifier's view of the same event, in isolation.
+///
 /// `read_to_end_after_a_reset_fails_rather_than_truncating` is what a caller
 /// actually experiences; this checks the underlying read reports a *lost
 /// connection* rather than a clean end, which is what makes that possible.
