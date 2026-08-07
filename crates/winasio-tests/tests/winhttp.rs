@@ -711,6 +711,38 @@ fn every_winhttp_error_variant_round_trips_through_its_code() {
 }
 
 #[test]
+fn every_winhttp_error_variant_can_be_matched_from_another_crate() {
+    // `WinHttpError` is deliberately not `#[non_exhaustive]`, and this test is
+    // what makes that promise observable. It lives in `winasio-tests` rather
+    // than beside the enum on purpose: `#[non_exhaustive]` has no effect within
+    // the defining crate, so an exhaustive match in `winasio`'s own unit tests
+    // would compile either way and prove nothing.
+    //
+    // There is no `_` arm. Adding a variant to the enum breaks this test at
+    // compile time, which is exactly the semver-major signal the attribute
+    // would otherwise have suppressed. If that happens, the fix is to bump the
+    // major version and add an arm here -- not to add a catch-all.
+    fn describe(error: &WinHttpError) -> &'static str {
+        match error {
+            WinHttpError::Cancelled => "cancelled",
+            WinHttpError::Timeout => "timeout",
+            WinHttpError::CannotConnect => "cannot connect",
+            WinHttpError::ConnectionError => "connection error",
+            WinHttpError::SecureFailure => "secure failure",
+            WinHttpError::NameNotResolved => "name not resolved",
+            WinHttpError::InvalidServerResponse => "invalid server response",
+            WinHttpError::HeaderNotFound => "header not found",
+            WinHttpError::IncorrectHandleState => "incorrect handle state",
+            WinHttpError::OperationInProgress => "operation in progress",
+            WinHttpError::Other(_) => "other",
+        }
+    }
+
+    assert_eq!(describe(&WinHttpError::Timeout), "timeout");
+    assert_eq!(describe(&WinHttpError::Other(12345)), "other");
+}
+
+#[test]
 fn the_readme_example_is_a_subset_of_a_test_that_actually_runs() {
     // A README example that has never been compiled is a liability. This keeps
     // the documented snippet literally identical, line for line, to code the
