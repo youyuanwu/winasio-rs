@@ -108,7 +108,7 @@ pub use ops::{
     WriteHandleAt,
 };
 pub use port::RegistrationError;
-pub use proactor::{Notify, Proactor};
+pub use proactor::Proactor;
 pub use threadpool::ThreadPoolIo;
 
 #[cfg(any(test, feature = "test-util"))]

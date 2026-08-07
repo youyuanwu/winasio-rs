@@ -198,26 +198,6 @@ fn duplicate_attach_is_rejected_distinguishably() {
 }
 
 #[test]
-fn notify_wakes_a_blocked_poll_from_another_thread() {
-    let _guard = counter_guard();
-    let proactor = Proactor::new().unwrap();
-    let notify = proactor.notify();
-
-    let waker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        notify.wake().unwrap();
-    });
-
-    let started = std::time::Instant::now();
-    proactor.poll(Some(Duration::from_secs(30))).unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the sentinel must interrupt a long wait"
-    );
-    waker.join().unwrap();
-}
-
-#[test]
 fn dropping_a_pending_operation_releases_it_on_completion() {
     let _guard = counter_guard();
     let baseline = live_operations();
