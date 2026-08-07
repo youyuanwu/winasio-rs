@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use crate::iocp::{OpResult, Registrar, Submitter};
 
-use super::addr::family_of;
+use super::addr::{family_of, unsupported_family};
 use super::error::SocketError;
 use super::ops::accept::AcceptSocket;
 use super::socket::Socket;
@@ -167,15 +167,25 @@ impl<R: Registrar + Clone> TcpListener<R> {
     pub async fn accept(&self) -> Result<(TcpStream<R::Io>, SocketAddr), SocketError> {
         // `AcceptEx` does not create the socket; the caller must supply one of
         // the listener's family, unbound and unconnected.
-        let accepted = Socket::new_overlapped(AcceptSocket::family_for(&self.local))
-            .map_err(SocketError::from_win32)?;
+        let accepted =
+            Socket::new_overlapped(family_of(&self.local)).map_err(SocketError::from_win32)?;
 
         let op = AcceptSocket::new(self.socket.clone(), accepted);
         let OpResult(result, op) = self.io.submit(op).await;
 
-        // `finish` applies `SO_UPDATE_ACCEPT_CONTEXT` and decodes both
-        // addresses out of the provider's buffer before it is dropped.
+        // `finish` applies `SO_UPDATE_ACCEPT_CONTEXT` and copies both addresses
+        // out of the provider's buffer before it is dropped.
         let parts = op.finish(result).map_err(SocketError::from_win32)?;
+
+        // The operation hands back encoded bytes rather than a `SocketAddr`,
+        // so that it need know nothing about address families — see the
+        // accept operation's docs. This is where the family knowledge lives:
+        // a listener created for an IP address decodes an IP peer, and a
+        // storage that decodes as neither is refused rather than invented.
+        let peer = parts
+            .peer
+            .to_socket_addr()
+            .ok_or_else(|| SocketError::from_win32(unsupported_family()))?;
 
         // LOAD-BEARING ORDERING — this is the whole of FR-027's mitigation, and
         // there is deliberately no guard object.
@@ -189,7 +199,7 @@ impl<R: Registrar + Clone> TcpListener<R> {
         // every error path and would then need a guard to close it.
         let io = self.registrar.register(parts.socket.as_handle())?;
 
-        Ok((TcpStream::from_parts(parts.socket, io), parts.peer))
+        Ok((TcpStream::from_parts(parts.socket, io), peer))
     }
 }
 

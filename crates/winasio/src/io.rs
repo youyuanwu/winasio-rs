@@ -173,6 +173,29 @@ impl<S: Submitter> WholePayloadIo for crate::net::TcpStream<S> {
     fn advance_position(_position: &mut u64, _transferred: usize) {}
 }
 
+impl<S: Submitter> WholePayloadIo for crate::net::UnixStream<S> {
+    fn read_once<B>(
+        &self,
+        _position: u64,
+        buffer: B,
+    ) -> impl Future<Output = OpResult<ReadOutcome, B>>
+    where
+        B: IoBufMut + Send,
+    {
+        self.read(buffer)
+    }
+
+    fn write_once<B>(&self, _position: u64, buffer: B) -> impl Future<Output = OpResult<usize, B>>
+    where
+        B: IoBuf + Send,
+    {
+        self.write(buffer)
+    }
+
+    /// A socket has no cursor, so there is no position to advance.
+    fn advance_position(_position: &mut u64, _transferred: usize) {}
+}
+
 pub(crate) async fn write_all<T, B>(io: &T, mut position: u64, mut buffer: B) -> TransferResult<B>
 where
     T: WholePayloadIo,
