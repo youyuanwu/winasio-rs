@@ -27,21 +27,52 @@
 //! type supplies its own text.
 
 use windows::core::{Error, HRESULT};
-
-use super::consts::{
-    ERROR_BUSY, ERROR_WINHTTP_CANNOT_CONNECT, ERROR_WINHTTP_CONNECTION_ERROR,
-    ERROR_WINHTTP_HEADER_NOT_FOUND, ERROR_WINHTTP_INCORRECT_HANDLE_STATE,
-    ERROR_WINHTTP_INVALID_SERVER_RESPONSE, ERROR_WINHTTP_NAME_NOT_RESOLVED,
-    ERROR_WINHTTP_OPERATION_CANCELLED, ERROR_WINHTTP_SECURE_FAILURE, ERROR_WINHTTP_TIMEOUT,
+use windows::Win32::Foundation::ERROR_BUSY;
+use windows::Win32::Networking::WinHttp::{
+    ERROR_WINHTTP_CANNOT_CONNECT, ERROR_WINHTTP_CONNECTION_ERROR, ERROR_WINHTTP_HEADER_NOT_FOUND,
+    ERROR_WINHTTP_INCORRECT_HANDLE_STATE, ERROR_WINHTTP_INVALID_SERVER_RESPONSE,
+    ERROR_WINHTTP_NAME_NOT_RESOLVED, ERROR_WINHTTP_OPERATION_CANCELLED,
+    ERROR_WINHTTP_SECURE_FAILURE, ERROR_WINHTTP_TIMEOUT,
 };
+
+/// `ERROR_BUSY` as a plain `u32`.
+///
+/// The `WINHTTP_*` codes are generated as bare `u32` constants, but the
+/// `Foundation` ones are generated as the `WIN32_ERROR` newtype, and a field
+/// access is an expression rather than a constant path — so `ERROR_BUSY.0`
+/// cannot appear in a `match` pattern. Naming it once here keeps the arms below
+/// uniform.
+const ERROR_BUSY_CODE: u32 = ERROR_BUSY.0;
 
 /// A failure reported by a WinHTTP request.
 ///
-/// `#[non_exhaustive]`: WinHTTP defines around sixty error codes and only the
-/// ones worth branching on are named. Promoting one out of
-/// [`WinHttpError::Other`] later should not be a breaking change.
+/// # Why this enum is exhaustive
+///
+/// Deliberately **not** `#[non_exhaustive]`, unlike the other error enums in
+/// this crate, because here the attribute would cost a real guarantee and buy
+/// almost nothing.
+///
+/// [`WinHttpError::Other`] already absorbs every code this enum does not name,
+/// and WinHTTP defines around sixty of them. A caller is therefore never
+/// surprised at *runtime* by an unclassified failure: it arrives as `Other`
+/// carrying its raw code. The only change `#[non_exhaustive]` would guard
+/// against is *promoting* a code out of `Other` into a named variant — and that
+/// already changes behaviour for anyone matching `Other(12002)`, whether or not
+/// the attribute is present. Sealing the enum would protect against a break the
+/// attribute cannot actually prevent.
+///
+/// What it costs is concrete: with `#[non_exhaustive]` no downstream crate can
+/// match this enum exhaustively, so the compiler can never tell a caller that a
+/// new variant appeared and they might want to handle it. For an enum whose
+/// entire purpose is to be branched on, that is the more valuable guarantee,
+/// and it is the one kept here.
+///
+/// The consequence is accepted rather than worked around: **adding a named
+/// variant is a breaking change** and needs a semver-major release. The
+/// `every_winhttp_error_variant_can_be_matched_from_another_crate` test in the
+/// integration suite exists to make that promise visible from outside, where
+/// the attribute would have applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum WinHttpError {
     /// The operation was cancelled, normally because the request handle was
     /// closed while the operation was still in flight.
@@ -107,7 +138,7 @@ impl WinHttpError {
             ERROR_WINHTTP_HEADER_NOT_FOUND => WinHttpError::HeaderNotFound,
             ERROR_WINHTTP_INVALID_SERVER_RESPONSE => WinHttpError::InvalidServerResponse,
             ERROR_WINHTTP_SECURE_FAILURE => WinHttpError::SecureFailure,
-            ERROR_BUSY => WinHttpError::OperationInProgress,
+            ERROR_BUSY_CODE => WinHttpError::OperationInProgress,
             other => WinHttpError::Other(other),
         }
     }
@@ -144,7 +175,7 @@ impl WinHttpError {
             WinHttpError::Other(code) => *code,
             // Raised by this crate, not by the platform, so it borrows a Win32
             // code that means the same thing and is not one WinHTTP produces.
-            WinHttpError::OperationInProgress => ERROR_BUSY,
+            WinHttpError::OperationInProgress => ERROR_BUSY_CODE,
         }
     }
 }

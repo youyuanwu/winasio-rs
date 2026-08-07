@@ -496,7 +496,7 @@ fn read_async_error(information: *const c_void, information_length: u32) -> Erro
         // success: a caller must never see a transport failure as an empty
         // successful body.
         return Error::from_hresult(HRESULT::from_win32(
-            super::consts::ERROR_WINHTTP_CONNECTION_ERROR,
+            windows::Win32::Networking::WinHttp::ERROR_WINHTTP_CONNECTION_ERROR,
         ));
     }
     // SAFETY: non-null, and WinHTTP reports at least `size_of` bytes there.
