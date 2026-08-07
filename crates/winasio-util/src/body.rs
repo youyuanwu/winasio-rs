@@ -79,7 +79,7 @@
 //! The layer below cannot do better: zero available is the only end-of-body
 //! signal the platform gives it. So this body counts what it has delivered and
 //! compares it against the declared length, and reports
-//! [`Error::TruncatedBody`] when they disagree. `crates/winasio/src/net`
+//! [`ResponseBodyError::Truncated`] when they disagree. `crates/winasio/src/net`
 //! already paid for this lesson once, in the shape of an outcome classifier
 //! that folded connection resets into a graceful close and returned truncated
 //! reads as `Ok(())`.
@@ -108,7 +108,7 @@ use http_body::{Body, Frame, SizeHint};
 use winasio::iocp::OpResult;
 use winasio::winhttp::Request;
 
-use crate::error::{Error, Stage};
+use crate::error::ResponseBodyError;
 
 /// The largest single read this body will ask the platform for.
 ///
@@ -117,7 +117,7 @@ use crate::error::{Error, Stage};
 const MAX_READ: usize = 64 * 1024;
 
 /// What one turn of the read protocol produced.
-type Step = (Request, Result<Option<Vec<u8>>, Error>);
+type Step = (Request, Result<Option<Vec<u8>>, ResponseBodyError>);
 
 enum State {
     /// The request is idle and this body owns it.
@@ -138,7 +138,7 @@ enum State {
 /// # Truncation
 ///
 /// If the response declared a `Content-Length` and the connection ends before
-/// that many bytes arrive, the final poll yields [`Error::TruncatedBody`]
+/// that many bytes arrive, the final poll yields [`ResponseBodyError::Truncated`]
 /// rather than end-of-stream. A body without a declared length cannot be
 /// checked; see the module documentation.
 pub struct ResponseBody {
@@ -177,10 +177,10 @@ impl ResponseBody {
     }
 
     /// Whether the body owes bytes it is never going to receive.
-    fn shortfall(&self) -> Option<Error> {
+    fn shortfall(&self) -> Option<ResponseBodyError> {
         match self.remaining {
             Some(0) | None => None,
-            Some(missing) => Some(Error::TruncatedBody {
+            Some(missing) => Some(ResponseBodyError::Truncated {
                 expected: self.delivered + missing,
                 received: self.delivered,
             }),
@@ -195,7 +195,7 @@ impl ResponseBody {
 async fn read_once(mut request: Request, cap: Option<u64>) -> Step {
     let available = match request.query_data_available().await {
         Ok(available) => available,
-        Err(error) => return (request, Err(Error::transport(Stage::ReadBody)(error))),
+        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
     };
     if available == 0 {
         return (request, Ok(None));
@@ -213,7 +213,7 @@ async fn read_once(mut request: Request, cap: Option<u64>) -> Step {
     let OpResult(read, mut buffer) = request.read_data(Vec::<u8>::with_capacity(wanted)).await;
     let read = match read {
         Ok(read) => read,
-        Err(error) => return (request, Err(Error::transport(Stage::ReadBody)(error))),
+        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
     };
     buffer.truncate(read);
     if buffer.is_empty() {
@@ -246,12 +246,12 @@ impl std::fmt::Debug for ResponseBody {
 
 impl Body for ResponseBody {
     type Data = Bytes;
-    type Error = Error;
+    type Error = ResponseBodyError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, ResponseBodyError>>> {
         loop {
             match std::mem::replace(&mut self.state, State::Finished) {
                 State::Finished => {
@@ -365,7 +365,7 @@ mod tests {
         };
         assert!(matches!(
             body.shortfall(),
-            Some(Error::TruncatedBody {
+            Some(ResponseBodyError::Truncated {
                 expected: 10,
                 received: 3
             })

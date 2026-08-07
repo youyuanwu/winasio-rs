@@ -42,7 +42,10 @@ use http::{HeaderValue, Request, Response, StatusCode};
 use http_body::Frame;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use winasio::iocp::ThreadPool;
-use winasio_util::{ConnectionInfo, Error, IncomingBody, Server, ServerSession};
+use winasio_util::{
+    AcceptError, BodyError, ConnectionInfo, IncomingBody, ResponseError, ServeError, Server,
+    ServerOperation, ServerSession,
+};
 
 const PORT: u16 = 12370;
 /// The runnable example binds its own prefix.
@@ -530,10 +533,10 @@ fn a_reply_that_under_delivers_its_declared_length_is_an_error() {
     assert!(
         matches!(
             error,
-            Error::BodyLengthMismatch {
+            ServeError::Response(ResponseError::Body(BodyError::LengthMismatch {
                 declared: 40,
                 actual: 4
-            }
+            }))
         ),
         "{error}"
     );
@@ -563,10 +566,10 @@ fn a_caller_supplied_content_length_that_lies_is_refused_before_anything_is_sent
     assert!(
         matches!(
             &error,
-            Error::BodyLengthMismatch {
+            ServeError::Response(ResponseError::Body(BodyError::LengthMismatch {
                 declared: 99,
                 actual: 2
-            }
+            }))
         ),
         "{error}"
     );
@@ -592,7 +595,7 @@ fn a_caller_supplied_transfer_encoding_is_refused_before_anything_is_sent() {
     });
     let error = block_on(server.serve_one(&mut service)).expect_err("a refusal");
     assert!(
-        matches!(&error, Error::FramingHeaderNotAllowed { name } if name == "transfer-encoding"),
+        matches!(&error, ServeError::Response(ResponseError::Body(BodyError::FramingHeaderNotAllowed { name })) if name == "transfer-encoding"),
         "{error}"
     );
     drop(client.join());
@@ -783,7 +786,7 @@ fn a_failing_service_puts_a_500_on_the_wire_and_still_reports_the_error() {
         Err::<Response<Empty<Bytes>>, _>(std::io::Error::other("the handler gave up"))
     });
     let error = block_on(server.serve_one(&mut service)).expect_err("the error is not swallowed");
-    assert!(matches!(error, Error::Service(_)), "{error}");
+    assert!(matches!(error, ServeError::Service(_)), "{error}");
     assert!(error.to_string().contains("the handler gave up"));
 
     let raw = client.join().unwrap().expect("a reply");
@@ -1286,7 +1289,13 @@ fn a_reply_that_over_delivers_its_declared_length_is_stopped_not_sent() {
     });
     let error = block_on(server.serve_one(&mut service)).expect_err("a mismatch");
     assert!(
-        matches!(&error, Error::BodyLengthMismatch { declared: 5, .. }),
+        matches!(
+            &error,
+            ServeError::Response(ResponseError::Body(BodyError::LengthMismatch {
+                declared: 5,
+                ..
+            }))
+        ),
         "{error}"
     );
 
@@ -1335,7 +1344,13 @@ fn a_first_frame_matching_the_declared_length_does_not_truncate_the_rest() {
     // four-byte reply.
     let error = block_on(server.serve_one(&mut service)).expect_err("a mismatch");
     assert!(
-        matches!(&error, Error::BodyLengthMismatch { declared: 4, .. }),
+        matches!(
+            &error,
+            ServeError::Response(ResponseError::Body(BodyError::LengthMismatch {
+                declared: 4,
+                ..
+            }))
+        ),
         "{error}"
     );
     drop(client.join());
@@ -1411,7 +1426,9 @@ fn a_request_this_crate_cannot_express_gets_an_answer_anyway() {
         // The ordinary case: the head converted and the service answered.
         Ok(()) => assert_eq!(status, "HTTP/1.1 200 OK"),
         // The case this test exists for: a 400 rather than silence.
-        Err(Error::MalformedRequest { .. }) => assert!(status.contains("400"), "got {status:?}"),
+        Err(ServeError::Accept(AcceptError::MalformedRequest { .. })) => {
+            assert!(status.contains("400"), "got {status:?}")
+        }
         Err(other) => panic!("unexpected: {other}"),
     }
 }
@@ -1559,10 +1576,7 @@ fn a_request_body_cut_off_mid_send_is_an_error_not_a_short_body() {
         Err(error) => {
             // The platform reported the amputation, so this crate does not have
             // to guess at one.
-            assert!(
-                matches!(&error, Error::Platform { stage, .. } if *stage == winasio_util::ServerStage::ReadBody),
-                "{error}"
-            );
+            assert!(error.operation == ServerOperation::ReadBody, "{error}");
         }
         Ok(body) => panic!("a truncated body must not look like a body that ended: {body:?}"),
     }

@@ -78,7 +78,7 @@ use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, DATE, SERVER, TRANSF
 use http::{HeaderMap, Method, StatusCode, Uri, Version};
 use winasio::httpsys::{Request, RequestHeader, RequestId, Response, ResponseHeader};
 
-use crate::error::{Error, RequestReason};
+use crate::error::{AcceptError, BodyError, RequestReason, ResponseError};
 
 /// What HTTP.sys knows about the connection a request arrived on.
 ///
@@ -107,7 +107,7 @@ pub(crate) struct Head {
 }
 
 /// Copy an HTTP.sys request head into `http` types.
-pub(crate) fn to_http(request: &Request) -> Result<Head, Error> {
+pub(crate) fn to_http(request: &Request) -> Result<Head, AcceptError> {
     let method = method_of(request)?;
     let uri = uri_of(request)?;
     let version = version_of(request);
@@ -121,7 +121,7 @@ pub(crate) fn to_http(request: &Request) -> Result<Head, Error> {
         // `known.name()` is a compile-time constant from the request table, so
         // it is always a valid field name; the value is whatever arrived.
         let name = HeaderName::from_bytes(known.name().as_bytes()).map_err(|_| {
-            Error::MalformedRequest {
+            AcceptError::MalformedRequest {
                 reason: RequestReason::HeaderName,
                 value: known.name().to_string(),
             }
@@ -129,7 +129,7 @@ pub(crate) fn to_http(request: &Request) -> Result<Head, Error> {
         headers.append(name, header_value(value)?);
     }
     for (name, value) in request.unknown_headers() {
-        let name = HeaderName::from_bytes(name).map_err(|_| Error::MalformedRequest {
+        let name = HeaderName::from_bytes(name).map_err(|_| AcceptError::MalformedRequest {
             reason: RequestReason::HeaderName,
             value: String::from_utf8_lossy(name).into_owned(),
         })?;
@@ -152,8 +152,8 @@ pub(crate) fn to_http(request: &Request) -> Result<Head, Error> {
     })
 }
 
-fn header_value(bytes: &[u8]) -> Result<HeaderValue, Error> {
-    HeaderValue::from_bytes(bytes).map_err(|_| Error::MalformedRequest {
+fn header_value(bytes: &[u8]) -> Result<HeaderValue, AcceptError> {
+    HeaderValue::from_bytes(bytes).map_err(|_| AcceptError::MalformedRequest {
         reason: RequestReason::HeaderValue,
         value: String::from_utf8_lossy(bytes).into_owned(),
     })
@@ -166,16 +166,16 @@ fn header_value(bytes: &[u8]) -> Result<HeaderValue, Error> {
 /// unknown path is not an edge case to be tolerated, it is the path a
 /// perfectly ordinary method takes, and it goes through
 /// [`Method::from_bytes`] which knows `PATCH` perfectly well.
-fn method_of(request: &Request) -> Result<Method, Error> {
+fn method_of(request: &Request) -> Result<Method, AcceptError> {
     let raw = request.method();
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
-        return Err(Error::MalformedRequest {
+        return Err(AcceptError::MalformedRequest {
             reason: RequestReason::Method,
             value: String::new(),
         });
     }
-    Method::from_bytes(bytes).map_err(|_| Error::MalformedRequest {
+    Method::from_bytes(bytes).map_err(|_| AcceptError::MalformedRequest {
         reason: RequestReason::Method,
         value: String::from_utf8_lossy(bytes).into_owned(),
     })
@@ -188,9 +188,9 @@ fn method_of(request: &Request) -> Result<Method, Error> {
 /// absolute-form from a proxy-shaped client. It is not reassembled from the
 /// pre-parsed components HTTP.sys also offers, because reassembling would
 /// normalise a target the peer wrote and this crate is not a normaliser.
-fn uri_of(request: &Request) -> Result<Uri, Error> {
+fn uri_of(request: &Request) -> Result<Uri, AcceptError> {
     let raw = request.raw_target();
-    Uri::try_from(raw).map_err(|_| Error::MalformedRequest {
+    Uri::try_from(raw).map_err(|_| AcceptError::MalformedRequest {
         reason: RequestReason::Target,
         value: String::from_utf8_lossy(raw).into_owned(),
     })
@@ -232,19 +232,19 @@ pub(crate) fn is_framing_header(name: &HeaderName) -> bool {
 /// for a sender.
 ///
 /// [RFC 9110 §8.6]: https://www.rfc-editor.org/rfc/rfc9110#section-8.6
-pub(crate) fn declared_length(headers: &HeaderMap) -> Result<Option<u64>, Error> {
+pub(crate) fn declared_length(headers: &HeaderMap) -> Result<Option<u64>, ResponseError> {
     let mut found: Option<u64> = None;
     for value in headers.get_all(CONTENT_LENGTH) {
         let text = std::str::from_utf8(value.as_bytes()).ok();
         let parsed = text.and_then(|t| t.trim().parse::<u64>().ok());
         let Some(parsed) = parsed else {
-            return Err(Error::BadContentLength {
+            return Err(ResponseError::BadContentLength {
                 value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
             });
         };
         match found {
             Some(previous) if previous != parsed => {
-                return Err(Error::BadContentLength {
+                return Err(ResponseError::BadContentLength {
                     value: format!("{previous}, {parsed}"),
                 });
             }
@@ -272,7 +272,10 @@ fn known_slot(name: &HeaderName) -> Option<ResponseHeader> {
 ///
 /// `Transfer-Encoding` is refused and `Content-Length` is dropped here; the
 /// response path declares the length itself, after it has agreed on one.
-pub(crate) fn from_http(status: StatusCode, headers: &HeaderMap) -> Result<Response, Error> {
+pub(crate) fn from_http(
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<Response, ResponseError> {
     let mut reply = Response::new(status.as_u16());
 
     // Measured: HTTP.sys supplies no reason phrase at all, so a status line
@@ -283,7 +286,9 @@ pub(crate) fn from_http(status: StatusCode, headers: &HeaderMap) -> Result<Respo
 
     for (name, value) in headers.iter() {
         if is_framing_header(name) {
-            return Err(Error::FramingHeaderNotAllowed { name: name.clone() });
+            return Err(ResponseError::Body(BodyError::FramingHeaderNotAllowed {
+                name: name.clone(),
+            }));
         }
         if name == CONTENT_LENGTH {
             // Read by `declared_length` and re-emitted through the known slot
@@ -423,7 +428,11 @@ mod tests {
         headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
         let error = from_http(StatusCode::OK, &headers).unwrap_err();
         assert!(
-            matches!(&error, Error::FramingHeaderNotAllowed { name } if name == "transfer-encoding"),
+            matches!(
+                &error,
+                ResponseError::Body(BodyError::FramingHeaderNotAllowed { name })
+                    if name == "transfer-encoding"
+            ),
             "{error}"
         );
     }
@@ -453,7 +462,7 @@ mod tests {
         headers.append("content-length", HeaderValue::from_static("9"));
         assert!(matches!(
             declared_length(&headers),
-            Err(Error::BadContentLength { .. })
+            Err(ResponseError::BadContentLength { .. })
         ));
 
         // Agreeing repeats are not an error, only a redundancy.
@@ -469,7 +478,7 @@ mod tests {
         headers.insert("content-length", HeaderValue::from_static("seven"));
         assert!(matches!(
             declared_length(&headers),
-            Err(Error::BadContentLength { .. })
+            Err(ResponseError::BadContentLength { .. })
         ));
     }
 

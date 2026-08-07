@@ -60,7 +60,7 @@
 use http::header::{HeaderName, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{HeaderMap, StatusCode, Version};
 
-use crate::error::{Error, HeaderReason};
+use crate::error::{BodyError, HeaderReason, RequestError};
 
 /// Encode a header map as the UTF-16 `name: value` block WinHTTP wants.
 ///
@@ -68,18 +68,22 @@ use crate::error::{Error, HeaderReason};
 /// handed to `WinHttpSendRequest` used to fault the process, and while
 /// `winasio::winhttp` now normalises it, saying "no headers" when there are
 /// none is what the caller meant anyway.
-pub(crate) fn encode(headers: &HeaderMap) -> Result<Option<Vec<u16>>, Error> {
+pub(crate) fn encode(headers: &HeaderMap) -> Result<Option<Vec<u16>>, RequestError> {
     let mut block = String::new();
     // `iter` yields one item per value, so a repeated name is emitted once per
     // occurrence rather than collapsed.
     for (name, value) in headers.iter() {
         if name == CONTENT_LENGTH || name == TRANSFER_ENCODING {
-            return Err(Error::FramingHeaderNotAllowed { name: name.clone() });
+            return Err(RequestError::Body(BodyError::FramingHeaderNotAllowed {
+                name: name.clone(),
+            }));
         }
-        let text = value.to_str().map_err(|_| Error::InvalidRequestHeader {
-            name: name.clone(),
-            reason: HeaderReason::NotVisibleAscii,
-        })?;
+        let text = value
+            .to_str()
+            .map_err(|_| RequestError::InvalidRequestHeader {
+                name: name.clone(),
+                reason: HeaderReason::NotVisibleAscii,
+            })?;
         block.push_str(name.as_str());
         block.push_str(": ");
         block.push_str(text);
@@ -96,7 +100,7 @@ pub(crate) fn encode(headers: &HeaderMap) -> Result<Option<Vec<u16>>, Error> {
 ///
 /// Separate from [`encode`] because the framing decision is the client's, not
 /// the caller's, and mixing the two would blur exactly the line that
-/// [`Error::FramingHeaderNotAllowed`] exists to draw.
+/// [`BodyError::FramingHeaderNotAllowed`] exists to draw.
 pub(crate) fn append(block: Option<Vec<u16>>, line: &str) -> Option<Vec<u16>> {
     let mut encoded: Vec<u16> = block.unwrap_or_default();
     encoded.extend(line.encode_utf16());
@@ -112,7 +116,7 @@ pub(crate) struct Head {
 }
 
 /// Parse the CRLF header block WinHTTP reports for a response.
-pub(crate) fn parse(raw: &str) -> Result<Head, Error> {
+pub(crate) fn parse(raw: &str) -> Result<Head, RequestError> {
     let mut lines = raw.split("\r\n");
 
     // Line 0 is the status line. It is not a header, and emitting it as one
@@ -127,20 +131,21 @@ pub(crate) fn parse(raw: &str) -> Result<Head, Error> {
         if line.is_empty() {
             continue;
         }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| Error::MalformedResponseHeader {
-                line: line.to_string(),
-            })?;
+        let (name, value) =
+            line.split_once(':')
+                .ok_or_else(|| RequestError::MalformedResponseHeader {
+                    line: line.to_string(),
+                })?;
         let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|_| {
-            Error::MalformedResponseHeader {
+            RequestError::MalformedResponseHeader {
                 line: line.to_string(),
             }
         })?;
-        let value =
-            HeaderValue::from_str(value.trim()).map_err(|_| Error::MalformedResponseHeader {
+        let value = HeaderValue::from_str(value.trim()).map_err(|_| {
+            RequestError::MalformedResponseHeader {
                 line: line.to_string(),
-            })?;
+            }
+        })?;
         // `append`, not `insert`: a repeated name must survive as repeated
         // entries, which is the entire reason this function exists.
         headers.append(name, value);
@@ -284,14 +289,17 @@ X-Spaces: padded\r\n\r\n";
         let error = parse("HTTP/1.1 200 OK\r\nnonsense\r\n\r\n").unwrap_err();
         assert!(matches!(
             &error,
-            Error::MalformedResponseHeader { line } if line == "nonsense"
+            RequestError::MalformedResponseHeader { line } if line == "nonsense"
         ));
     }
 
     #[test]
     fn a_name_that_is_not_a_header_name_is_reported() {
         let error = parse("HTTP/1.1 200 OK\r\nbad name: x\r\n\r\n").unwrap_err();
-        assert!(matches!(error, Error::MalformedResponseHeader { .. }));
+        assert!(matches!(
+            error,
+            RequestError::MalformedResponseHeader { .. }
+        ));
     }
 
     #[test]
@@ -332,7 +340,7 @@ X-Spaces: padded\r\n\r\n";
         let error = encode(&map).unwrap_err();
         assert!(matches!(
             &error,
-            Error::InvalidRequestHeader { name, reason }
+            RequestError::InvalidRequestHeader { name, reason }
                 if name == "x-note" && *reason == HeaderReason::NotVisibleAscii
         ));
     }
@@ -343,7 +351,12 @@ X-Spaces: padded\r\n\r\n";
             let mut map = HeaderMap::new();
             map.insert(name, HeaderValue::from_static("7"));
             assert!(
-                matches!(encode(&map), Err(Error::FramingHeaderNotAllowed { .. })),
+                matches!(
+                    encode(&map),
+                    Err(RequestError::Body(
+                        BodyError::FramingHeaderNotAllowed { .. }
+                    ))
+                ),
                 "{name} should have been refused"
             );
         }

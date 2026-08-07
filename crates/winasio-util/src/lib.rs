@@ -59,8 +59,12 @@
 //!   WinHTTP or HTTP.sys; it offers hyper's *types* over both. A hyper service
 //!   bridges through `hyper-util`'s adapter.
 //! * **The two halves do not share a connection, a cache or anything else.**
-//!   They share a vocabulary — one [`Error`], one set of `http` types — and
-//!   nothing more.
+//!   They share one set of `http` types, and, for the one problem that really
+//!   is the same in both directions -- framing an [`http_body::Body`] -- one
+//!   [`BodyError`]. Their *failure vocabularies* are otherwise deliberately
+//!   disjoint: a WinHTTP stage name is meaningless to HTTP.sys and vice versa,
+//!   and each fallible API returns a type whose variants it can all actually
+//!   produce. See the [`error`] module docs.
 //!
 //! # Runtime agnosticism
 //!
@@ -88,13 +92,13 @@
 //!   applies *no* framing at all to a streamed reply, so an undeclared one runs
 //!   into the next response on a keep-alive connection.
 //! * **A body that promised a length and produced another is an error.** Both
-//!   halves count what they wrote and report [`Error::BodyLengthMismatch`];
+//!   halves count what they wrote and report [`BodyError::LengthMismatch`];
 //!   measured, neither platform checks, and HTTP.sys will happily emit a
 //!   silently truncated message.
 //! * **A request header that cannot be represented is refused, not
 //!   converted.** [`http::HeaderValue`] holds arbitrary bytes and WinHTTP wants
 //!   a UTF-16 string; a value that is not printable ASCII produces
-//!   [`Error::InvalidRequestHeader`] naming the header, rather than silently
+//!   [`RequestError::InvalidRequestHeader`] naming the header, rather than silently
 //!   sending something the caller did not write. The server side has no such
 //!   rule and needs none: measured, HTTP.sys passes reply header bytes through
 //!   unchanged.
@@ -107,7 +111,7 @@
 //!   nothing left to preserve.
 //! * **A body that was cut off is never a body that ended.** If a response
 //!   declares a `Content-Length` and the connection ends early, the client
-//!   body's final poll yields [`Error::TruncatedBody`]. The platform reports
+//!   body's final poll yields [`ResponseBodyError::Truncated`]. The platform reports
 //!   that case as a clean end of body; this crate does not. Measured, HTTP.sys
 //!   is better behaved and reports a truncated *request* body as an error
 //!   itself, so the server side propagates rather than re-detects.
@@ -123,7 +127,7 @@
 //!   through these APIs.
 //! * **Nothing is spawned and nothing is swallowed.** The server never creates
 //!   a task or a thread; a service that returns `Err` gets a bodiless `500` on
-//!   the wire and the error is still returned as [`Error::Service`].
+//!   the wire and the error is still returned as [`ServeError::Service`].
 //!
 //! # Known warts
 //!
@@ -143,14 +147,26 @@
 
 mod body;
 mod client;
-mod error;
+/// The error types.
+///
+/// Public — unlike `winasio`'s own private `error` module, which holds a single
+/// enum whose rationale fits in that enum's own doc. This one holds eight types
+/// whose *shared* design story (why there is no single `Error`, why the two
+/// halves' vocabularies stay disjoint, why some are structs) has no natural home
+/// on any one of them. Every type is also re-exported at the crate root, so the
+/// module path is documentation, not a required import.
+pub mod error;
 mod headers;
 pub mod server;
 mod uri;
 
 pub use body::ResponseBody;
 pub use client::{Client, ClientBuilder};
-pub use error::{Error, HeaderReason, RequestReason, ServerStage, Stage};
+pub use error::{
+    AcceptError, BodyError, ClientConfigError, ClientConfigStage, HeaderReason, PlatformError,
+    RequestError, RequestReason, RequestStage, ResponseBodyError, ResponseError, SendStage,
+    ServeError, ServerOperation,
+};
 pub use server::{
     Accepted, Backend, ConnectionInfo, IncomingBody, Responder, Server, ServerBuilder,
     ServerSession, ShutdownHandle,

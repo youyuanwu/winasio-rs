@@ -41,7 +41,7 @@ use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use winasio::iocp::ThreadPool;
 use winasio_util::tower_service::Service;
-use winasio_util::{Error, IncomingBody, ServerSession};
+use winasio_util::{AcceptError, IncomingBody, ServeError, ServerSession};
 
 /// The application. An ordinary `tower::Service`, so an `axum::Router` or a
 /// `tower-http` layer would slot in unchanged.
@@ -127,7 +127,11 @@ fn text(status: StatusCode, body: String) -> Response<Full<Bytes>> {
 /// Serve `count` requests, then stop. Pass `usize::MAX` to serve forever.
 ///
 /// There is no `unsafe` anywhere in this file.
-pub async fn run_server(port: u16, path: &str, count: usize) -> Result<(), Error> {
+pub async fn run_server(
+    port: u16,
+    path: &str,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The session owns the subsystem initialisation, because HTTP.sys will not
     // create a session before `HttpInitialize` has run.
     let session = ServerSession::new()?;
@@ -146,7 +150,9 @@ pub async fn run_server(port: u16, path: &str, count: usize) -> Result<(), Error
             Err(e) if e.is_queue_closed() => break,
             // An over-large request has already been discarded by the layer
             // below, so carrying on is safe and does not spin.
-            Err(Error::RequestTooLarge { .. }) => eprintln!("discarded an over-large request"),
+            Err(ServeError::Accept(AcceptError::RequestTooLarge { .. })) => {
+                eprintln!("discarded an over-large request")
+            }
             Err(e) => eprintln!("serving failed: {e}"),
         }
     }
