@@ -1,6 +1,6 @@
 [package]
 name = "winasio-util"
-description = "Higher-level HTTP client over winasio's WinHTTP bindings, shaped around the http crate."
+description = "Higher-level HTTP client over WinHTTP and server over HTTP.sys, shaped around the http crate."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ windows = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
+tower-service = { workspace = true }
 
 [dev-dependencies]
 # Deliberately not tokio. The client is runtime-agnostic and the doc examples

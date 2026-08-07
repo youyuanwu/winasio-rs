@@ -19,6 +19,10 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1.2"
+# Trait-only, zero transitive dependencies, stable since 2019. This is the same
+# Service trait axum and the tower-http middleware ecosystem are built on, so
+# taking it does not compromise this workspace's runtime agnosticism.
+tower-service = "0.3"
 
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -39,4 +43,9 @@ serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 rand = "0.9"
+# Dev-only, and deliberately with default features off: measured, axum 0.8 with
+# no default features pulls no tokio at all, so the server tests prove a real
+# axum Router is servable without a runtime entering the picture.
+tower = { version = "0.5", default-features = false, features = ["util"] }
+axum = { version = "0.8", default-features = false }
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }

@@ -219,11 +219,14 @@ streamed fails the transfer outright. `Session::set_redirect_policy` turns it
 off.
 
 # Winasio-util
-A higher-level HTTP **client** over `winasio::winhttp`, shaped around the `http`
-crate. Send an `http::Request`, get back an `http::Response` whose body
-implements `http_body::Body` over `bytes::Bytes` -- the same types hyper uses, so
-a hyper user should find nothing surprising in the shape of the API, only in what
-it deliberately does not have.
+Higher-level HTTP over `winasio`, shaped around the `http` crate: a **client**
+over `winasio::winhttp` and a **server** over `winasio::httpsys`. Both speak
+`http::Request`/`http::Response` with bodies that implement `http_body::Body`
+over `bytes::Bytes` -- the same types hyper uses, so a hyper or axum user should
+find nothing surprising in the shape of the API, only in what it deliberately
+does not have.
+
+## Client
 
 ```rs
 let client = Client::new("winasio-util/0.1")?;
@@ -257,9 +260,8 @@ declared length and cannot be checked; that is a property of HTTP and is
 documented rather than guessed around.
 
 Redirect following is off, because the platform's rewrites a `POST` into a `GET`
-without saying so and breaks every streamed body. Cookie jars, retry policy, the
-server side, and implementations of hyper's own client/server traits are all out
-of scope.
+without saying so and breaks every streamed body. Cookie jars and retry policy
+are out of scope, as are implementations of hyper's own client/server traits.
 
 This crate implements no connection pool -- but WinHTTP keeps one anyway, and it
 was measured to be **process-wide**, not per-session: a brand new `Client` per
@@ -281,10 +283,78 @@ poll -- the obvious alternative -- was measured to retire a buffer per poll and
 then park the request with `ERROR_BUSY`. The module docs record the rejected
 alternatives in full.
 
+## Server
+
+The server half takes a **`tower_service::Service`** and drives it over HTTP.sys.
+`tower-service` is trait-only, has no runtime and no dependencies, and is the
+trait axum's `Router` and every `tower-http` layer already implement -- so an
+axum router is servable here directly, and a hyper service bridges through
+`hyper-util`'s existing adapter.
+
+```rs
+// The session owns the subsystem initialisation: HTTP.sys will not create a
+// session before `HttpInitialize` has run.
+let session = ServerSession::new()?;
+let server = Server::builder(&session)
+    .url("http://localhost:8080/demo/")
+    .build(&ThreadPool)?;
+
+let mut service = tower::service_fn(|_req: http::Request<IncomingBody>| async {
+    Ok::<_, Infallible>(http::Response::new(Full::new(Bytes::from_static(b"hi"))))
+});
+
+// No runtime anywhere: `block_on` is a bare single-threaded executor.
+futures::executor::block_on(server.serve_one(&mut service))?;
+```
+
+**Nothing here spawns.** No task, no thread, no reactor, no runtime. Concurrency
+is the caller's, and both shapes work: `serve`/`serve_one` take `&mut S` and
+drive requests one at a time, which is all a single-threaded `block_on` loop
+needs; or `accept` hands back an `Accepted` that owns everything it needs, is
+`Send + 'static` on the thread-pool backend, and can be moved onto whatever
+executor the caller likes together with a clone of the service. The type is
+generic over the I/O backend, so a `!Send` single-threaded `Proactor` loop works
+as well as the thread pool.
+
+`poll_ready` is honoured rather than skipped. The sequential driver awaits
+readiness **before** it accepts, so a service that is not ready stops requests
+being pulled out of the kernel queue -- backpressure that does something. The
+concurrent driver awaits readiness on the clone that will handle the request,
+because a tower reservation belongs to the clone that made it.
+
+Framing is the crate's, and it is measured rather than assumed. HTTP.sys computes
+`Content-Length` for a fully buffered reply but does **no** framing at all for a
+streamed one -- not even on a keep-alive connection, where the result is an
+undelimited body running into the next response -- so this crate declares a
+length when the body's `size_hint` gives one and writes chunked framing when it
+does not. A caller's `Content-Length` is allowed, because an `axum::Router` sets
+one, but it is checked against the body rather than trusted; a caller's
+`Transfer-Encoding` is refused. A reply that under-delivers its declared length
+is an error, not a silently truncated message, which is what HTTP.sys would
+otherwise put on the wire. A `HEAD` reply and a `204` never send a body -- HTTP.sys
+sends both if given one.
+
+The two header numbering tables are the sharpest edge below: every id from 20 to
+29 means a *different* header on a request than on a reply, so `25` is `Cookie`
+inbound and `Retry-After` outbound. The conversion reads each side through its
+own table, and a test asserts it end to end rather than by inspection.
+
+Out of scope: TLS certificate configuration, which HTTP.sys does out of band via
+`netsh http add sslcert`; HTTP/2 specifics, WebSockets, server push,
+authentication; and routing, which is what a `tower::Service` is for. Free from
+the platform and therefore not built: `Expect: 100-continue`, request
+de-chunking, and truncated-body detection -- unlike WinHTTP, HTTP.sys reports a
+cut-off request body as an error.
+
+`crates/winasio-tests/examples/util_server.rs` is a complete server in safe code
+on a bare executor; the test suite compiles it, runs it, and asserts textually
+that it contains no `unsafe`.
+
 # Layout
 This repo is a cargo workspace:
 - `crates/winasio`: the library crate.
-- `crates/winasio-util`: higher-level HTTP client built on `winasio::winhttp`.
+- `crates/winasio-util`: higher-level HTTP client over `winasio::winhttp` and
+  HTTP server over `winasio::httpsys`.
 - `crates/winasio-tests`: test only crate holding the integration tests.
 
 # MISC
