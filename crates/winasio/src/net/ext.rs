@@ -208,19 +208,40 @@ mod tests {
         // The premise of the single process-wide cache. If a future platform
         // ever disagreed, this fails here rather than misbehaving at a call
         // site on the family that was not used for discovery.
+        //
+        // `AF_UNIX` is included because it is the family most likely to
+        // disagree: it is a different provider, not merely a different address
+        // shape, so "the extension pointers are process-wide" is a real claim
+        // about it rather than an obvious one. It was measured to agree, and
+        // this is what keeps that measurement honest — all three pointers, not
+        // just `AcceptEx`, since `ConnectEx` and `GetAcceptExSockaddrs` are
+        // resolved from the same cache and used on `AF_UNIX` sockets too.
         let v4 = Socket::new_overlapped(AF_INET).expect("v4 socket");
         let v6 = Socket::new_overlapped(AF_INET6).expect("v6 socket");
+        // Note the protocol: 0, not `IPPROTO_TCP`, which `AF_UNIX` rejects
+        // with `WSAEPROTONOSUPPORT`.
+        let un = Socket::new_overlapped_unix().expect("unix socket");
 
-        // SAFETY: both are live sockets and `LPFN_ACCEPTEX` is what the GUID
+        for (guid, name) in [
+            (&WSAID_ACCEPTEX, "AcceptEx"),
+            (&WSAID_CONNECTEX, "ConnectEx"),
+            (&WSAID_GETACCEPTEXSOCKADDRS, "GetAcceptExSockaddrs"),
+        ] {
+            // SAFETY: all three are live sockets, and every GUID here names a
+            // function pointer, so a `usize`-sized output is the right size
+            // for each. The concrete signatures differ but are not called.
+            let on = |s: &Socket| unsafe { lookup::<usize>(s, guid) }.expect("lookup");
+            let (a, b, c) = (on(&v4), on(&v6), on(&un));
+            assert_eq!(a, b, "{name} must be the same function for v4 and v6");
+            assert_eq!(a, c, "{name} must be the same function for v4 and AF_UNIX");
+        }
+
+        // Keep the typed lookup exercised as well, so the `LPFN_*` aliases the
+        // rest of the module depends on are not left unproven by the
+        // `usize`-shaped comparison above.
+        // SAFETY: `v4` is a live socket and `LPFN_ACCEPTEX` is what the GUID
         // names.
-        let a: LPFN_ACCEPTEX = unsafe { lookup(&v4, &WSAID_ACCEPTEX) }.expect("v4 lookup");
-        // SAFETY: as above.
-        let b: LPFN_ACCEPTEX = unsafe { lookup(&v6, &WSAID_ACCEPTEX) }.expect("v6 lookup");
-
-        assert_eq!(
-            a.map(|f| f as usize),
-            b.map(|f| f as usize),
-            "AcceptEx must be the same function for both families"
-        );
+        let typed: LPFN_ACCEPTEX = unsafe { lookup(&v4, &WSAID_ACCEPTEX) }.expect("typed lookup");
+        assert!(typed.is_some(), "AcceptEx resolves to a non-null pointer");
     }
 }

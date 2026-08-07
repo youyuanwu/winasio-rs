@@ -39,11 +39,12 @@ use windows::Win32::Networking::WinSock::{
     bind, closesocket, getpeername, getsockname, listen, setsockopt, shutdown, WSASocketW,
     ADDRESS_FAMILY, INVALID_SOCKET, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY, SD_BOTH, SD_RECEIVE,
     SD_SEND, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
-    WSAEAFNOSUPPORT, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 
-use super::addr::SockAddrBytes;
+use super::addr::{unsupported_family, SockAddrBytes, AF_UNIX_FAMILY};
 use super::init::ensure_winsock;
+use super::unix_addr::UnixSocketAddr;
 
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,8 +130,15 @@ impl Socket {
         Socket(Arc::new(Owned::new(raw)))
     }
 
-    /// Create an overlapped TCP socket of the given family.
-    pub(crate) fn new_overlapped(family: ADDRESS_FAMILY) -> Result<Socket> {
+    /// Create an overlapped stream socket of the given family and protocol.
+    ///
+    /// The protocol is a parameter rather than a constant, and that is not
+    /// generalisation for its own sake. Measured on this platform: creating an
+    /// `AF_UNIX` socket with `IPPROTO_TCP` fails with `WSAEPROTONOSUPPORT`
+    /// (10043), so a hard-coded `IPPROTO_TCP` makes AF_UNIX unreachable. The
+    /// two named constructors below spell out which value each family wants,
+    /// so no caller has to remember.
+    pub(crate) fn new_overlapped_with(family: ADDRESS_FAMILY, protocol: i32) -> Result<Socket> {
         ensure_winsock()?;
         // `WSA_FLAG_NO_HANDLE_INHERIT` alongside the overlapped flag: without
         // it a child process spawned while a connection is open inherits the
@@ -144,7 +152,7 @@ impl Socket {
             WSASocketW(
                 family.0 as i32,
                 SOCK_STREAM.0,
-                IPPROTO_TCP.0,
+                protocol,
                 None,
                 0,
                 WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
@@ -153,6 +161,19 @@ impl Socket {
         // SAFETY: `WSASocketW` returned a socket owned by this frame and
         // nothing else.
         Ok(unsafe { Socket::from_raw(raw) })
+    }
+
+    /// Create an overlapped TCP socket of the given family.
+    pub(crate) fn new_overlapped(family: ADDRESS_FAMILY) -> Result<Socket> {
+        Socket::new_overlapped_with(family, IPPROTO_TCP.0)
+    }
+
+    /// Create an overlapped `AF_UNIX` stream socket.
+    ///
+    /// Protocol zero: see [`Socket::new_overlapped_with`] for why naming
+    /// `IPPROTO_TCP` here fails.
+    pub(crate) fn new_overlapped_unix() -> Result<Socket> {
+        Socket::new_overlapped_with(AF_UNIX_FAMILY, 0)
     }
 
     /// The underlying socket, borrowed.
@@ -191,7 +212,15 @@ impl Socket {
     }
 
     pub(crate) fn bind_to(&self, addr: SocketAddr) -> Result<()> {
-        let encoded = SockAddrBytes::from_socket_addr(addr);
+        self.bind_bytes(&SockAddrBytes::from_socket_addr(addr))
+    }
+
+    /// Bind to an already-encoded address, whatever its family.
+    ///
+    /// The family-neutral form. `bind` itself never cared about the family —
+    /// only the encoder did — so the Unix path reuses this rather than growing
+    /// a parallel call.
+    pub(crate) fn bind_bytes(&self, encoded: &SockAddrBytes) -> Result<()> {
         // SAFETY: `encoded` outlives the call and describes `len()` valid bytes.
         let rc = unsafe { bind(self.raw(), encoded.as_ptr(), encoded.len()) };
         last_error_if(rc)
@@ -229,6 +258,30 @@ impl Socket {
         let rc = unsafe { getpeername(self.raw(), bytes.as_mut_ptr(), bytes.len_mut()) };
         last_error_if(rc)?;
         bytes.to_socket_addr().ok_or_else(unsupported_family)
+    }
+
+    /// `getsockname` decoded as an `AF_UNIX` address.
+    pub(crate) fn local_unix_addr(&self) -> Result<UnixSocketAddr> {
+        let mut bytes = SockAddrBytes::zeroed();
+        // SAFETY: `bytes` is a live storage of the length it reports, and
+        // Winsock writes at most that much.
+        let rc = unsafe { getsockname(self.raw(), bytes.as_mut_ptr(), bytes.len_mut()) };
+        last_error_if(rc)?;
+        bytes.to_unix_addr().ok_or_else(unsupported_family)
+    }
+
+    /// `getpeername` decoded as an `AF_UNIX` address.
+    ///
+    /// The peer of an accepted `AF_UNIX` connection is very often *unnamed* —
+    /// a client that bound the empty path, which is the Unix analogue of
+    /// binding the wildcard — so this succeeds with
+    /// [`UnixSocketAddr::is_unnamed`] rather than failing.
+    pub(crate) fn peer_unix_addr(&self) -> Result<UnixSocketAddr> {
+        let mut bytes = SockAddrBytes::zeroed();
+        // SAFETY: as above.
+        let rc = unsafe { getpeername(self.raw(), bytes.as_mut_ptr(), bytes.len_mut()) };
+        last_error_if(rc)?;
+        bytes.to_unix_addr().ok_or_else(unsupported_family)
     }
 
     /// Set `IPV6_V6ONLY`, controlling whether an IPv6 listener also accepts
@@ -322,10 +375,6 @@ fn last_error_if(rc: i32) -> Result<()> {
     } else {
         Err(Error::from_thread())
     }
-}
-
-fn unsupported_family() -> Error {
-    Error::from_hresult(windows::core::HRESULT::from_win32(WSAEAFNOSUPPORT.0 as u32))
 }
 
 #[cfg(test)]
