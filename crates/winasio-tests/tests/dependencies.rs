@@ -31,9 +31,13 @@ const RUNTIMES: &[&str] = &[
 /// `--color never` matters: CI sets `CARGO_TERM_COLOR=always`, which would
 /// otherwise wrap every crate name in ANSI escapes and defeat the parsing below.
 fn cargo_tree(extra: &[&str]) -> Option<String> {
-    let mut args = vec![
-        "tree", "-p", "winasio", "--edges", "normal", "--color", "never",
-    ];
+    cargo_tree_pkg("winasio", extra)
+}
+
+/// As [`cargo_tree`], but for an arbitrary workspace package. Used to assert the
+/// runtime-agnostic story for both `winasio` and `winasio-axum`.
+fn cargo_tree_pkg(pkg: &str, extra: &[&str]) -> Option<String> {
+    let mut args = vec!["tree", "-p", pkg, "--edges", "normal", "--color", "never"];
     args.extend_from_slice(extra);
 
     let output = Command::new(env!("CARGO"))
@@ -78,6 +82,38 @@ fn the_library_pulls_in_no_async_runtime() {
             "`{runtime}` reached the library's dependency graph. \
              winasio must stay runtime-agnostic; check that any new dependency \
              is a dev-dependency of winasio-tests rather than of winasio.\n{tree}"
+        );
+    }
+}
+
+/// M1/M4/D-A: `winasio-axum` refuses the tokio cost. axum with the `tokio`
+/// feature would pull `tokio`, `mio`, `hyper` and `hyper-util` into the normal
+/// graph (measured); this crate depends on axum with default features off and no
+/// `tokio` feature, so none of those may appear. The check is on `winasio-axum`'s
+/// *own* normal graph, so `winasio-tests` enabling `axum/tokio` for its M2 recipe
+/// test — a dev-dependency of a different crate — does not perturb it.
+#[test]
+fn winasio_axum_pulls_in_no_async_runtime() {
+    // The four crates D-A refuses, plus the general runtimes.
+    const TOKIO_COST: &[&str] = &["tokio", "mio", "hyper", "hyper-util"];
+
+    let Some(tree) = cargo_tree_pkg("winasio-axum", &["--prefix", "none", "--no-dedupe"]) else {
+        return;
+    };
+    assert!(
+        tree.contains("winasio-axum"),
+        "cargo tree produced nothing useful:\n{tree}"
+    );
+
+    for forbidden in RUNTIMES.iter().chain(TOKIO_COST) {
+        let leaked = tree
+            .lines()
+            .any(|line| crate_name(line) == Some(*forbidden));
+        assert!(
+            !leaked,
+            "`{forbidden}` reached winasio-axum's normal dependency graph. \
+             winasio-axum must depend on axum with default features off and no \
+             `tokio` feature (D-A); check any new dependency.\n{tree}"
         );
     }
 }

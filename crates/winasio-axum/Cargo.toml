@@ -1,0 +1,26 @@
+[package]
+name = "winasio-axum"
+description = "Concurrent driver serving an axum Router over HTTP.sys, generic over a caller-supplied executor, depending on no async runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+winasio-util = { workspace = true }
+axum = { workspace = true }
+tower-service = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+# Deliberately not tokio: the crate is runtime-agnostic and the doc examples and
+# unit tests prove it by running on a bare `block_on`.
+futures = { workspace = true }
+http-body-util = { workspace = true }
+# Test-only: lets the `classify` unit test construct an `AcceptError::Receive`
+# from a hand-made `windows::core::Error` so the fatal/clean-stop branches are
+# exercised without the kernel having to emit them.
+windows = { workspace = true }

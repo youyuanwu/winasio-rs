@@ -47,6 +47,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -55,6 +56,7 @@ dependencies = [
  "pin-project-lite",
  "serde_core",
  "sync_wrapper",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -998,6 +1000,7 @@ dependencies = [
  "futures-util",
  "pin-project-lite",
  "sync_wrapper",
+ "tokio",
  "tower-layer",
  "tower-service",
 ]
@@ -1130,6 +1133,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "winasio-axum"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "tower-service",
+ "winasio-util",
+ "windows",
+]
+
+[[package]]
 name = "winasio-tests"
 version = "0.1.0"
 dependencies = [
@@ -1148,6 +1167,7 @@ dependencies = [
  "tower",
  "warp",
  "winasio",
+ "winasio-axum",
  "winasio-util",
  "windows",
 ]
