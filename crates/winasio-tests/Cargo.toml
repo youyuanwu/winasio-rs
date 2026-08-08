@@ -27,12 +27,33 @@ rand = { workspace = true }
 windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock", "Win32_Security"] }
 criterion = { workspace = true }
 tower = { workspace = true }
+# gRPC / tonic e2e stack (Phase 4). These are dev-dependencies of the TEST crate
+# only, so a full runtime here is fine and does NOT enter winasio-tonic's own
+# graph (guarded by `winasio_tonic_pulls_in_no_async_runtime_beyond_tokio`).
+# Unlike winasio-tonic (client stub only, no runtime), the tests need the
+# generated *server* stub too, so tonic is taken with the `server` feature
+# (which pulls a runtime — allowed here). `build_transport(false)` in build.rs
+# keeps the hyper-based `Channel` out; the transport under test is winasio-tonic's
+# `WinHttpChannel`.
+winasio-tonic = { workspace = true }
+tonic = { version = "0.14", default-features = false, features = ["server", "codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
 # axum's `tokio` feature is enabled ONLY here, in winasio-tests' dev-dependencies,
 # so the `ConnectInfo<SocketAddr>` *type* compiles for the M2 recipe test. This is
 # test-only: it does not enter `winasio-axum`'s normal dependency graph (asserted
 # by `dependencies.rs::winasio_axum_pulls_in_no_async_runtime`). winasio-tests
 # already carries tokio as a dev-dependency, so this adds no new runtime here.
 axum = { workspace = true, features = ["tokio"] }
+
+[build-dependencies]
+# Codegen for the gRPC e2e tests (Phase 4). Unlike winasio-tonic's build.rs
+# (client stub only), this generates BOTH client and server stubs from the same
+# checked-in proto (`../winasio-tonic/proto/echo.proto`), because the tests both
+# call and serve the Echo service. Runs `protoc` (installed by CI; locally on
+# PATH or via `PROTOC`). `build_transport(false)` keeps tonic's hyper `Channel`
+# out of the generated code.
+tonic-prost-build = "0.14"
 
 [[bench]]
 name = "httpsys"

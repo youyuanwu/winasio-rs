@@ -329,6 +329,20 @@ impl<B: IoBuf + Send + Unpin> Future for WriteData<'_, B> {
         // that the returned count already expresses.
         let length = u32::try_from(initialised).unwrap_or(u32::MAX);
 
+        // A zero-length write is a deliberate signal, not a no-op: with
+        // `WINHTTP_FLAG_AUTOMATIC_CHUNKING` it emits an empty HTTP/2 DATA frame
+        // carrying END_STREAM, half-closing the request stream. It must pass a
+        // *null* data pointer, exactly as .NET's WinHttpHandler does
+        // (`WinHttpWriteData(handle, IntPtr.Zero, 0, ...)`): an empty `Vec`'s
+        // `stable_ptr` is a non-null dangling pointer, and WinHTTP rejects a
+        // non-null-but-unreadable pointer with `ERROR_INVALID_PARAMETER`
+        // (0x80070057) even though it would read zero bytes from it.
+        let pointer = if length == 0 {
+            std::ptr::null()
+        } else {
+            pointer
+        };
+
         let outcome = this
             .request
             .poll_operation(OpKind::Write, &mut this.generation, cx, || {

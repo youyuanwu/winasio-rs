@@ -141,13 +141,41 @@ impl H2Framing {
         }
     }
 
-    /// The terminal bytes to write once the body ends, if any.
-    fn terminal(self) -> Option<Vec<u8>> {
+    /// How the request body is terminated once its frames are exhausted.
+    fn terminal(self) -> Terminal {
         match self {
-            H2Framing::ManualChunked => Some(b"0\r\n\r\n".to_vec()),
-            H2Framing::Automatic | H2Framing::Exact(_) => None,
+            // The manual chunk trailer, written as ordinary body bytes.
+            H2Framing::ManualChunked => Terminal::Bytes(b"0\r\n\r\n".to_vec()),
+            // Automatic chunking needs an explicit *empty* `WinHttpWriteData`
+            // to emit a zero-length DATA frame carrying END_STREAM. Without it
+            // the request stream is never half-closed: HTTP.sys keeps the h2
+            // stream open, and the moment the server tries to send its response
+            // head the connection is torn down (measured: server side
+            // `ERROR_CONNECTION_INVALID` 0x800704CD, client side
+            // `ERROR_WINHTTP_TIMEOUT` 0x80072EE2). This mirrors .NET's
+            // `WinHttpRequestStream.EndUploadAsync` /`InternalWriteEndDataAsync`,
+            // which for `WinHttpChunkMode.Automatic` calls
+            // `WinHttpWriteData(handle, IntPtr.Zero, 0, IntPtr.Zero)` with the
+            // comment "Send empty DATA frame with END_STREAM flag."
+            H2Framing::Automatic => Terminal::EndStream,
+            // Exact length: the Content-Length already bounds the body and
+            // WinHTTP closes the stream when the declared count is reached.
+            H2Framing::Exact(_) => Terminal::None,
         }
     }
+}
+
+/// How to close out a request body once all its frames have been written.
+enum Terminal {
+    /// Nothing to write — the framing already bounds the body (Exact).
+    None,
+    /// Write these bytes as ordinary body (ManualChunked's `0\r\n\r\n`).
+    Bytes(Vec<u8>),
+    /// Submit a zero-length `WinHttpWriteData` to emit an empty DATA frame with
+    /// END_STREAM (Automatic chunking). Distinct from `Bytes(Vec::new())`
+    /// because the write helpers treat an empty buffer as a no-op and never
+    /// submit it — the END_STREAM signal must be forced.
+    EndStream,
 }
 
 /// Send one HTTP/2 request and return its response.
@@ -298,10 +326,17 @@ where
             Some(Ok(frame)) => frame,
             Some(Err(error)) => return Err(RequestError::Body(BodyError::Source(error.into()))),
             None => {
-                // The whole request body has been produced. Write the framing
-                // terminal, if any, then stop and await the head.
-                if let Some(terminal) = framing.terminal() {
-                    write_all_with_recv(&mut writer, terminal, &mut recv, &mut head).await?;
+                // The whole request body has been produced. Close out the
+                // request stream according to the framing, then stop and await
+                // the head.
+                match framing.terminal() {
+                    Terminal::None => {}
+                    Terminal::Bytes(bytes) => {
+                        write_all_with_recv(&mut writer, bytes, &mut recv, &mut head).await?;
+                    }
+                    Terminal::EndStream => {
+                        end_stream_with_recv(&mut writer, &mut recv, &mut head).await?;
+                    }
                 }
                 write_done = true;
                 break;
@@ -404,7 +439,30 @@ async fn write_all_with_recv(
     }
 }
 
-/// The HTTP/2 response body: reads the response while finishing the request.
+/// Submit a single zero-length `WinHttpWriteData` to emit an empty DATA frame
+/// carrying END_STREAM (Automatic chunking), polling the receive concurrently.
+///
+/// Unlike [`write_all_with_recv`], this always submits the write even though the
+/// buffer is empty — the empty write *is* the END_STREAM signal. A failure once
+/// the head has already arrived is tolerated (M6): the response is in hand, so
+/// the request stream ending on the server's side is not a client fault.
+async fn end_stream_with_recv(
+    writer: &mut RequestWriter<'_>,
+    recv: &mut Pin<&mut ReceiveResponse<'_>>,
+    head: &mut Option<Result<(), Error>>,
+) -> Result<(), RequestError> {
+    let OpResult(written, _) = with_recv(writer.write_data(Vec::new()), recv, head).await;
+    match written {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if head.is_some() {
+                Ok(())
+            } else {
+                Err(RequestError::transport(RequestStage::Write)(error))
+            }
+        }
+    }
+}
 ///
 /// Owns the [`Request`] and the remainder of the outbound body. Each poll first
 /// advances the outbound write (any request-body frames that are ready) and
@@ -529,8 +587,18 @@ where
                         break;
                     }
                     Poll::Ready(None) => {
-                        if let Some(terminal) = framing.terminal() {
-                            let _ = write_all_half(&mut writer, terminal).await;
+                        match framing.terminal() {
+                            Terminal::None => {}
+                            Terminal::Bytes(bytes) => {
+                                let _ = write_all_half(&mut writer, bytes).await;
+                            }
+                            Terminal::EndStream => {
+                                // Zero-length write emits the END_STREAM DATA
+                                // frame; a failure here means the server already
+                                // ended the request stream (M6), so it is
+                                // tolerated exactly like a body-write failure.
+                                let _ = writer.write_data(Vec::new()).await;
+                            }
                         }
                         write_done = true;
                         break;
@@ -700,7 +768,8 @@ mod tests {
     fn exact_framing_declares_the_length_and_writes_bytes_raw() {
         assert_eq!(H2Framing::Exact(7).total_length(), 7);
         assert_eq!(H2Framing::Exact(7).frame(b"hello"), b"hello");
-        assert!(H2Framing::Exact(7).terminal().is_none());
+        // A declared Content-Length bounds the body: no terminal write.
+        assert!(matches!(H2Framing::Exact(7).terminal(), Terminal::None));
     }
 
     #[test]
@@ -708,14 +777,21 @@ mod tests {
         // The whole point of M7: no `{len:x}` framing, so no HTTP/2 downgrade.
         assert_eq!(H2Framing::Automatic.total_length(), 0);
         assert_eq!(H2Framing::Automatic.frame(b"hello"), b"hello");
-        assert!(H2Framing::Automatic.terminal().is_none());
+        // Automatic chunking MUST end the body with an explicit zero-length
+        // write (an empty DATA frame carrying END_STREAM). Omitting it leaves
+        // the request stream open and the server tears the connection down when
+        // it responds (measured 0x800704CD / 0x80072EE2). Mirrors .NET's
+        // `WinHttpRequestStream.EndUploadAsync` for `WinHttpChunkMode.Automatic`.
+        assert!(matches!(H2Framing::Automatic.terminal(), Terminal::EndStream));
     }
 
     #[test]
     fn manual_chunked_framing_is_the_downgrading_fallback() {
         assert_eq!(H2Framing::ManualChunked.total_length(), 0);
         assert_eq!(H2Framing::ManualChunked.frame(b"hello"), b"5\r\nhello\r\n");
-        assert_eq!(H2Framing::ManualChunked.terminal().unwrap(), b"0\r\n\r\n");
+        assert!(
+            matches!(H2Framing::ManualChunked.terminal(), Terminal::Bytes(bytes) if bytes == b"0\r\n\r\n")
+        );
     }
 
     #[test]
