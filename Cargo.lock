@@ -1130,6 +1130,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "winasio-axum"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "tower-service",
+ "winasio-util",
+]
+
+[[package]]
 name = "winasio-tests"
 version = "0.1.0"
 dependencies = [
