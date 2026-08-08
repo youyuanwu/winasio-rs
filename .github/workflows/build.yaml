@@ -21,6 +21,19 @@ jobs:
     # enable cache
     - uses: Swatinem/rust-cache@v2
 
+    # Provision the machine-wide HTTPS test binding once for the whole job.
+    # GitHub's Windows runners run elevated, so this generates a self-signed
+    # localhost certificate and binds it to the fixed test port; the TLS tests
+    # (crates/winasio-tests/tests/httpsys_tls.rs) then RUN unelevated against it.
+    # `continue-on-error` keeps the build green if a runner's HTTP.sys context
+    # refuses the bind: the tests detect the missing binding and SKIP loudly
+    # (grep the log for `HTTPS_TLS_TEST:`) rather than failing. The runner VM is
+    # ephemeral, so no teardown is needed here.
+    - name: Provision HTTPS test binding
+      continue-on-error: true
+      shell: pwsh
+      run: ./scripts/setup-https-test.ps1
+
     - name: Run cargo check
       run: cargo check --workspace --all-targets --all-features
 

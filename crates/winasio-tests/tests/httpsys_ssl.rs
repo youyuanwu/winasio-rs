@@ -19,31 +19,26 @@
 //!   "wrong" kind of host.
 //!
 //! This binary installs no certificate and, on the unelevated path, writes
-//! nothing that persists: a refused bind changes no machine state.
+//! nothing that persists: a refused bind changes no machine state. The
+//! certificate itself is provisioned out-of-process by
+//! `scripts/setup-https-test.ps1` (see `httpsys_tls.rs`), so nothing here
+//! generates or installs one.
 
 #![cfg(windows)]
 
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
 
 use common::is_elevated;
 use winasio::httpsys::{
-    bind_ssl_certificate, cert_present, key_container_present, CertStore, HttpInitializer,
-    SelfSignedCert, SslBindError, SSL_BINDING_APP_ID, THUMBPRINT_LEN,
+    bind_ssl_certificate, HttpInitializer, SslBindError, SSL_BINDING_APP_ID, THUMBPRINT_LEN,
 };
 use windows::core::Error;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
 
-/// Serialises the certificate-helper tests in this binary. They each create,
-/// install, and remove a `CurrentUser\My` certificate and run the prefix sweep,
-/// which touches shared per-user store and key-container state; running them
-/// concurrently would let one test's sweep see another's in-flight certificate.
-static CERT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 /// This binary owns 12490..=12492 for its throwaway bind attempt, inside the
-/// TLS range reserved in the plan and disjoint from the e2e ports in
+/// TLS range reserved in the plan and disjoint from the e2e port in
 /// `httpsys_tls.rs`.
 const PORT_ELEVATION_PROBE: u16 = 12490;
 
@@ -150,104 +145,4 @@ fn bind_without_elevation_reports_requires_elevation() {
              (if this host is actually elevated, is_elevated() misreported)"
         ),
     }
-}
-
-// ---------------------------------------------------------------------------
-// Always-on: self-signed certificate helper round-trip (CurrentUser\My)
-// ---------------------------------------------------------------------------
-//
-// These exercise the `test-util` certificate helper without touching the
-// machine-wide SSL binding table, so they need no elevation and run on any
-// host. They install into `CurrentUser\My`, which an unelevated process may
-// write (measured: C2), and assert complete cleanup — both the certificate and
-// its CNG key container — on drop and on unwind.
-
-#[test]
-fn self_signed_cert_roundtrip_current_user() {
-    let _guard = CERT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Best-effort sweep of any leftovers from a previously aborted run so the
-    // assertions below start from a clean slate. No ports: this store holds no
-    // SSL bindings.
-    SelfSignedCert::sweep_leftovers(CertStore::CurrentUser, &[]);
-
-    let cert = SelfSignedCert::create("CN=localhost", CertStore::CurrentUser)
-        .expect("self-signed certificate creation succeeds in CurrentUser\\My");
-
-    // Thumbprint is a real 20-byte SHA-1, not all zero.
-    let thumbprint = cert.thumbprint();
-    assert_eq!(thumbprint.len(), THUMBPRINT_LEN);
-    assert_ne!(thumbprint, [0u8; THUMBPRINT_LEN], "thumbprint must be real");
-
-    let container = cert.container().to_string();
-
-    // While alive: both the certificate and its key container are present.
-    assert!(
-        cert_present(&thumbprint, CertStore::CurrentUser),
-        "certificate must be installed while the guard is alive"
-    );
-    assert!(
-        key_container_present(&container, CertStore::CurrentUser),
-        "key container must exist while the guard is alive"
-    );
-
-    drop(cert);
-
-    // After drop: both are gone. This is the machine-hygiene contract.
-    assert!(
-        !cert_present(&thumbprint, CertStore::CurrentUser),
-        "certificate must be removed on drop"
-    );
-    assert!(
-        !key_container_present(&container, CertStore::CurrentUser),
-        "key container must be deleted on drop"
-    );
-
-    eprintln!(
-        "HTTPS_TLS_TEST: RAN (cert helper round-trip in CurrentUser\\My; clean after drop) \
-         test=self_signed_cert_roundtrip_current_user"
-    );
-}
-
-#[test]
-fn self_signed_cert_cleanup_on_unwind() {
-    let _guard = CERT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    SelfSignedCert::sweep_leftovers(CertStore::CurrentUser, &[]);
-
-    // Capture identity across the panic boundary so we can assert cleanup after
-    // the guard is dropped by unwinding.
-    let captured: std::sync::Mutex<Option<([u8; THUMBPRINT_LEN], String)>> =
-        std::sync::Mutex::new(None);
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let cert = SelfSignedCert::create("CN=localhost", CertStore::CurrentUser)
-            .expect("self-signed certificate creation succeeds");
-        *captured.lock().unwrap() = Some((cert.thumbprint(), cert.container().to_string()));
-        assert!(cert_present(&cert.thumbprint(), CertStore::CurrentUser));
-        // Force an unwind while the guard is in scope.
-        panic!("deliberate panic to exercise Drop-based cleanup");
-    }));
-
-    assert!(result.is_err(), "the closure must have panicked");
-
-    let (thumbprint, container) = captured
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the certificate was created before the panic");
-
-    assert!(
-        !cert_present(&thumbprint, CertStore::CurrentUser),
-        "certificate must be removed even when the guard drops via unwind"
-    );
-    assert!(
-        !key_container_present(&container, CertStore::CurrentUser),
-        "key container must be deleted even when the guard drops via unwind"
-    );
-
-    eprintln!(
-        "HTTPS_TLS_TEST: RAN (cert helper cleaned up on unwind; clean after panic) \
-         test=self_signed_cert_cleanup_on_unwind"
-    );
 }

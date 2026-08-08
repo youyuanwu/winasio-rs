@@ -15,11 +15,11 @@ windows = { workspace = true }
 futures = { workspace = true }
 
 [features]
-# Exposes allocation accounting used by the integration test suite, plus the
-# `test-util`-gated self-signed certificate helper (`httpsys::SelfSignedCert`).
-# The certificate helper needs `Win32_Security_Cryptography`; it is pulled only
-# under this feature so the crate's default footprint is unchanged (measured:
-# `cargo check -p winasio` with no features does not compile the crypto surface).
-test-util = [
-    "windows/Win32_Security_Cryptography",
-]
+# Enables allocation accounting used by the integration test suite (the
+# `live_operations`/`live_bytes` counters the IOCP and socket layers expose).
+# It pulls in no additional `windows` features: the crate's default footprint is
+# unchanged (measured: `cargo check -p winasio` with and without `--features
+# test-util` compile the same OS surface). Certificate generation and SSL
+# binding for the HTTPS tests are handled out-of-process by
+# `scripts/setup-https-test.ps1`, so no crypto surface is compiled into the crate.
+test-util = []

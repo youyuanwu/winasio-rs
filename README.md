@@ -93,23 +93,38 @@ distinctly as `SslBindError::RequiresElevation` so a caller can say "needs
 elevation" rather than reporting a generic error. This is the piece HTTP.sys
 otherwise leaves to `netsh http add sslcert`.
 
-For tests, the `test-util` feature adds `SelfSignedCert`: a self-signed
-certificate generated with the `windows` crate alone (no OpenSSL or schannel),
-installed into a store and removed — certificate *and* CNG key container —
-on drop. See [`httpsys_tls.rs`](./crates/winasio-tests/tests/httpsys_tls.rs) for
-an end-to-end WinHTTP-over-HTTPS test, paired with a negative control that
-confirms an unrelaxed client rejects the self-signed certificate.
+### Running the HTTPS integration tests
 
-> **Measured CI caveat.** On the standard GitHub-hosted Windows runner the e2e
-> binding cannot be completed: although the runner is elevated and the cert's
-> private key is acquirable in-process, both `HttpSetServiceConfiguration` *and*
-> Microsoft's own `netsh http add sslcert` fail with
-> `ERROR_NO_SUCH_LOGON_SESSION (1312)` when HTTP.sys's `SYSTEM` context tries to
-> open the CNG machine key. Because the reference tool fails identically, this
-> is a runner-environment limitation rather than a defect in this crate. The
-> tests detect it, print a greppable `HTTPS_TLS_TEST: BIND_UNPROVEN` line, and
-> report the roundtrip as not proven on that runner instead of masking it; on an
-> interactive elevated host the full roundtrip runs.
+Because binding a certificate is a machine-wide, administrator-only operation,
+the end-to-end HTTPS tests do **not** bind anything themselves. Provisioning is a
+one-time, out-of-process step: run
+[`scripts/setup-https-test.ps1`](./scripts/setup-https-test.ps1) **from an
+elevated PowerShell** once per machine. It generates a self-signed `localhost`
+certificate (with a `DNS:localhost` SAN) into `LocalMachine\My` and binds it to a
+fixed port:
+
+```powershell
+# once, elevated:
+pwsh -File scripts/setup-https-test.ps1
+```
+
+The tests then run **unelevated** (`cargo test`): they detect the binding and, if
+it is absent, skip with a greppable `HTTPS_TLS_TEST: SKIPPED` line rather than
+failing. Tear the machine state down completely — binding, certificate and CNG
+key container — with:
+
+```powershell
+pwsh -File scripts/setup-https-test.ps1 -Uninstall
+```
+
+The port, AppId and certificate subject live in a single source of truth,
+[`scripts/https-test-config.ps1`](./scripts/https-test-config.ps1), which both
+the script and the tests read, so they cannot drift. See
+[`httpsys_tls.rs`](./crates/winasio-tests/tests/httpsys_tls.rs) for the
+end-to-end WinHTTP-over-HTTPS test, paired with a negative control that confirms
+an unrelaxed client rejects the self-signed certificate. CI provisions the
+binding on its elevated runner before the test step, so the TLS tests execute
+there too (grep the CI log for `HTTPS_TLS_TEST:` to see `RAN` vs `SKIPPED`).
 
 # Fs
 Safe asynchronous file I/O on top of the IOCP layer. Files are opened for

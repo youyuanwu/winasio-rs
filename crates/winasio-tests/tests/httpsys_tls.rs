@@ -7,114 +7,76 @@
 //! End-to-end HTTPS tests: a WinHTTP client talking TLS to an HTTP.sys server
 //! that presents a self-signed certificate.
 //!
-//! # What this proves
+//! # Design: binding is provisioned out-of-process
 //!
-//! * The Phase-1 SSL binding API (`bind_ssl_certificate` / `query_ssl_binding`)
-//!   actually binds a certificate to an `ip:port` that HTTP.sys serves.
-//! * The Phase-2 self-signed certificate helper produces a certificate the
-//!   Windows TLS stack accepts once its issuing authority is trusted.
-//! * The WinHTTP client (`winasio::winhttp`) completes a real HTTPS request
-//!   against that server, and — the negative control — a client that relaxes
-//!   *nothing* is rejected with [`WinHttpError::SecureFailure`], i.e. the TLS
-//!   check the positive test relaxes is genuinely load-bearing.
+//! Binding a certificate to an `ip:port` in the HTTP.sys SSL table is a
+//! machine-wide, administrator-only operation (measured: an unelevated
+//! `netsh http add sslcert` fails `ERROR_ACCESS_DENIED (5)` even with a bogus
+//! thumbprint). Rather than make every test attempt that at run time — which
+//! forced the whole suite to run elevated and left machine-wide residue to
+//! clean up — provisioning is done **once, out of process**, by
+//! [`scripts/setup-https-test.ps1`](../../../../scripts/setup-https-test.ps1):
+//! it generates a `CN=localhost` self-signed certificate (with a `DNS:localhost`
+//! SAN) into `LocalMachine\My` and binds it to the fixed test port.
 //!
-//! # A measured limitation on GitHub-hosted runners
+//! These tests therefore run **unelevated**. Each one queries the SSL table for
+//! the expected binding via [`query_ssl_binding`] and, when it is absent, prints
+//! a greppable `HTTPS_TLS_TEST: SKIPPED` line explaining how to provision it and
+//! returns without touching machine state — the same `start() -> Option<..>`
+//! skip idiom the rest of the HTTP.sys suite uses. When the binding is present
+//! it prints `HTTPS_TLS_TEST: RAN` and exercises the full path. CI runs with
+//! `--nocapture`, so grepping the log for these tokens says definitively whether
+//! the e2e path executed or was skipped (R1).
 //!
-//! The end-to-end **binding** and **wire roundtrip** cannot be proven on the
-//! standard GitHub-hosted Windows runner, and this is reported loudly rather
-//! than hidden. Measured on the elevated CI runner (grep `HTTPS_TLS_TEST`):
+//! # What running proves
 //!
-//! * the elevation gate does **not** trip — the runner is elevated, so the
-//!   tests genuinely RUN rather than silently skip (this settles C6/R1);
-//! * the self-signed certificate is created and its private key is fully
-//!   usable *in-process* — `in_proc_key_acquire=OK`, the same
-//!   `CryptAcquireCertificatePrivateKey` call HTTP.sys makes;
-//! * yet `HttpSetServiceConfiguration` (and **Microsoft's own `netsh http add
-//!   sslcert`**, run as a control) both fail with
-//!   `ERROR_NO_SUCH_LOGON_SESSION (1312 / 0x80070520)`.
+//! * The [`query_ssl_binding`] API reads back the externally-provisioned binding
+//!   on both wildcard families.
+//! * A WinHTTP client completes a real HTTPS request against HTTP.sys over the
+//!   self-signed certificate, relaxing **only** CA-trust — the `DNS:localhost`
+//!   SAN is expected to satisfy name validation on its own (R5).
+//! * The negative control: a client that relaxes *nothing* is rejected with
+//!   [`WinHttpError::SecureFailure`], i.e. the certificate check the positive
+//!   test relaxes is genuinely load-bearing.
 //!
-//! Because the reference tool fails identically with the same certificate, the
-//! defect is **not** in this crate's binding API or certificate helper: it is
-//! HTTP.sys's own `SYSTEM`/no-interactive-logon context on these runners being
-//! unable to acquire the CNG machine key at bind time. When the bind fails the
-//! fixture emits a greppable `HTTPS_TLS_TEST: BIND_UNPROVEN` line (with the
-//! error and the `netsh` control result) and the affected tests report the
-//! roundtrip as *not proven on this runner* instead of masking or hard-failing.
-//! Everything up to the bind — cert generation, store install, private-key
-//! acquisition, RAII cleanup, machine hygiene, elevation classification and the
-//! negative-control plumbing — is exercised and proven. On an elevated host
-//! whose HTTP.sys context *can* open the machine key (a normal interactive
-//! admin session), the same tests bind and complete the full HTTPS roundtrip.
+//! # Registering the URL prefix needs no elevation
 //!
-//! # Elevation
+//! Registering the `https://localhost:PORT/` URL group is separate from binding
+//! the certificate and, measured on an unelevated host, succeeds without
+//! administrator rights or a URL ACL (R6) — exactly as the plain-`http` HTTP.sys
+//! suite already relies on. So the only privileged step is the one moved to the
+//! setup script; the request path here is fully unprivileged.
 //!
-//! Writing the machine-wide HTTP.sys SSL binding table, and installing a
-//! machine-scoped certificate/key, both require administrator rights (measured:
-//! C2 — an unelevated `netsh http add sslcert` fails `ERROR_ACCESS_DENIED (5)`
-//! even with a bogus thumbprint, and opening `LocalMachine\My` unelevated fails
-//! `0x80070005`). Every test here therefore gates on [`is_elevated`] up front
-//! and, when the host is not elevated, prints a greppable
-//! `HTTPS_TLS_TEST: SKIPPED` line and returns without touching machine state.
-//! When elevated it prints `HTTPS_TLS_TEST: RAN`. CI runs with `--nocapture`,
-//! so grepping the log for these tokens tells you definitively whether the e2e
-//! path executed or was skipped (R1).
+//! # Serialisation
 //!
-//! # Ports
-//!
-//! This binary owns the range **`12480..=12489`**; `httpsys_ssl.rs` owns
-//! `12490..=12492`, so the two suites' bindings and pre-test sweeps cannot
-//! reach into each other's ports. An HTTP.sys SSL binding is keyed by `ip:port`
-//! and is machine-global, a stronger conflict domain than a URL prefix: two
-//! tests binding the same port with different certificates would fight. A
-//! file-scoped [`TLS_LOCK`] therefore serialises all tests in this binary (R3),
-//! and each test uses a distinct port so a crashed predecessor's residue cannot
-//! alias a successor.
-//!
-//! # Cleanup
-//!
-//! Every persistent artifact is held by an RAII guard and removed on drop:
-//! the two [`SslCertBinding`]s unbind, and the [`SelfSignedCert`] removes both
-//! the certificate and its CNG key container. The fixture also sweeps this
-//! crate's own leftovers (by AppId, port set, and container prefix) before it
-//! binds, so an aborted prior run cannot leave machine-wide residue that
-//! outlives the test process (R2).
+//! An HTTP.sys SSL binding is keyed by `ip:port` and is machine-global, and only
+//! one URL group may own a given prefix at a time. All tests here share the one
+//! provisioned port, so a file-scoped [`TLS_LOCK`] serialises them (R3).
 
 #![cfg(windows)]
 
 mod common;
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use windows::core::HSTRING;
 
-use common::{block_on, is_elevated};
-use winasio::httpsys::{
-    bind_ssl_certificate, query_ssl_binding, CertStore, SelfSignedCert, SslCertBinding,
-    SSL_BINDING_APP_ID, THUMBPRINT_LEN,
-};
+use common::{block_on, tls_config};
+use winasio::httpsys::{query_ssl_binding, THUMBPRINT_LEN};
 use winasio::iocp::{OpResult, ThreadPool};
 use winasio::winhttp::{CertificateRelaxations, Session, WinHttpError};
-use winasio_util::{Server, ServerSession};
+use winasio_util::{IncomingBody, Server, ServerSession};
 
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Full;
-use std::convert::Infallible;
-use winasio_util::IncomingBody;
 
-/// Serialises every TLS test: HTTP.sys SSL configuration is global per
-/// `ip:port`, so two tests running at once could see or clobber each other's
-/// bindings (R3).
+/// Serialises every TLS test: the provisioned binding and URL prefix are global
+/// per `ip:port`, so two tests running at once would contend for the same
+/// prefix (R3).
 static TLS_LOCK: Mutex<()> = Mutex::new(());
-
-/// The port range this binary owns (`12480..=12489`). Used both to pick
-/// per-test ports and to scope the pre-test leftover sweep. Kept disjoint from
-/// `httpsys_ssl.rs`'s `12490..=12492` so neither suite's sweep can delete the
-/// other's binding.
-const RESERVED_PORTS: [u16; 10] = [
-    12480, 12481, 12482, 12483, 12484, 12485, 12486, 12487, 12488, 12489,
-];
 
 /// Generous client timeouts: a stuck handshake should surface as an error, not
 /// hang the suite. 15s is far longer than a loopback handshake needs.
@@ -123,251 +85,83 @@ const CLIENT_TIMEOUT_MS: u32 = 15_000;
 /// The body the test server returns on the happy path.
 const HELLO_BODY: &[u8] = b"secure hello";
 
-/// Everything a running HTTPS test needs, with drop order chosen so unbinding
-/// happens while the HTTP configuration subsystem is still live.
-///
-/// Field order is load-bearing: Rust drops fields top-to-bottom, so the two
-/// bindings unbind and the certificate is removed **before** `session` (which
-/// owns the `HttpInitializer` that started the configuration subsystem) drops.
-/// Unbinding calls `HttpDeleteServiceConfiguration`, which needs that subsystem
-/// alive — mirroring the documented `winasio-util::ServerSession` drop-order
-/// rule.
-struct HttpsFixture {
-    /// Bound to `0.0.0.0:port` (IPv4-any).
-    _v4: SslCertBinding,
-    /// Bound to `[::]:port` (IPv6-any).
-    _v6: SslCertBinding,
-    /// The installed self-signed certificate (removed, with its key, on drop).
-    cert: SelfSignedCert,
-    /// Holds the `HttpInitializer`; dropped last so the config subsystem
-    /// outlives the unbind calls above.
+/// A ready HTTPS test environment: the config subsystem is live (so the query
+/// and URL registration below work) and the certificate is already bound to
+/// [`port`](Self::port) by the setup script.
+struct HttpsEnv {
+    /// Holds the `HttpInitializer`; kept alive for the config-subsystem calls
+    /// (`query_ssl_binding`) and the URL-group registration.
     session: ServerSession,
+    /// The provisioned port, from the single-source config.
     port: u16,
 }
 
-impl HttpsFixture {
+impl HttpsEnv {
     fn session(&self) -> &ServerSession {
         &self.session
     }
-
-    fn thumbprint(&self) -> [u8; THUMBPRINT_LEN] {
-        self.cert.thumbprint()
-    }
 }
 
-/// Bind a self-signed certificate to `port` on both IP families and return the
-/// fixture, or `None` when the host is not elevated (the one legitimate skip).
+/// Return a ready [`HttpsEnv`] when the setup script has bound a certificate to
+/// the test port, or `None` (with a greppable reason) when it has not — the one
+/// legitimate skip.
 ///
-/// The ordering here is deliberate (F1/F3):
-/// 1. Gate on elevation **first**, so the RAN/SKIPPED decision is explicit and
-///    does not depend on which privileged step would have failed first.
-/// 2. Create the `ServerSession` (and thus the `HttpInitializer`) **before**
-///    any sweep/bind/query, because those touch the configuration subsystem.
-/// 3. Sweep this crate's own leftovers before binding (R2).
-/// 4. Create the machine-scoped certificate and bind it to both wildcard
-///    families, so the handshake lands on a bound endpoint whichever family
-///    WinHTTP resolves `localhost` to.
-///
-/// After the elevation gate, any failure is a hard error rather than a silent
-/// skip: step 0 already established the host *can* do this, so a failure now is
-/// a real regression that must not be masked.
-fn setup_https(port: u16) -> Option<HttpsFixture> {
-    if !is_elevated() {
-        eprintln!("HTTPS_TLS_TEST: SKIPPED (requires elevation) port={port}");
-        return None;
-    }
+/// Detection is by the binding itself, not by elevation: the whole point of the
+/// redesign is that these tests need no privileges, so "can I see the binding?"
+/// is the right question. Reading the SSL table is permitted unelevated
+/// (measured: `netsh http show sslcert` works without administrator rights, C7).
+fn require_bound_endpoint() -> Option<HttpsEnv> {
+    let port = tls_config::https_test_port();
 
-    // 1. The initializer must exist before we touch the config subsystem.
+    // The initializer must exist before we touch the config subsystem.
     let session = ServerSession::new().expect("HTTP.sys initialises");
 
-    // 2. Remove any residue this crate left behind on a previous aborted run.
-    SelfSignedCert::sweep_leftovers(CertStore::LocalMachine, &RESERVED_PORTS);
-
-    // 3. A machine-scoped self-signed certificate with a DNS:localhost SAN.
-    let cert = SelfSignedCert::create("CN=localhost", CertStore::LocalMachine)
-        .expect("self-signed certificate creation succeeds on an elevated host");
-    let thumbprint = cert.thumbprint();
-    let store_name = cert
-        .store_name()
-        .expect("a LocalMachine certificate has a bindable store name");
-
-    // Diagnostic (read-only): report the stored cert's private-key association
-    // health on this runner. A broken cert->key association is the classic
-    // cause of the bind-time ERROR_NO_SUCH_LOGON_SESSION (1312); this pins down
-    // whether the failure is cert-side or http.sys-context-side. See R1.
-    diagnose_private_key(&thumbprint);
-    // Decisive: can THIS elevated, logged-on process acquire the private key the
-    // same way HTTP.sys does? Success => the cert->key link is intact and the
-    // 1312 is HTTP.sys's SYSTEM/no-logon context; failure => the association is
-    // broken.
-    match cert.verify_private_key_acquirable() {
-        Ok(()) => eprintln!("HTTPS_TLS_TEST: DIAG in_proc_key_acquire=OK"),
-        Err(e) => eprintln!("HTTPS_TLS_TEST: DIAG in_proc_key_acquire=ERR {e:?}"),
-    }
-
-    // 4. Bind to both wildcard families for the reasons in the module docs.
-    let v4addr: SocketAddr = format!("0.0.0.0:{port}")
+    let v4: SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .expect("valid v4 endpoint");
-    let v6addr: SocketAddr = format!("[::]:{port}").parse().expect("valid v6 endpoint");
-
-    let v4 = match bind_ssl_certificate(v4addr, &thumbprint, store_name, SSL_BINDING_APP_ID) {
-        Ok(b) => b,
-        Err(e) => {
-            // LOUD, greppable, NOT silent: this host is elevated (step 0 proved
-            // it), so a bind failure here is a real, reportable outcome — the
-            // HTTPS wire roundtrip is NOT proven on this runner. Isolate whether
-            // the reference tool (`netsh`) also fails with this exact cert.
+    match query_ssl_binding(v4) {
+        Ok(Some(thumbprint)) => {
             eprintln!(
-                "HTTPS_TLS_TEST: BIND_UNPROVEN port={port} err={e:?} \
-                 -- HTTPS wire roundtrip NOT proven on this runner (see diagnostics)"
+                "HTTPS_TLS_TEST: RAN (certificate bound by scripts/setup-https-test.ps1) \
+                 port={port} thumbprint={}",
+                thumb_hex(&thumbprint)
             );
-            diagnose_reference_netsh_bind(v4addr, &thumbprint, port);
-            return None;
+            Some(HttpsEnv { session, port })
         }
-    };
-    let v6 = match bind_ssl_certificate(v6addr, &thumbprint, store_name, SSL_BINDING_APP_ID) {
-        Ok(b) => b,
-        Err(e) => {
+        Ok(None) => {
             eprintln!(
-                "HTTPS_TLS_TEST: BIND_UNPROVEN port={port} family=v6 err={e:?} \
-                 -- HTTPS wire roundtrip NOT proven on this runner"
+                "HTTPS_TLS_TEST: SKIPPED (no SSL binding on 0.0.0.0:{port}) -- provision it with an \
+                 elevated `pwsh -File scripts/setup-https-test.ps1`, then re-run these tests \
+                 unelevated"
             );
-            // `v4` drops here and unbinds via RAII, so no leftover binding.
-            return None;
+            None
         }
-    };
-
-    eprintln!("HTTPS_TLS_TEST: RAN (elevated) port={port}");
-    Some(HttpsFixture {
-        _v4: v4,
-        _v6: v6,
-        cert,
-        session,
-        port,
-    })
+        Err(e) => {
+            // Reading the table should not fail unelevated; if it does, treat it
+            // as an environment we cannot run in and skip loudly rather than
+            // failing for being on the wrong host.
+            eprintln!(
+                "HTTPS_TLS_TEST: SKIPPED (could not read the SSL binding table on \
+                 0.0.0.0:{port}: {e:?})"
+            );
+            None
+        }
+    }
 }
 
-/// Print the SHA-1 thumbprint as lowercase hex, the form the diagnostics need.
+/// Print a SHA-1 thumbprint as lowercase hex.
 fn thumb_hex(thumbprint: &[u8; THUMBPRINT_LEN]) -> String {
     thumbprint.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Report, read-only, whether the freshly installed machine certificate has an
-/// acquirable private key **as seen from this (elevated) process**. This
-/// isolates the two candidate root causes of a bind-time
-/// `ERROR_NO_SUCH_LOGON_SESSION (1312)`:
-///
-/// * `HasPrivateKey=False` -> the cert->key association in the store is broken
-///   (cert-side bug; the fix is re-association).
-/// * `HasPrivateKey=True` + acquire OK here, yet the bind still fails ->
-///   http.sys's SYSTEM context cannot open a key this logged-on process can
-///   (context-side; not a cert-content bug).
-///
-/// Emitted as greppable `HTTPS_TLS_TEST: DIAG ...` lines (R1).
-fn diagnose_private_key(thumbprint: &[u8; THUMBPRINT_LEN]) {
-    // The crate's own view of its machine store, via the same `CertOpenStore`
-    // path `create`/`sweep_leftovers` use. Comparing this against PowerShell's
-    // view distinguishes "cert never persisted" from "persisted somewhere the
-    // machine store readers don't see".
-    let crate_view = winasio::httpsys::cert_present(thumbprint, CertStore::LocalMachine);
-    eprintln!("HTTPS_TLS_TEST: DIAG crate_cert_present(LocalMachine\\My)={crate_view}");
-
-    // Uppercase hex is the form the `Cert:` PSDrive path expects.
-    let hex_upper: String = thumbprint.iter().map(|b| format!("{b:02X}")).collect();
-    let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         $lm = @(Get-ChildItem Cert:\\LocalMachine\\My); \
-         'LM_My_count=' + $lm.Count; \
-         $cu = @(Get-ChildItem Cert:\\CurrentUser\\My); \
-         'CU_My_count=' + $cu.Count; \
-         $c = ($lm + $cu) | Where-Object {{ $_.Thumbprint -eq '{hex_upper}' }} | Select-Object -First 1; \
-         if ($null -eq $c) {{ 'ps_cert_found=false'; return }}; \
-         'ps_cert_found=true HasPrivateKey=' + $c.HasPrivateKey; \
-         try {{ \
-           $k = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c); \
-           if ($null -ne $k) {{ 'Acquire=OK KeySize=' + $k.KeySize }} else {{ 'Acquire=null' }} \
-         }} catch {{ 'AcquireErr=' + $_.Exception.Message }}"
-    );
-    match std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    {
-        Ok(out) => {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let line = line.trim();
-                if !line.is_empty() {
-                    eprintln!("HTTPS_TLS_TEST: DIAG {line}");
-                }
-            }
-        }
-        Err(e) => eprintln!("HTTPS_TLS_TEST: DIAG powershell-spawn-failed: {e}"),
-    }
-}
-
-/// Ask the *reference* tool (`netsh http add sslcert`) to bind the same cert to
-/// the same endpoint. If `netsh` succeeds where [`bind_ssl_certificate`] fails,
-/// the defect is in this crate's API surface; if `netsh` fails identically, the
-/// defect is in the certificate or the runner. Cleans up any binding it adds.
-///
-/// Emitted as greppable `HTTPS_TLS_TEST: NETSH ...` lines (R1). Best-effort:
-/// any spawn failure is reported and ignored.
-fn diagnose_reference_netsh_bind(
-    endpoint: SocketAddr,
-    thumbprint: &[u8; THUMBPRINT_LEN],
-    port: u16,
-) {
-    let hex = thumb_hex(thumbprint);
-    let ipport = format!("{}:{}", endpoint.ip(), port);
-    // A throwaway AppId GUID; identity is irrelevant to whether the bind works.
-    let appid = "{9a8b7e8d-e4a1-40b7-992a-838ba5842c89}";
-    let add = std::process::Command::new("netsh")
-        .args([
-            "http",
-            "add",
-            "sslcert",
-            &format!("ipport={ipport}"),
-            &format!("certhash={hex}"),
-            &format!("appid={appid}"),
-            "certstorename=MY",
-        ])
-        .output();
-    match add {
-        Ok(out) => {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let summary = combined
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            eprintln!(
-                "HTTPS_TLS_TEST: NETSH add status={} out=[{summary}]",
-                out.status
-            );
-            if out.status.success() {
-                // Remove the reference binding so the machine is left clean.
-                let _ = std::process::Command::new("netsh")
-                    .args(["http", "delete", "sslcert", &format!("ipport={ipport}")])
-                    .output();
-                eprintln!("HTTPS_TLS_TEST: NETSH delete (reference binding cleaned up)");
-            }
-        }
-        Err(e) => eprintln!("HTTPS_TLS_TEST: NETSH spawn-failed: {e}"),
-    }
-}
-
-/// Build the one-shot HTTP.sys server for a fixture, listening on
-/// `https://localhost:{port}/tls/`.
-fn build_server(fx: &HttpsFixture) -> Server<'_> {
-    Server::builder(fx.session())
-        .url(&format!("https://localhost:{}/tls/", fx.port))
+/// Build the one-shot HTTP.sys server for the environment, listening on
+/// `https://localhost:{port}/tls/`. Registering the prefix needs no elevation
+/// (R6).
+fn build_server(env: &HttpsEnv) -> Server<'_> {
+    Server::builder(env.session())
+        .url(&format!("https://localhost:{}/tls/", env.port))
         .build(&ThreadPool)
-        .expect("binding the https URL prefix succeeds on an elevated host")
+        .expect("registering the https URL prefix succeeds unelevated (R6)")
 }
 
 /// Drive one HTTPS GET from the client side and return `(status, body)`.
@@ -435,17 +229,18 @@ fn from_err(error: windows::core::Error) -> WinHttpError {
 #[test]
 fn https_roundtrip_positive() {
     let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(fx) = setup_https(12480) else {
+    let Some(env) = require_bound_endpoint() else {
         return;
     };
-    let server = build_server(&fx);
+    let port = env.port;
+    let server = build_server(&env);
 
     // The client runs on its own thread; the server answers one request here.
     let client = std::thread::spawn(move || {
         // R5: relax ONLY the CA-trust check. The DNS:localhost SAN plus the
         // `localhost` request host should satisfy name validation on their own.
         https_get(
-            12480,
+            port,
             "/tls/x",
             CertificateRelaxations {
                 unknown_certificate_authority: true,
@@ -488,41 +283,34 @@ fn https_roundtrip_positive() {
     );
 }
 
-/// The binding is observable through the query API while held and gone after
-/// the fixture drops, on both families (SC-003).
+/// The externally-provisioned binding is observable through the query API on
+/// both wildcard families, and both families report the same certificate
+/// (SC-003) — i.e. the setup script's dual-family binding contract holds.
 #[test]
-fn https_binding_observable_then_absent() {
+fn https_binding_observable_on_both_families() {
     let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(fx) = setup_https(12481) else {
+    let Some(env) = require_bound_endpoint() else {
         return;
     };
-    let expected = fx.thumbprint();
+    let port = env.port;
 
-    let v4: SocketAddr = "0.0.0.0:12481".parse().unwrap();
-    let v6: SocketAddr = "[::]:12481".parse().unwrap();
+    let v4: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+    let v6: SocketAddr = format!("[::]:{port}").parse().unwrap();
 
-    assert_eq!(
-        query_ssl_binding(v4).expect("query v4 succeeds"),
-        Some(expected),
-        "the v4 binding is observable while the guard is held"
+    let v4_thumb = query_ssl_binding(v4).expect("query v4 succeeds");
+    let v6_thumb = query_ssl_binding(v6).expect("query v6 succeeds");
+
+    assert!(
+        v4_thumb.is_some(),
+        "the v4 binding is observable (the setup script binds 0.0.0.0)"
+    );
+    assert!(
+        v6_thumb.is_some(),
+        "the v6 binding is observable (the setup script binds [::])"
     );
     assert_eq!(
-        query_ssl_binding(v6).expect("query v6 succeeds"),
-        Some(expected),
-        "the v6 binding is observable while the guard is held"
-    );
-
-    drop(fx);
-
-    assert_eq!(
-        query_ssl_binding(v4).expect("query v4 succeeds"),
-        None,
-        "the v4 binding is gone once the guard drops"
-    );
-    assert_eq!(
-        query_ssl_binding(v6).expect("query v6 succeeds"),
-        None,
-        "the v6 binding is gone once the guard drops"
+        v4_thumb, v6_thumb,
+        "both families report the same provisioned certificate"
     );
 }
 
@@ -533,15 +321,16 @@ fn https_binding_observable_then_absent() {
 #[test]
 fn https_negative_control_unrelaxed_fails() {
     let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(_fx) = setup_https(12482) else {
+    let Some(env) = require_bound_endpoint() else {
         return;
     };
+    let port = env.port;
     // The URL prefix must be registered for HTTP.sys to listen and perform the
     // handshake at all; the request itself never reaches `serve_one` because the
     // handshake fails first, so no server loop is run here.
-    let _server = build_server(&_fx);
+    let _server = build_server(&env);
 
-    let result = https_get(12482, "/tls/x", CertificateRelaxations::default());
+    let result = https_get(port, "/tls/x", CertificateRelaxations::default());
 
     match result {
         Err(WinHttpError::SecureFailure) => {
@@ -561,4 +350,47 @@ fn https_negative_control_unrelaxed_fails() {
              certificate — certificate validation is not being enforced"
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Always-on: the single-source config parser (no elevation, no binding needed)
+// ---------------------------------------------------------------------------
+//
+// These pin down that this test binary and `scripts/setup-https-test.ps1` read
+// the same port from the one config file, so the two cannot drift into binding
+// one port and connecting to another (E-F).
+
+#[test]
+fn shared_config_port_is_a_plausible_user_port() {
+    let port = tls_config::https_test_port();
+    assert!(
+        port >= 1024,
+        "the shared test port must be a non-privileged port, got {port}"
+    );
+}
+
+#[test]
+fn config_parser_reads_a_simple_assignment() {
+    let src = "# comment\n$HttpsTestPort = 12495\n$Other = 1\n";
+    assert_eq!(
+        tls_config::parse_u16_assignment(src, "HttpsTestPort"),
+        Some(12495)
+    );
+}
+
+#[test]
+fn config_parser_ignores_similar_names_and_comments() {
+    let src = "#$HttpsTestPort = 1\n$HttpsTestPortX = 2\n$HttpsTestPort = 12495\n";
+    assert_eq!(
+        tls_config::parse_u16_assignment(src, "HttpsTestPort"),
+        Some(12495)
+    );
+}
+
+#[test]
+fn config_parser_returns_none_when_absent() {
+    assert_eq!(
+        tls_config::parse_u16_assignment("$Foo = 3\n", "HttpsTestPort"),
+        None
+    );
 }

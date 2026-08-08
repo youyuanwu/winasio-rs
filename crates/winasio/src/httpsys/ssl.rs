@@ -354,7 +354,7 @@ pub fn bind_ssl_certificate(
 ///
 /// Idempotent from the caller's view apart from the returned error: deleting a
 /// nonexistent row reports a not-found platform error. Exposed to the crate so
-/// the `test-util` cleanup sweep can remove stale bindings by endpoint.
+/// the [`SslCertBinding`] guard can unbind by endpoint on drop.
 pub(crate) fn delete_binding(endpoint: SocketAddr) -> Result<(), SslBindError> {
     let ipport = IpPort::new(endpoint);
     let set = HTTP_SERVICE_CONFIG_SSL_SET {
