@@ -567,7 +567,9 @@ mod tests {
         // this table: measured (M2), HTTP.sys reports `(1, 1)` for an h2 request
         // and flags it via `HTTP_REQUEST.Flags` instead, so `version_of` checks
         // `is_http2`/`is_http3` before consulting this table. That flag path
-        // needs a real h2 request and is covered end-to-end in winasio-tests.
+        // needs a real h2 request; it is asserted end-to-end by the gRPC-over-TLS
+        // suite (`winasio-tests/tests/grpc_tls.rs::grpc_unary`, which fails unless
+        // the server observes the request as HTTP/2).
         assert_eq!(version_from_tuple(0, 9), Version::HTTP_09);
         assert_eq!(version_from_tuple(1, 0), Version::HTTP_10);
         assert_eq!(version_from_tuple(1, 1), Version::HTTP_11);

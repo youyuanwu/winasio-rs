@@ -27,6 +27,15 @@
 //! * **No runtime is required.** Nothing here spawns a task, blocks a thread or
 //!   touches a reactor; the returned futures run on any executor, including
 //!   `futures::executor::block_on`.
+//! * **The request body is bound `Send + Unpin + 'static`.** Phase 1 (HTTP/2)
+//!   tightened [`Client::request`]'s body bound from a plain `Body` to
+//!   `Body + Send + Unpin + 'static` (its `Data: Send`, its `Error: Send`). The
+//!   HTTP/2 duplex path drives the body from WinHTTP's own callback threads and
+//!   holds it across `await` points that outlive the call frame, which requires
+//!   all three. This is a source-breaking tightening for any HTTP/1.1 caller
+//!   that passed a `!Send`/`!'static` body; in practice the common bodies
+//!   (`Full<Bytes>`, `Empty`, channel-backed streams) already satisfy it. It is
+//!   recorded here deliberately rather than left as a silent bound change.
 //!
 //! # Connection reuse belongs to the platform
 //!

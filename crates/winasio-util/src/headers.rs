@@ -191,14 +191,16 @@ pub(crate) fn parse_trailers(raw: &str) -> Result<HeaderMap, RequestError> {
     Ok(headers)
 }
 
-/// The HTTP version named by a status line.
+/// The HTTP version named by an HTTP/1.x status line.
 ///
 /// A version the parser does not recognise becomes `HTTP/1.1` rather than an
-/// error. WinHTTP does not speak HTTP/2 or HTTP/3 through this API and reports
-/// what it negotiated, so an unrecognised token means the status line was
-/// malformed — and a malformed status line accompanying a status code and body
-/// the platform was happy with is not worth failing an otherwise good response
-/// over.
+/// error. This parses the textual status line, which only exists on the
+/// HTTP/1.x wire; when the request negotiated HTTP/2 (via
+/// `WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL`, Phase 1) there is no textual status
+/// line and the negotiated version is read from the response object instead. So
+/// an unrecognised token here means an HTTP/1.x status line was malformed — and
+/// a malformed status line accompanying a status code and body the platform was
+/// happy with is not worth failing an otherwise good response over.
 fn parse_version(status_line: &str) -> Version {
     match status_line.split(' ').next().unwrap_or_default() {
         "HTTP/0.9" => Version::HTTP_09,

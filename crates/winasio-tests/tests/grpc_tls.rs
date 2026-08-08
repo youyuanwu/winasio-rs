@@ -41,12 +41,27 @@
 //!    always allowed, even under the require-flag (it is not a provisioning
 //!    failure).
 //!
-//! When both gates pass, **unary + server-streaming are required**: they must
-//! run and assert successfully. **Client-streaming + bidirectional** attempt the
-//! call; success is a genuine run, and a failure is converted into a documented,
-//! greppable `GRPC_DUPLEX: SKIPPED-UNSUPPORTED` token that carries the OS version
-//! and the exact error — never a silent skip, and never masked as a pass. On a
-//! duplex-capable host (Windows 11+, and this developer machine) all four run.
+//! When both gates pass, **all four call types are required**: they must run and
+//! assert successfully. The M8 automatic-chunking probe (gate 2) is not merely
+//! *a* capability check — it is the *duplex* discriminator: Microsoft's own
+//! WinHttpHandler tests treat the automatic-chunking backport and bidirectional
+//! support as the same capability (`dotnet/runtime`
+//! `BidirectionStreamingTest.cs`: `OsSupportsWinHttpBidirectionalStreaming` is
+//! true exactly when chunking is available). So once gate 2 passes, duplex is
+//! expected to work, and a client-streaming or bidirectional failure is a **real
+//! bug that fails the test loudly** — never converted into a skip, which would
+//! be exactly the blanket masking that could hide a regression (e.g. a
+//! request-body END_STREAM or head-ordering defect). Success logs a greppable
+//! `GRPC_DUPLEX: RAN` token carrying the OS version.
+//!
+//! If a future OS (e.g. the Server 2025 CI runner, M11) ever advertises chunking
+//! yet genuinely cannot do duplex, this suite will *fail visibly* with the real
+//! error rather than skip silently — at which point a narrow, signature-based
+//! skip can be added against the now-known error, per the user's "documented,
+//! visible, narrowly-scoped, never silent" requirement. We do not pre-emptively
+//! skip on an unknown signature, because that is indistinguishable from masking a
+//! bug. On a duplex-capable host (Windows 11+, and this developer machine) all
+//! four run.
 //!
 //! # No privileged operation; identical elevated/unelevated
 //!
@@ -93,6 +108,16 @@ const CLIENT_TIMEOUT_MS: u32 = 15_000;
 
 /// How many messages the streaming call types exchange.
 const STREAM_N: usize = 3;
+
+/// Records, at the axum layer, whether the server observed the request as
+/// HTTP/2 — the e2e proof of the M2 fix. HTTP.sys reports `HTTP_REQUEST.Version`
+/// as `(1, 1)` even for an h2 request and signals h2 only via
+/// `HTTP_REQUEST.Flags`; `winasio-util`'s `version_of`/`is_http2` reads that
+/// flag, and `winasio-axum` stamps the resulting version onto the `http::Request`
+/// tonic sees. This static captures that stamped version so the unary test can
+/// assert the whole chain end-to-end (FR-008 / SC-002), rather than merely
+/// unit-testing the tuple mapping.
+static SERVER_SAW_HTTP2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // The server implementation
@@ -324,9 +349,20 @@ where
     let shutdown = server.shutdown_handle();
 
     // tonic's server side IS an axum router: mount the generated EchoServer as
-    // the router's fallback so every path routes to it (D-A / crate design).
-    let router =
-        winasio_tonic::server::axum::Router::new().fallback_service(EchoServer::new(EchoService));
+    // the router's fallback so every path routes to it (D-A / crate design). A
+    // thin middleware records the HTTP version the server actually saw, proving
+    // the M2 flag-based h2 detection end-to-end (see `SERVER_SAW_HTTP2`).
+    use winasio_tonic::server::axum;
+    let router = axum::Router::new()
+        .fallback_service(EchoServer::new(EchoService))
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.version() == http::Version::HTTP_2 {
+                    SERVER_SAW_HTTP2.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                next.run(req).await
+            },
+        ));
 
     std::thread::scope(|scope| {
         let serve_thread = scope.spawn(|| {
@@ -394,26 +430,23 @@ fn run_client<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Classify a duplex (client-streaming / bidirectional) failure. On a
-/// duplex-capable host the call succeeds and this is never reached; where it is,
-/// the failure becomes a documented, greppable skip carrying the OS version and
-/// the exact error, per the M11 obligation — visible, never silent, never masked
-/// as a pass.
-fn duplex_skip(call: &str, status: &Status) {
-    eprintln!(
-        "GRPC_DUPLEX: SKIPPED-UNSUPPORTED call={call} os={} code={:?} message={:?} -- the duplex \
-         ordering (M6) appears unsupported on this OS (M9/M11); unary + server-streaming still ran",
-        os_version(),
-        status.code(),
-        status.message()
-    );
+/// Log that a duplex call genuinely ran on this host. Reached only when the
+/// call succeeded — the M8 chunking gate (gate 2) already established that this
+/// OS supports the duplex path, so a *failure* past that gate is a real bug and
+/// is asserted, not skipped (see the module docs' capability model).
+fn duplex_ran(call: &str) {
+    eprintln!("GRPC_DUPLEX: RAN call={call} os={}", os_version());
 }
 
 // ---------------------------------------------------------------------------
 // Tests — one per call type
 // ---------------------------------------------------------------------------
 /// Unary: one request, one response, terminating `grpc-status`. Required
-/// whenever TLS + chunking are present (does not need duplex).
+/// whenever TLS + chunking are present (does not need duplex). Also asserts the
+/// M2 chain: the server must have observed the request as **HTTP/2** (gRPC has
+/// no h2c, M10 — so if this call worked at all the wire was h2, and the server
+/// must report it as such via the `HTTP_REQUEST.Flags` path, not the misleading
+/// `(1,1)` version tuple).
 #[test]
 fn grpc_unary() {
     let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -421,6 +454,7 @@ fn grpc_unary() {
         return;
     };
 
+    SERVER_SAW_HTTP2.store(false, std::sync::atomic::Ordering::SeqCst);
     with_echo_server(&env, |mut client| {
         let reply = run_client(async {
             client
@@ -433,6 +467,11 @@ fn grpc_unary() {
         .into_inner();
         assert_eq!(reply.message, "echo: hello");
     });
+    assert!(
+        SERVER_SAW_HTTP2.load(std::sync::atomic::Ordering::SeqCst),
+        "server must observe the request as HTTP/2 (M2: read from HTTP_REQUEST.Flags, \
+         not the (1,1) version tuple); gRPC has no h2c so this proves the h2 path e2e"
+    );
 }
 
 /// Server-streaming: one request, a stream of responses ended by trailers.
@@ -470,7 +509,8 @@ fn grpc_server_streaming() {
 
 /// Client-streaming: a stream of requests, one response. Needs duplex — the
 /// client keeps writing the request body after the server has been reached.
-/// Attempted; a failure becomes a documented `GRPC_DUPLEX` skip (M9/M11).
+/// Required once the M8 chunking gate has passed (see the module capability
+/// model); a failure is a real bug, not a skip.
 #[test]
 fn grpc_client_streaming() {
     let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -484,28 +524,28 @@ fn grpc_client_streaming() {
                 message: format!("c{i}"),
             })
             .collect();
-        let result = run_client(async {
+        let reply = run_client(async {
             client
                 .client_streaming(Request::new(futures::stream::iter(requests)))
                 .await
-        });
-        match result {
-            Ok(reply) => {
-                let reply = reply.into_inner();
-                assert_eq!(
-                    reply.message,
-                    format!("received {STREAM_N} messages, last=c{}", STREAM_N - 1)
-                );
-                eprintln!("GRPC_DUPLEX: RAN call=client_streaming os={}", os_version());
-            }
-            Err(status) => duplex_skip("client_streaming", &status),
-        }
+        })
+        .expect("client-streaming call succeeds (duplex supported past the M8 gate)")
+        .into_inner();
+        assert_eq!(
+            reply.message,
+            format!("received {STREAM_N} messages, last=c{}", STREAM_N - 1)
+        );
+        duplex_ran("client_streaming");
     });
 }
 
 /// Bidirectional: a stream each way, echoed per message. The strongest duplex
-/// test — responses are produced before the client finishes sending. Attempted;
-/// a failure becomes a documented `GRPC_DUPLEX` skip (M9/M11).
+/// test — driven as a genuine **ping-pong**: request `n+1` is produced only
+/// after reply `n` has been read, via a lazily-fed channel. This exercises the
+/// case where the response head must be returned while the request body is still
+/// `Pending` (a pre-buffered `stream::iter` would not — its frames are all ready
+/// immediately, so the whole request body drains before the head arrives). A
+/// failure here is a real bug, not a skip (module capability model).
 #[test]
 fn grpc_bidi_streaming() {
     let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -514,29 +554,51 @@ fn grpc_bidi_streaming() {
     };
 
     with_echo_server(&env, |mut client| {
-        let requests: Vec<EchoRequest> = (0..STREAM_N)
-            .map(|i| EchoRequest {
-                message: format!("b{i}"),
+        let collected = run_client(async {
+            // A lazily-fed outbound stream: we send the next request only after
+            // reading the previous reply, so the stream is `Pending` between
+            // turns. This is what makes it a true duplex ping-pong.
+            let (tx, rx) = futures::channel::mpsc::unbounded::<EchoRequest>();
+            tx.unbounded_send(EchoRequest {
+                message: "p0".into(),
             })
-            .collect();
-        let result = run_client(async {
+            .expect("seed first request");
+            // Held in an `Option` so we can drop (close) the outbound stream from
+            // inside the read loop without an early `break` — draining to the
+            // final `None` reads the `grpc-status` trailer and lets the server
+            // close its side cleanly (an early break would race the trailer send).
+            let mut tx = Some(tx);
+
             let mut inbound = client
-                .bidi_streaming(Request::new(futures::stream::iter(requests)))
-                .await?
+                .bidi_streaming(Request::new(rx))
+                .await
+                .expect("bidi call succeeds (duplex supported past the M8 gate)")
                 .into_inner();
+
             let mut out = Vec::new();
-            while let Some(reply) = inbound.message().await? {
+            let mut sent = 1usize;
+            while let Some(reply) = inbound.message().await.expect("read a bidi-streamed reply") {
                 out.push(reply.message);
+                if sent < STREAM_N {
+                    // Only now, having seen reply n, do we produce request n+1.
+                    tx.as_ref()
+                        .expect("sender live")
+                        .unbounded_send(EchoRequest {
+                            message: format!("p{sent}"),
+                        })
+                        .expect("send next ping");
+                    sent += 1;
+                } else {
+                    // All pings sent and their pongs seen: close the outbound
+                    // stream so the server ends its side; the loop keeps reading
+                    // until the trailing `None` (the grpc-status trailer).
+                    tx = None;
+                }
             }
-            Ok::<_, Status>(out)
+            out
         });
-        match result {
-            Ok(collected) => {
-                let expected: Vec<String> = (0..STREAM_N).map(|i| format!("echo: b{i}")).collect();
-                assert_eq!(collected, expected);
-                eprintln!("GRPC_DUPLEX: RAN call=bidi_streaming os={}", os_version());
-            }
-            Err(status) => duplex_skip("bidi_streaming", &status),
-        }
+        let expected: Vec<String> = (0..STREAM_N).map(|i| format!("echo: p{i}")).collect();
+        assert_eq!(collected, expected);
+        duplex_ran("bidi_streaming");
     });
 }

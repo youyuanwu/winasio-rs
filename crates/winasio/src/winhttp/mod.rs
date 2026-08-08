@@ -816,6 +816,7 @@ impl Request {
         }
     }
 
+    /// Send the request head, and optionally the whole body.
     ///
     /// `headers` is a raw `name: value` block encoded as UTF-16;
     /// [`encode_headers`] builds one. It is taken by value because WinHTTP

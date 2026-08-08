@@ -302,9 +302,13 @@ fn probe_chunking(
 ///
 /// The receive future is polled on every await via [`with_recv`], so it is
 /// submitted before the first byte of body and progresses alongside the writes,
-/// which is exactly the ordering the platform requires. No in-flight operation
-/// is ever dropped mid-flight: each body write completes before the next frame
-/// is pulled, and the receive is held by reference rather than moved.
+/// which is exactly the ordering the platform requires. No in-flight *write* is
+/// ever dropped mid-flight: each body write completes before the next frame is
+/// pulled, and the receive is held by reference rather than moved. The one thing
+/// that *is* abandoned when the head arrives is a still-pending frame *pull*
+/// (via [`with_recv_until_head`]) — that owns nothing but a `&mut` to the
+/// caller's body, so dropping it is safe, and doing so is what lets a genuine
+/// client-driven ping-pong bidi stream make progress (see the loop below).
 async fn drive_head<B>(
     platform: &mut Request,
     body: &mut B,
@@ -321,8 +325,19 @@ where
     let mut write_done = false;
 
     while head.is_none() {
-        let frame = with_recv(pull_frame(body), &mut recv, &mut head).await;
-        let frame = match frame {
+        // Pull the next request-body frame, but give up the pull the instant the
+        // response head arrives. A caller doing client-driven bidirectional
+        // ping-pong cannot produce its next request frame until it has read the
+        // response head and the previous reply, so `drive_head` MUST be able to
+        // return with the head in hand while the request body is still
+        // `Pending` — otherwise the two sides wait on each other forever. The
+        // remaining body is handed to `DuplexResponseBody`, which interleaves it
+        // with the response reads.
+        let pulled = match with_recv_until_head(pull_frame(body), &mut recv, &mut head).await {
+            Some(pulled) => pulled,
+            None => break, // head arrived, body not drained; write_done stays false
+        };
+        let frame = match pulled {
             Some(Ok(frame)) => frame,
             Some(Err(error)) => return Err(RequestError::Body(BodyError::Source(error.into()))),
             None => {
@@ -388,6 +403,39 @@ async fn with_recv<F: Future>(
             }
         }
         op.as_mut().poll(context)
+    })
+    .await
+}
+
+/// Like [`with_recv`], but resolves as soon as *either* `op` completes *or* the
+/// response head arrives — returning `Some(output)` in the first case and `None`
+/// in the second (the head is stored in `head`).
+///
+/// This is safe to use **only** when abandoning a still-pending `op` leaks no
+/// in-flight platform operation. A pending [`pull_frame`] owns nothing but a
+/// `&mut` to the caller's body, so dropping it is fine; a pending `write_data`,
+/// by contrast, owns a buffer WinHTTP is reading and must run to completion —
+/// those keep using [`with_recv`]. Abandoning the frame pull the moment the head
+/// lands is what breaks the client-driven ping-pong deadlock: the caller cannot
+/// produce its next request frame until it has read the head and the previous
+/// reply, so waiting for that frame here would wait forever.
+async fn with_recv_until_head<F: Future>(
+    op: F,
+    recv: &mut Pin<&mut ReceiveResponse<'_>>,
+    head: &mut Option<Result<(), Error>>,
+) -> Option<F::Output> {
+    let mut op = std::pin::pin!(op);
+    std::future::poll_fn(|context| {
+        if head.is_none() {
+            if let Poll::Ready(result) = recv.as_mut().poll(context) {
+                *head = Some(result);
+            }
+        }
+        match op.as_mut().poll(context) {
+            Poll::Ready(value) => Poll::Ready(Some(value)),
+            Poll::Pending if head.is_some() => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     })
     .await
 }
@@ -463,6 +511,7 @@ async fn end_stream_with_recv(
         }
     }
 }
+/// The response body of a duplex HTTP/2 request.
 ///
 /// Owns the [`Request`] and the remainder of the outbound body. Each poll first
 /// advances the outbound write (any request-body frames that are ready) and
@@ -663,6 +712,10 @@ where
         },
     }
 }
+/// Write a whole buffer on the writer half, without polling any receive.
+///
+/// Used from [`DuplexResponseBody`], where the response receive is driven by the
+/// body's own poll loop rather than concurrently here.
 async fn write_all_half(
     writer: &mut RequestWriter<'_>,
     buffer: Vec<u8>,

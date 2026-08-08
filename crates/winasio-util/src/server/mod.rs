@@ -785,31 +785,53 @@ impl<S: Backend> Responder<S> {
         sent.map_err(ResponseError::send(SendStage::Head))?;
 
         let mut body = std::pin::pin!(body);
-        let mut trailers: Option<HeaderMap> = None;
-        loop {
-            match next_frame(body.as_mut()).await? {
-                Some(Frame::Data(bytes)) => {
-                    // Raw, un-framed. `write` never marks this last: the response
-                    // is closed by the trailers frame (or the empty terminal
-                    // frame below), never by a body chunk.
-                    if !bytes.is_empty() {
-                        self.write(bytes, false).await?;
-                    }
-                }
-                Some(Frame::Trailers(map)) => {
-                    // http_body yields trailers as the final frame; fold in case
-                    // a body somehow produces more than one map.
-                    trailers = Some(match trailers {
-                        Some(mut existing) => {
-                            existing.extend(map);
-                            existing
+        // Drain the body into wire writes, capturing any body/write error. The
+        // head has already gone out with MORE_DATA, so a mid-stream error must
+        // not simply propagate: that would leave the response half-open and the
+        // peer hanging on a stream that never ends. On error we send a
+        // best-effort empty terminal frame (below) so the peer at least sees the
+        // response close, then surface the original error.
+        let drained: Result<Option<HeaderMap>, ResponseError> = async {
+            let mut trailers: Option<HeaderMap> = None;
+            loop {
+                match next_frame(body.as_mut()).await? {
+                    Some(Frame::Data(bytes)) => {
+                        // Raw, un-framed. `write` never marks this last: the
+                        // response is closed by the trailers frame (or the empty
+                        // terminal frame below), never by a body chunk.
+                        if !bytes.is_empty() {
+                            self.write(bytes, false).await?;
                         }
-                        None => map,
-                    });
+                    }
+                    Some(Frame::Trailers(map)) => {
+                        // http_body yields trailers as the final frame; fold in
+                        // case a body somehow produces more than one map.
+                        trailers = Some(match trailers {
+                            Some(mut existing) => {
+                                existing.extend(map);
+                                existing
+                            }
+                            None => map,
+                        });
+                    }
+                    None => break,
                 }
-                None => break,
             }
+            Ok(trailers)
         }
+        .await;
+
+        let trailers = match drained {
+            Ok(trailers) => trailers,
+            Err(error) => {
+                // Best-effort: end the (broken) response so the peer is not left
+                // waiting, then report the original failure. The terminal write
+                // may itself fail if the connection is already gone — that is
+                // discarded because the interesting failure is `error`.
+                let _ = self.write(Vec::new(), true).await;
+                return Err(error);
+            }
+        };
 
         match trailers {
             Some(map) if self.trailers_supported && !map.is_empty() => {

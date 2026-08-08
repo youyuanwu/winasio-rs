@@ -506,9 +506,14 @@ backport, only unary and server-streaming are guaranteed; client-streaming and
 bidirectional need the duplex request path. The client probes the
 `WINHTTP_FLAG_AUTOMATIC_CHUNKING` capability at request time and falls back to
 manual chunking (which downgrades to HTTP/1.1 and cannot carry gRPC) when it is
-absent. The e2e tests log greppable `GRPC_TLS_TEST:` and `GRPC_DUPLEX:` tokens
-recording exactly which call types were exercised, so a platform that lacks duplex
-produces a **visible, narrowly-scoped** skip rather than a silent green.
+absent. That same probe is the duplex discriminator: Microsoft's own
+`WinHttpHandler` tests treat the automatic-chunking backport and bidirectional
+support as one capability. So the e2e suite gates *all* gRPC on the probe — a
+platform without it logs a **visible, narrowly-scoped** `SKIPPED` for the whole
+gRPC suite (no silent green) — and once the probe passes, **all four call types
+are required and asserted**: a duplex failure past the probe is a real bug that
+fails loudly, never a skip that could mask a regression. The tests log greppable
+`GRPC_TLS_TEST:` and `GRPC_DUPLEX:` tokens recording exactly which call types ran.
 
 **`tokio`, but no runtime.** `winasio-tonic` allows bare `tokio` in its graph
 (tonic pulls it via `tokio-stream`, features `default` + `sync` only) but no

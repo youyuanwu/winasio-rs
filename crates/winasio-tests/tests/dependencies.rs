@@ -222,10 +222,11 @@ fn winasio_tonic_pulls_in_no_async_runtime_beyond_tokio() {
     }
 }
 
-/// `winasio-util` gained a `futures-util` normal dependency in Phase 1 but had
+/// `winasio-util` gained a `futures` normal dependency in Phase 1 but had
 /// no runtime-guard of its own; assert its normal graph pulls no async runtime
-/// (the same forbidden set as the `winasio` guard). `futures-util` is not a
-/// runtime — it is combinators over `std` — so it is allowed.
+/// (the same forbidden set as the `winasio` guard). `futures` is not a
+/// runtime — it is combinators and executors over `std` (we use only
+/// `futures::executor::block_on`) — so it is allowed.
 #[test]
 fn winasio_util_pulls_in_no_async_runtime() {
     let Some(tree) = cargo_tree_pkg("winasio-util", &["--prefix", "none", "--no-dedupe"]) else {
