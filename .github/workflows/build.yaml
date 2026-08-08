@@ -5,6 +5,15 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      # The HTTPS TLS tests must genuinely RUN in CI, not silently skip. With
+      # this set, an absent or unreadable SSL binding becomes a hard test failure
+      # instead of a skip (see crates/winasio-tests/tests/httpsys_tls.rs,
+      # `tls_tests_required`), so a broken provisioning step OR a
+      # `query_ssl_binding` regression cannot drain all TLS coverage while CI
+      # stays green. Provisioning below is a hard gate on GitHub's elevated
+      # Windows runners, so reaching the test steps means the binding exists.
+      WINASIO_REQUIRE_TLS_TESTS: "1"
     strategy:
       matrix:
         BUILD_TYPE: ["Debug"]
@@ -25,12 +34,15 @@ jobs:
     # GitHub's Windows runners run elevated, so this generates a self-signed
     # localhost certificate and binds it to the fixed test port; the TLS tests
     # (crates/winasio-tests/tests/httpsys_tls.rs) then RUN unelevated against it.
-    # `continue-on-error` keeps the build green if a runner's HTTP.sys context
-    # refuses the bind: the tests detect the missing binding and SKIP loudly
-    # (grep the log for `HTTPS_TLS_TEST:`) rather than failing. The runner VM is
-    # ephemeral, so no teardown is needed here.
+    #
+    # This is a HARD GATE (no `continue-on-error`): provisioning succeeding is a
+    # reasonable expectation on the elevated GitHub-hosted `windows-latest`
+    # runner, and combined with `WINASIO_REQUIRE_TLS_TESTS=1` above it guarantees
+    # the e2e tests genuinely run rather than silently skipping into a green run.
+    # If provisioning ever legitimately cannot bind on a runner, that must be
+    # surfaced and diagnosed here, not masked. The runner VM is ephemeral, so no
+    # teardown is needed.
     - name: Provision HTTPS test binding
-      continue-on-error: true
       shell: pwsh
       run: ./scripts/setup-https-test.ps1
 

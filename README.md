@@ -126,6 +126,13 @@ an unrelaxed client rejects the self-signed certificate. CI provisions the
 binding on its elevated runner before the test step, so the TLS tests execute
 there too (grep the CI log for `HTTPS_TLS_TEST:` to see `RAN` vs `SKIPPED`).
 
+Where the tests are *expected* to run — CI, or any run after you have
+provisioned the binding — set `WINASIO_REQUIRE_TLS_TESTS=1`. With it set, a
+missing or unreadable binding is a hard **failure** instead of a skip, so a
+broken provisioning step or a `query_ssl_binding` regression cannot silently
+drop all HTTPS coverage while the run stays green. The CI workflow sets it; an
+unelevated local run without it still skips cleanly.
+
 # Fs
 Safe asynchronous file I/O on top of the IOCP layer. Files are opened for
 overlapped I/O, registered immediately, and expose positional reads, writes, and

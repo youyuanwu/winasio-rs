@@ -28,6 +28,14 @@
 //! `--nocapture`, so grepping the log for these tokens says definitively whether
 //! the e2e path executed or was skipped (R1).
 //!
+//! **A silent skip cannot be allowed to pass in CI.** Where the positive path is
+//! expected to run, the workflow sets `WINASIO_REQUIRE_TLS_TESTS=1`; with it set,
+//! an absent or unreadable binding is a hard **panic**, not a skip (see
+//! [`tls_tests_required`]). That closes the hole where a broken provisioning step
+//! or a [`query_ssl_binding`] regression would drain all TLS coverage while CI
+//! stayed green. Absent the variable, a contributor's local run still skips
+//! cleanly.
+//!
 //! # What running proves
 //!
 //! * The [`query_ssl_binding`] API reads back the externally-provisioned binding
@@ -112,9 +120,32 @@ impl HttpsEnv {
     }
 }
 
+/// Whether a missing/unreadable binding must be a hard failure instead of a
+/// skip. Set by CI (`WINASIO_REQUIRE_TLS_TESTS=1`) where provisioning is a hard
+/// gate and the positive HTTPS path is expected to run.
+///
+/// # D. Why a skip must be promotable to a failure
+///
+/// The suite's entire value is the *positive* HTTPS path. Two independent things
+/// make that path fragile in CI: the provisioning step could break (runner
+/// policy or `netsh` change, a script bug) and [`query_ssl_binding`] could
+/// regress to returning `None`/`Err`. In either case every e2e test would skip
+/// and **CI would stay green with zero TLS coverage** — nobody reads a green
+/// run's logs. Note `query_unbound_port_reads_none_unelevated` cannot catch this
+/// (it *asserts* `Ok(None)`), so the only thing exercising the positive path is
+/// this suite, which is exactly what goes silent. When this returns `true`, the
+/// no-binding and read-error paths panic loudly instead. Absent the variable —
+/// an unelevated contributor's local run — the historical clean skip is kept.
+fn tls_tests_required() -> bool {
+    match std::env::var("WINASIO_REQUIRE_TLS_TESTS") {
+        Ok(v) => !matches!(v.trim(), "" | "0" | "false" | "False" | "FALSE"),
+        Err(_) => false,
+    }
+}
+
 /// Return a ready [`HttpsEnv`] when the setup script has bound a certificate to
 /// the test port, or `None` (with a greppable reason) when it has not — the one
-/// legitimate skip.
+/// legitimate skip, and only when [`tls_tests_required`] is false.
 ///
 /// Detection is by the binding itself, not by elevation: the whole point of the
 /// redesign is that these tests need no privileges, so "can I see the binding?"
@@ -139,6 +170,15 @@ fn require_bound_endpoint() -> Option<HttpsEnv> {
             Some(HttpsEnv { session, port })
         }
         Ok(None) => {
+            if tls_tests_required() {
+                panic!(
+                    "HTTPS_TLS_TEST: REQUIRED-BUT-ABSENT — WINASIO_REQUIRE_TLS_TESTS is set, but no \
+                     SSL binding exists on 0.0.0.0:{port}. Provisioning \
+                     (scripts/setup-https-test.ps1) must run and succeed before these tests. \
+                     Failing hard so a broken provisioning step or a query_ssl_binding regression \
+                     cannot drop all TLS coverage while CI stays green."
+                );
+            }
             eprintln!(
                 "HTTPS_TLS_TEST: SKIPPED (no SSL binding on 0.0.0.0:{port}) -- provision it with an \
                  elevated `pwsh -File scripts/setup-https-test.ps1`, then re-run these tests \
@@ -147,6 +187,14 @@ fn require_bound_endpoint() -> Option<HttpsEnv> {
             None
         }
         Err(e) => {
+            if tls_tests_required() {
+                panic!(
+                    "HTTPS_TLS_TEST: REQUIRED-BUT-UNREADABLE — WINASIO_REQUIRE_TLS_TESTS is set, \
+                     but reading the SSL binding table on 0.0.0.0:{port} failed: {e:?}. Reads are \
+                     supposed to work unelevated (C7); this is a query_ssl_binding or environment \
+                     regression and must not be masked as a skip."
+                );
+            }
             // Reading the table should not fail unelevated; if it does, treat it
             // as an environment we cannot run in and skip loudly rather than
             // failing for being on the wrong host.
