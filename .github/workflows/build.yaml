@@ -30,6 +30,16 @@ jobs:
     # enable cache
     - uses: Swatinem/rust-cache@v2
 
+    # gRPC codegen: crates/winasio-tests/build.rs runs tonic-prost-build, which
+    # shells out to `protoc` to compile the checked-in .proto (D3/FR-014). It
+    # must be on PATH before any cargo step that compiles winasio-tests (check,
+    # clippy, test, doc). `repo-token` avoids GitHub API rate limits when the
+    # action resolves the release to download.
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
     # Provision the machine-wide HTTPS test binding once for the whole job.
     # GitHub's Windows runners run elevated, so this generates a self-signed
     # localhost certificate and binds it to the fixed test port; the TLS tests

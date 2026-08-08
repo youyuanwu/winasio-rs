@@ -782,7 +782,10 @@ mod tests {
         // the request stream open and the server tears the connection down when
         // it responds (measured 0x800704CD / 0x80072EE2). Mirrors .NET's
         // `WinHttpRequestStream.EndUploadAsync` for `WinHttpChunkMode.Automatic`.
-        assert!(matches!(H2Framing::Automatic.terminal(), Terminal::EndStream));
+        assert!(matches!(
+            H2Framing::Automatic.terminal(),
+            Terminal::EndStream
+        ));
     }
 
     #[test]
