@@ -51,5 +51,11 @@
 pub use axum;
 
 mod executor;
+mod serve;
 
 pub use executor::{CurrentThread, Executor, RequestTask, ThreadPerRequest};
+pub use serve::{serve, HandlerPanic, Serve};
+
+// Re-exported so a caller can name the error type the serve loop reports without
+// also depending on `winasio-util` directly.
+pub use winasio_util::ServeError;

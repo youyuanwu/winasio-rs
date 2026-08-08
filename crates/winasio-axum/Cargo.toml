@@ -20,3 +20,7 @@ futures-util = { workspace = true }
 # unit tests prove it by running on a bare `block_on`.
 futures = { workspace = true }
 http-body-util = { workspace = true }
+# Test-only: lets the `classify` unit test construct an `AcceptError::Receive`
+# from a hand-made `windows::core::Error` so the fatal/clean-stop branches are
+# exercised without the kernel having to emit them.
+windows = { workspace = true }
