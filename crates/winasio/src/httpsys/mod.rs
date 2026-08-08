@@ -137,6 +137,7 @@ mod queue;
 mod request;
 mod response;
 mod session;
+mod ssl;
 
 pub use header::{RequestHeader, ResponseHeader};
 pub use init::HttpInitializer;
@@ -148,6 +149,10 @@ pub use queue::{ReceiveConfig, ReceiveError, RequestQueue};
 pub use request::{Method, Request, RequestId, UnknownHeaders, MIN_CAPACITY};
 pub use response::{Response, Value, INLINE_CHUNKS, INLINE_UNKNOWN_HEADERS};
 pub use session::{ServerSession, UrlGroup};
+pub use ssl::{
+    bind_ssl_certificate, query_ssl_binding, SslBindError, SslCertBinding, SSL_BINDING_APP_ID,
+    THUMBPRINT_LEN,
+};
 
 /// The element the request buffer is allocated as.
 ///

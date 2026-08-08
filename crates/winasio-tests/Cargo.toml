@@ -24,7 +24,7 @@ serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
-windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock"] }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock", "Win32_Security"] }
 criterion = { workspace = true }
 tower = { workspace = true }
 # axum's `tokio` feature is enabled ONLY here, in winasio-tests' dev-dependencies,

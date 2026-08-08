@@ -81,6 +81,58 @@ Three things are worth knowing:
 See the [example server](./crates/winasio-tests/examples/httpsys_server.rs) for
 complete, runnable code.
 
+## Server-side TLS
+
+`bind_ssl_certificate` binds a certificate — named by its SHA-1 thumbprint in a
+system store — to an `ip:port`, wrapping `HttpSetServiceConfiguration` for
+`HttpServiceConfigSSLCertInfo`. It returns an `SslCertBinding` guard that unbinds
+on drop, because a leaked binding is machine-wide global state, not a
+process-local handle; `query_ssl_binding` reads a binding back. Writing the
+binding table requires an elevated process, and that one failure is modelled
+distinctly as `SslBindError::RequiresElevation` so a caller can say "needs
+elevation" rather than reporting a generic error. This is the piece HTTP.sys
+otherwise leaves to `netsh http add sslcert`.
+
+### Running the HTTPS integration tests
+
+Because binding a certificate is a machine-wide, administrator-only operation,
+the end-to-end HTTPS tests do **not** bind anything themselves. Provisioning is a
+one-time, out-of-process step: run
+[`scripts/setup-https-test.ps1`](./scripts/setup-https-test.ps1) once per
+machine. It generates a self-signed `localhost` certificate (with a
+`DNS:localhost` SAN) into `LocalMachine\My` and binds it to a fixed port:
+
+```powershell
+# once; run from an ordinary PowerShell -- the script self-elevates and Windows
+# shows a UAC prompt to approve. (Already elevated? It just runs, no prompt.)
+pwsh -File scripts/setup-https-test.ps1
+```
+
+The tests then run **unelevated** (`cargo test`): they detect the binding and, if
+it is absent, skip with a greppable `HTTPS_TLS_TEST: SKIPPED` line rather than
+failing. Tear the machine state down completely — binding, certificate and CNG
+key container — with (this also self-elevates):
+
+```powershell
+pwsh -File scripts/setup-https-test.ps1 -Uninstall
+```
+
+The port, AppId and certificate subject live in a single source of truth,
+[`scripts/https-test-config.ps1`](./scripts/https-test-config.ps1), which both
+the script and the tests read, so they cannot drift. See
+[`httpsys_tls.rs`](./crates/winasio-tests/tests/httpsys_tls.rs) for the
+end-to-end WinHTTP-over-HTTPS test, paired with a negative control that confirms
+an unrelaxed client rejects the self-signed certificate. CI provisions the
+binding on its elevated runner before the test step, so the TLS tests execute
+there too (grep the CI log for `HTTPS_TLS_TEST:` to see `RAN` vs `SKIPPED`).
+
+Where the tests are *expected* to run — CI, or any run after you have
+provisioned the binding — set `WINASIO_REQUIRE_TLS_TESTS=1`. With it set, a
+missing or unreadable binding is a hard **failure** instead of a skip, so a
+broken provisioning step or a `query_ssl_binding` regression cannot silently
+drop all HTTPS coverage while the run stays green. The CI workflow sets it; an
+unelevated local run without it still skips cleanly.
+
 # Fs
 Safe asynchronous file I/O on top of the IOCP layer. Files are opened for
 overlapped I/O, registered immediately, and expose positional reads, writes, and
@@ -339,8 +391,9 @@ The two header numbering tables are the sharpest edge below: every id from 20 to
 inbound and `Retry-After` outbound. The conversion reads each side through its
 own table, and a test asserts it end to end rather than by inspection.
 
-Out of scope: TLS certificate configuration, which HTTP.sys does out of band via
-`netsh http add sslcert`; HTTP/2 specifics, WebSockets, server push,
+Out of scope here: TLS certificate configuration, which lives one layer down in
+`winasio::httpsys` (see [Server-side TLS](#server-side-tls)) rather than in this
+`tower`-facing wrapper; HTTP/2 specifics, WebSockets, server push,
 authentication; and routing, which is what a `tower::Service` is for. Free from
 the platform and therefore not built: `Expect: 100-continue`, request
 de-chunking, and truncated-body detection -- unlike WinHTTP, HTTP.sys reports a

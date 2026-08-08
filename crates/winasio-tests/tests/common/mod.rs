@@ -12,6 +12,8 @@
 
 #![allow(dead_code)]
 
+pub mod tls_config;
+
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -301,3 +303,7 @@ pub fn parse_response(raw: &[u8]) -> (String, Vec<(String, String)>, Vec<u8>) {
         .collect();
     (status, headers, body)
 }
+
+// An `is_elevated` helper was removed with the bind test it served: no test
+// keys behavior on the process's privilege level. Detection of the HTTPS
+// binding is done by reading the SSL table — see `httpsys_tls.rs`.
