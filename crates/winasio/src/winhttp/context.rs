@@ -332,13 +332,6 @@ impl Drop for RequestContext {
     }
 }
 
-/// Record a completion against the operation slot, and return the waker to be
-/// woken *after* the lock is released.
-///
-/// Returns `None` — doing nothing at all — when the completion does not match
-/// what is outstanding. That is the right response to a notification the state
-/// machine did not expect: dropping it on the floor cannot corrupt anything,
-/// whereas guessing could resolve the wrong future.
 /// Record a completion against the slot the operation belongs to, and return
 /// the waker to be woken *after* the lock is released.
 ///
