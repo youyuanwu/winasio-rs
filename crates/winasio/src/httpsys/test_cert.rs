@@ -78,6 +78,10 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::core::{Error, Result, PCSTR, PCWSTR, PSTR, PWSTR};
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::Cryptography::{
     szOID_RSA_SHA256RSA, szOID_SUBJECT_ALT_NAME2, CertAddCertificateContextToStore, CertCloseStore,
     CertCreateSelfSignCertificate, CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
@@ -94,6 +98,7 @@ use windows::Win32::Security::Cryptography::{
     HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
     NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE, X509_ALTERNATE_NAME, X509_ASN_ENCODING,
 };
+use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 
 use super::THUMBPRINT_LEN;
 
@@ -395,6 +400,20 @@ impl SelfSignedCert {
                 return Err(e);
             }
 
+            // Grant the private key's DACL to the well-known service contexts.
+            // HTTP.sys validates an SSL binding by acquiring the certificate's
+            // private key; on a machine key whose default DACL does not admit
+            // that context, `HttpSetServiceConfiguration` fails at bind time with
+            // ERROR_NO_SUCH_LOGON_SESSION (0x80070520) — measured on an elevated
+            // CI runner, invisible on an unelevated dev host that skips the bind.
+            // Applied to both scopes so the unelevated CurrentUser round-trip
+            // test exercises the same path.
+            if let Err(e) = grant_key_access(NCRYPT_HANDLE(key.0)) {
+                let _ = NCryptFreeObject(NCRYPT_HANDLE(key.0));
+                delete_key_container(&container, store);
+                return Err(e);
+            }
+
             // 4. Provider info naming the container. For a machine key, set
             //    CRYPT_MACHINE_KEYSET so it resolves the machine-scoped container.
             let prov_info_flags = if store.is_machine() {
@@ -605,7 +624,42 @@ fn unique_container_name() -> String {
     format!("{CONTAINER_PREFIX}{pid}-{n}-{nanos}")
 }
 
-/// Delete the CNG key container `container` in `store`'s scope, ignoring errors.
+/// Grant the CNG key's private-key DACL to the well-known service contexts so
+/// HTTP.sys can acquire the private key when it validates an SSL binding.
+///
+/// # Safety
+///
+/// `key` must be a valid, finalized CNG key handle.
+unsafe fn grant_key_access(key: NCRYPT_HANDLE) -> Result<()> {
+    // Grant GENERIC_ALL to Everyone (WD) and SYSTEM (SY). Everyone-full on an
+    // ephemeral, drop-deleted self-signed test key is acceptable for a
+    // `test-util` helper and guarantees both that HTTP.sys's validation context
+    // can acquire the private key (fixing the bind-time
+    // ERROR_NO_SUCH_LOGON_SESSION) and that the creating context retains the
+    // delete rights cleanup needs. A protected DACL (`D:P`) so no inherited
+    // deny entry can override it.
+    let sddl = wide("D:P(A;;GA;;;WD)(A;;GA;;;SY)");
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        PCWSTR(sddl.as_ptr()),
+        SDDL_REVISION_1,
+        &mut psd,
+        None,
+    )?;
+    // The self-relative descriptor's bytes, passed verbatim to NCrypt.
+    let len = GetSecurityDescriptorLength(psd) as usize;
+    let bytes = std::slice::from_raw_parts(psd.0 as *const u8, len);
+    // Property name "Security Descr"; the flags carry the SECURITY_INFORMATION
+    // bits — DACL_SECURITY_INFORMATION (0x4).
+    let prop = wide("Security Descr");
+    let res = NCryptSetProperty(key, PCWSTR(prop.as_ptr()), bytes, NCRYPT_FLAGS(4));
+    // The descriptor was LocalAlloc'd by the conversion; free it.
+    let _ = LocalFree(Some(HLOCAL(psd.0)));
+    res
+}
+
+/// Delete the CNG key container named `container` in `store`'s scope,
+/// ignoring a miss.
 fn delete_key_container(container: &str, store: CertStore) {
     let provider_w = wide(PROVIDER);
     let container_w = wide(container);

@@ -20,4 +20,7 @@ futures = { workspace = true }
 # The certificate helper needs `Win32_Security_Cryptography`; it is pulled only
 # under this feature so the crate's default footprint is unchanged (measured:
 # `cargo check -p winasio` with no features does not compile the crypto surface).
-test-util = ["windows/Win32_Security_Cryptography"]
+test-util = [
+    "windows/Win32_Security_Cryptography",
+    "windows/Win32_Security_Authorization",
+]
