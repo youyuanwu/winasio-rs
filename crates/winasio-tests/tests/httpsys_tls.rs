@@ -241,9 +241,11 @@ fn diagnose_private_key(thumbprint: &[u8; THUMBPRINT_LEN]) {
     let hex_upper: String = thumbprint.iter().map(|b| format!("{b:02X}")).collect();
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         $all = @(Get-ChildItem Cert:\\LocalMachine\\My); \
-         'LM_My_count=' + $all.Count; \
-         $c = $all | Where-Object {{ $_.Thumbprint -eq '{hex_upper}' }} | Select-Object -First 1; \
+         $lm = @(Get-ChildItem Cert:\\LocalMachine\\My); \
+         'LM_My_count=' + $lm.Count; \
+         $cu = @(Get-ChildItem Cert:\\CurrentUser\\My); \
+         'CU_My_count=' + $cu.Count; \
+         $c = ($lm + $cu) | Where-Object {{ $_.Thumbprint -eq '{hex_upper}' }} | Select-Object -First 1; \
          if ($null -eq $c) {{ 'ps_cert_found=false'; return }}; \
          'ps_cert_found=true HasPrivateKey=' + $c.HasPrivateKey; \
          try {{ \

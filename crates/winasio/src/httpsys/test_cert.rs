@@ -92,11 +92,12 @@ use windows::Win32::Security::Cryptography::{
     CERT_ALT_NAME_ENTRY_0, CERT_ALT_NAME_INFO, CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS,
     CERT_EXTENSION, CERT_EXTENSIONS, CERT_FIND_HASH, CERT_HASH_PROP_ID, CERT_KEY_PROV_INFO_PROP_ID,
     CERT_KEY_SPEC, CERT_OID_NAME_STR, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
-    CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_W, CERT_SYSTEM_STORE_CURRENT_USER,
-    CERT_SYSTEM_STORE_LOCAL_MACHINE, CRYPT_ALGORITHM_IDENTIFIER, CRYPT_ENCODE_OBJECT_FLAGS,
-    CRYPT_INTEGER_BLOB, CRYPT_KEY_FLAGS, CRYPT_KEY_PROV_INFO, CRYPT_MACHINE_KEYSET, HCERTSTORE,
-    HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
-    NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE, X509_ALTERNATE_NAME, X509_ASN_ENCODING,
+    CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+    CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE, CRYPT_ALGORITHM_IDENTIFIER,
+    CRYPT_ENCODE_OBJECT_FLAGS, CRYPT_INTEGER_BLOB, CRYPT_KEY_FLAGS, CRYPT_KEY_PROV_INFO,
+    CRYPT_MACHINE_KEYSET, HCERTSTORE, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_FLAGS, NCRYPT_HANDLE,
+    NCRYPT_KEY_HANDLE, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE, X509_ALTERNATE_NAME,
+    X509_ASN_ENCODING,
 };
 use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 
@@ -182,7 +183,7 @@ pub fn cert_present(thumbprint: &[u8; THUMBPRINT_LEN], store: CertStore) -> bool
     // SAFETY: the store is opened and closed here; a found context is freed.
     unsafe {
         let Ok(hstore) = CertOpenStore(
-            CERT_STORE_PROV_SYSTEM_W,
+            CERT_STORE_PROV_SYSTEM_REGISTRY_W,
             CERT_QUERY_ENCODING_TYPE(0),
             None,
             CERT_OPEN_STORE_FLAGS(store.system_store_flag()),
@@ -477,7 +478,7 @@ impl SelfSignedCert {
             // 6. Install into the store.
             let store_w = wide(STORE_NAME);
             let hstore = match CertOpenStore(
-                CERT_STORE_PROV_SYSTEM_W,
+                CERT_STORE_PROV_SYSTEM_REGISTRY_W,
                 CERT_QUERY_ENCODING_TYPE(0),
                 None,
                 CERT_OPEN_STORE_FLAGS(store.system_store_flag()),
@@ -584,7 +585,7 @@ impl Drop for SelfSignedCert {
         unsafe {
             let store_w = wide(STORE_NAME);
             if let Ok(hstore) = CertOpenStore(
-                CERT_STORE_PROV_SYSTEM_W,
+                CERT_STORE_PROV_SYSTEM_REGISTRY_W,
                 CERT_QUERY_ENCODING_TYPE(0),
                 None,
                 CERT_OPEN_STORE_FLAGS(self.store.system_store_flag()),
@@ -723,7 +724,7 @@ fn sweep_store_certificates(store: CertStore) {
     // documented `prev`-context protocol; all results are best-effort.
     unsafe {
         let Ok(hstore) = CertOpenStore(
-            CERT_STORE_PROV_SYSTEM_W,
+            CERT_STORE_PROV_SYSTEM_REGISTRY_W,
             CERT_QUERY_ENCODING_TYPE(0),
             None,
             CERT_OPEN_STORE_FLAGS(store.system_store_flag()),
