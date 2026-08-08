@@ -9,8 +9,10 @@
 //! The binding table is machine-wide and writing it needs administrator rights,
 //! so this file is split by what a given host can prove:
 //!
-//! * **Always-on** — error classification and the `#[non_exhaustive]`
-//!   exhaustiveness proof. These are pure and run on any host.
+//! * **Always-on** — error classification, the `#[non_exhaustive]`
+//!   exhaustiveness proof, and a real (unelevated) read of the SSL config table
+//!   via `query_ssl_binding` on an unbound port (C7: reads need no admin). These
+//!   run on any host without setup.
 //! * **Elevation-gated** — the one behavioural test that actually calls the bind
 //!   API. On an unelevated host it asserts the call reports
 //!   [`SslBindError::RequiresElevation`]; on an elevated host it would succeed at
@@ -32,7 +34,8 @@ use std::net::SocketAddr;
 
 use common::is_elevated;
 use winasio::httpsys::{
-    bind_ssl_certificate, HttpInitializer, SslBindError, SSL_BINDING_APP_ID, THUMBPRINT_LEN,
+    bind_ssl_certificate, query_ssl_binding, HttpInitializer, SslBindError, SSL_BINDING_APP_ID,
+    THUMBPRINT_LEN,
 };
 use windows::core::Error;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
@@ -41,6 +44,11 @@ use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERRO
 /// TLS range reserved in the plan and disjoint from the e2e port in
 /// `httpsys_tls.rs`.
 const PORT_ELEVATION_PROBE: u16 = 12490;
+
+/// A never-bound port this binary reads back through `query_ssl_binding` to
+/// prove the read path is unelevated (C7). Distinct from the bind probe so a
+/// stray elevated `add` on one cannot perturb the other.
+const PORT_QUERY_PROBE: u16 = 12491;
 
 fn win32_error(code: windows::Win32::Foundation::WIN32_ERROR) -> Error {
     Error::from_hresult(code.to_hresult())
@@ -104,6 +112,41 @@ fn ssl_bind_error_is_exhaustively_matchable_from_another_crate() {
     assert_eq!(THUMBPRINT_LEN, 20);
     // The AppId is a fixed, non-nil constant.
     assert_ne!(SSL_BINDING_APP_ID, windows::core::GUID::zeroed());
+}
+
+/// C7 (re-measured here, unelevated): **reading** the HTTP.sys SSL config table
+/// is permitted without administrator rights, unlike **writing** it. `netsh http
+/// show sslcert` runs unelevated; this proves our own `query_ssl_binding` does
+/// too. A never-bound port must read back as `Ok(None)`.
+///
+/// This is deliberately *always-on*, not elevation-gated: it needs no admin and
+/// no setup, yet it genuinely exercises `ssl.rs`'s real read path — the two-pass
+/// `HttpQueryServiceConfiguration` sizing dance and the unsafe walk of the
+/// returned `HTTP_SERVICE_CONFIG_SSL_SET`. It is the honest coverage the
+/// setup-script-does-the-binding decision would otherwise cost this module, and
+/// it dogfoods the exact mechanism the e2e suite uses to decide RUN vs SKIP.
+#[test]
+fn query_unbound_port_reads_none_unelevated() {
+    // Precondition: the config subsystem needs a live initializer (ssl docs).
+    let _http = HttpInitializer::new().expect("HTTP.sys initialises");
+    let endpoint: SocketAddr = format!("0.0.0.0:{PORT_QUERY_PROBE}")
+        .parse()
+        .expect("a valid endpoint");
+    match query_ssl_binding(endpoint) {
+        Ok(None) => eprintln!(
+            "HTTPS_TLS_TEST: RAN (unelevated; query_ssl_binding read the SSL table and \
+             reported no binding on an unbound port) test=query_unbound_port_reads_none_unelevated"
+        ),
+        Ok(Some(tp)) => panic!(
+            "port {PORT_QUERY_PROBE} unexpectedly already has an SSL binding ({tp:02x?}); \
+             choose a truly-unbound probe port"
+        ),
+        Err(SslBindError::RequiresElevation) => panic!(
+            "query_ssl_binding required elevation — C7 FALSIFIED: the SSL read path is NOT \
+             unelevated. The e2e suite's binding-detection strategy must change; report this."
+        ),
+        Err(other) => panic!("unexpected error querying an unbound port: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
