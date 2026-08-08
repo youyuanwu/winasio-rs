@@ -81,6 +81,25 @@ Three things are worth knowing:
 See the [example server](./crates/winasio-tests/examples/httpsys_server.rs) for
 complete, runnable code.
 
+## Server-side TLS
+
+`bind_ssl_certificate` binds a certificate — named by its SHA-1 thumbprint in a
+system store — to an `ip:port`, wrapping `HttpSetServiceConfiguration` for
+`HttpServiceConfigSSLCertInfo`. It returns an `SslCertBinding` guard that unbinds
+on drop, because a leaked binding is machine-wide global state, not a
+process-local handle; `query_ssl_binding` reads a binding back. Writing the
+binding table requires an elevated process, and that one failure is modelled
+distinctly as `SslBindError::RequiresElevation` so a caller can say "needs
+elevation" rather than reporting a generic error. This is the piece HTTP.sys
+otherwise leaves to `netsh http add sslcert`.
+
+For tests, the `test-util` feature adds `SelfSignedCert`: a self-signed
+certificate generated with the `windows` crate alone (no OpenSSL or schannel),
+installed into a store and removed — certificate *and* CNG key container —
+on drop. See [`httpsys_tls.rs`](./crates/winasio-tests/tests/httpsys_tls.rs) for
+an end-to-end WinHTTP-over-HTTPS test, paired with a negative control that
+confirms an unrelaxed client rejects the self-signed certificate.
+
 # Fs
 Safe asynchronous file I/O on top of the IOCP layer. Files are opened for
 overlapped I/O, registered immediately, and expose positional reads, writes, and
@@ -339,8 +358,9 @@ The two header numbering tables are the sharpest edge below: every id from 20 to
 inbound and `Retry-After` outbound. The conversion reads each side through its
 own table, and a test asserts it end to end rather than by inspection.
 
-Out of scope: TLS certificate configuration, which HTTP.sys does out of band via
-`netsh http add sslcert`; HTTP/2 specifics, WebSockets, server push,
+Out of scope here: TLS certificate configuration, which lives one layer down in
+`winasio::httpsys` (see [Server-side TLS](#server-side-tls)) rather than in this
+`tower`-facing wrapper; HTTP/2 specifics, WebSockets, server push,
 authentication; and routing, which is what a `tower::Service` is for. Free from
 the platform and therefore not built: `Expect: 100-continue`, request
 de-chunking, and truncated-body detection -- unlike WinHTTP, HTTP.sys reports a
