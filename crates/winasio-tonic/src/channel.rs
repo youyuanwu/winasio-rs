@@ -22,9 +22,10 @@
 //! `hyper-util`, `h2`, `socket2` and a tokio reactor (`net`/`time`). This whole
 //! workspace exists to speak HTTP without any of that — the wire work is
 //! WinHTTP's. So `winasio-tonic` builds tonic with `default-features = false`
-//! and its own transport (D2, M13). The generated `connect()` convenience that
-//! references `tonic::transport::Channel` is suppressed in `build.rs`
-//! (`build_transport(false)`); a caller constructs a [`WinHttpChannel`] instead.
+//! and its own transport (D2, M13). A caller's generated `connect()`
+//! convenience — which would reference `tonic::transport::Channel` — is
+//! suppressed by `build_transport(false)` where the stubs are generated; a
+//! caller constructs a [`WinHttpChannel`] instead.
 //!
 //! # The four call types and duplex
 //!
@@ -204,16 +205,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The load-bearing type check: a real tonic-generated client must accept a
-    /// [`WinHttpChannel`] as its transport. `EchoClient::new` is bounded by
-    /// `tonic::client::GrpcService<tonic::body::Body>` plus the response-body
-    /// bounds, so if this compiles the channel satisfies tonic 0.14's transport
-    /// contract with tonic's actual body type — not a hand-picked one.
-    #[allow(dead_code)]
-    fn winhttp_channel_is_a_tonic_transport(channel: WinHttpChannel) {
-        let _client = crate::echo::echo_client::EchoClient::new(channel);
-    }
 
     /// `with_origin` replaces scheme+authority but keeps tonic's `:path`.
     #[test]

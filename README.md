@@ -521,9 +521,14 @@ async *runtime*: `rt`, `net`, `mio`, `hyper`, and `hyper-util` must not appear.
 This is enforced by `winasio_tonic_pulls_in_no_async_runtime_beyond_tokio` in
 `crates/winasio-tests/tests/dependencies.rs`.
 
-Codegen is `build.rs` + `tonic-prost-build` from a checked-in `.proto`, so a
-`protoc` install is required to build the tests (CI installs it via
-`arduino/setup-protoc`).
+**No `protoc` to use the crate.** `winasio-tonic` is a transport, not a service:
+it has no build script and runs no codegen, so a consumer needs no protobuf
+compiler to build it. The example `Echo` service used by the end-to-end tests —
+its `.proto` and every generated stub — lives in `crates/winasio-tests`, so
+`protoc` is required only to build the **tests** (CI installs it via
+`arduino/setup-protoc`; locally it must be on `PATH` or pointed at by `PROTOC`).
+Callers generate stubs from their own `.proto` and pass a `WinHttpChannel` as
+the transport.
 
 # Layout
 This repo is a cargo workspace:

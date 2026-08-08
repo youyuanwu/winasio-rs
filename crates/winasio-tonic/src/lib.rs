@@ -18,8 +18,11 @@
 //!   which serves a tonic service (an [`axum::Router`]) over HTTP.sys with gRPC
 //!   response framing.
 //!
-//! The generated stubs for the example [`echo`] service are produced from a
-//! checked-in `.proto` at build time (D3).
+//! This crate is a **transport**, not a service: it runs no codegen and has no
+//! build script, so building it does not require `protoc`. Callers generate
+//! their own stubs from their own `.proto` and plug a [`WinHttpChannel`] in as
+//! the transport. The example `Echo` service used to exercise all four call
+//! types lives with the end-to-end tests in `winasio-tests`.
 //!
 //! # D1. Server side is an axum router, so it is mostly already done
 //!
@@ -71,17 +74,6 @@
 
 mod channel;
 pub mod server;
-
-/// The generated stubs for the example `winasio.echo.v1.Echo` service.
-///
-/// Produced from `proto/echo.proto` by `build.rs` (client stub only — see D2).
-/// The service covers all four gRPC call shapes (unary, server-streaming,
-/// client-streaming, bidirectional) so the transport is exercised on each.
-pub mod echo {
-    // The generated code triggers lints that are not ours to fix.
-    #![allow(missing_docs)]
-    tonic::include_proto!("winasio.echo.v1");
-}
 
 pub use channel::WinHttpChannel;
 pub use server::{serve_grpc, CurrentThread, Executor, Serve, ThreadPerRequest};

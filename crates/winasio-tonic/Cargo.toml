@@ -10,26 +10,24 @@ description = "tonic (gRPC) transport for winasio-rs: a WinHTTP-backed client Ch
 # tonic with default-features = false + only `codegen` is the whole point of
 # this crate's dependency story (M13, measured): tonic 0.14.6 resolved that way
 # pulls NO hyper, NO h2, NO mio. `codegen` adds only `async-trait` (the derive
-# support the generated client stub uses). We deliberately do NOT enable:
+# support a generated client stub uses), and is kept because callers reach the
+# generated-code support through this crate's `pub use tonic`. We deliberately
+# do NOT enable:
 #   * `transport` / `channel` — they pull hyper + hyper-util (the built-in
-#     hyper-based Channel this crate exists to replace); `build.rs` sets
-#     `build_transport(false)` so the generated `connect()` block that would
-#     reference `tonic::transport::Channel` is never emitted.
+#     hyper-based Channel this crate exists to replace).
 #   * `server` — it pulls h2, hyper, hyper-util, socket2 and tokio `net`/`macros`
-#     (a full runtime), violating D2. The server stub is therefore generated in
-#     `winasio-tests` (a test crate, where a runtime is allowed), not here; this
-#     crate's server story is generic glue over `winasio-axum` that needs no
-#     generated server type.
+#     (a full runtime), violating D2. This crate's server story is generic glue
+#     over `winasio-axum` that needs no generated server type.
 # tonic still pulls `tokio` (features `default` + `sync`, via `tokio-stream`) and
 # `tracing`; the runtime-feature ban is enforced by the
 # `winasio_tonic_pulls_in_no_async_runtime_beyond_tokio` test in winasio-tests.
+#
+# NOTE: this crate runs NO codegen of its own and has NO build script, so
+# building it does not require `protoc`. It is a transport, not a service: the
+# `.proto` for the example Echo service and every stub generated from it live in
+# `winasio-tests`, which is the only place they are used. Keeping codegen out of
+# here means a downstream consumer never needs `protoc` to build this crate.
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
-# tonic 0.14 split prost support into a separate crate (M13). `tonic-prost`
-# carries the prost codec at runtime; `tonic-prost-build` (below) is build-only.
-tonic-prost = "0.14"
-# The generated message types derive `::prost::Message`, so `prost` must be a
-# direct dependency for that absolute path to resolve. prost pulls no runtime.
-prost = "0.14"
 winasio-util = { workspace = true }
 winasio-axum = { workspace = true }
 http = { workspace = true }
@@ -44,12 +42,6 @@ tower-service = { workspace = true }
 # (channels/oneshots) without a reactor. The ban on `rt`/`net`/`mio`/`hyper`/
 # `hyper-util` is tested.
 tokio = { version = "1", default-features = false, features = ["sync"] }
-
-[build-dependencies]
-# Build-only codegen from the checked-in `.proto` (D3). tonic 0.14 moved prost
-# codegen into `tonic-prost-build`. This runs `protoc`; CI installs it (see the
-# workflow) and locally it must be on PATH or pointed at via `PROTOC`.
-tonic-prost-build = "0.14"
 
 [dev-dependencies]
 winasio = { workspace = true }
