@@ -14,7 +14,7 @@
 //! that server drives any `tower_service::Service` and a `Router` is one. What
 //! `winasio-util` offers there is a deliberately *sequential* serve. The value
 //! this crate adds is the **driver**: a concurrent accept-and-dispatch loop
-//! shaped like [`axum::serve`], an [`Executor`] seam so concurrency is the
+//! shaped like `axum::serve`, an [`Executor`] seam so concurrency is the
 //! caller's choice of runtime (or none), and axum-shaped ergonomics. Request
 //! decoding, response framing, body handling, `poll_ready` backpressure, and
 //! connection info all remain `winasio-util`'s; this crate builds its loop on
@@ -31,19 +31,98 @@
 //!   parallelism.
 //!
 //! A runtime user plugs their runtime in with a tiny [`Executor`] impl, without
-//! this crate depending on that runtime.
+//! this crate depending on that runtime. The [`Executor`] trait documentation
+//! records why it carries a defaulted `poll_progress` hook (so a current-thread
+//! executor is drivable while a spawning one stays a single method) and why
+//! [`RequestTask`] is uniformly `Send`.
 //!
-//! The concurrent serve loop itself is added in a later phase; this phase
-//! establishes the executor seam.
+//! # The serve loop
 //!
-//! # `axum` is a runtime-free dependency
+//! [`serve`] is the concurrent counterpart to
+//! [`winasio_util::Server::serve`]'s sequential loop. Its full contract — the
+//! cancel-safe accept, the instance-correct `poll_ready` backpressure gate,
+//! uniform panic containment, the error policy, and the deliberately **abrupt**
+//! shutdown (in-flight work is not drained; `ThreadPerRequest` callbacks may run
+//! after `serve` returns) — is documented on the [`serve`] function. Prefer this
+//! crate's [`serve`] when you want concurrency; prefer `winasio-util`'s
+//! `serve`/`serve_one` when you want one request at a time.
+//!
+//! # Routes carry the HTTP.sys URL prefix (M8)
+//!
+//! HTTP.sys delivers request URIs with the *registered* URL prefix included. A
+//! server reserved at `http://localhost:PORT/axum/` therefore delivers
+//! `/axum/greet`, so routes must be written to match — `.route("/axum/greet",
+//! ..)`, not `.route("/greet", ..)`. This crate does **not** strip the prefix:
+//! stripping would need a rewriting layer that could disagree with `axum`'s own
+//! routing, and the behaviour is a property of HTTP.sys the caller already sees
+//! with `winasio-util`. It is documented rather than papered over. A caller who
+//! wants prefix-relative routes can mount their router under the prefix with
+//! [`axum::Router::nest`] themselves.
+//!
+//! # `axum` is a runtime-free dependency; `ConnectInfo` is opt-in (D-A / M4)
 //!
 //! This crate depends on `axum` with `default-features = false`, which
 //! (measured) pulls no tokio/mio/hyper/hyper-util into its normal dependency
-//! tree. `axum`'s `ConnectInfo<SocketAddr>` extractor is gated behind axum's
-//! `tokio` feature and is therefore deliberately unavailable here; the peer
-//! address remains reachable through [`winasio_util::ConnectionInfo`]. See the
-//! executor and serve module docs for the full decision record.
+//! tree. `axum`'s `ConnectInfo<SocketAddr>` extractor
+//! (`axum::extract::ConnectInfo`) is gated behind axum's `tokio` feature, and
+//! enabling that feature pulls tokio + mio + hyper + hyper-util into the
+//! *normal* graph (measured) — the cost this crate refuses. The peer address is
+//! instead reachable directly through [`winasio_util::ConnectionInfo`] in the
+//! request extensions:
+//!
+//! ```no_run
+//! use winasio_util::ConnectionInfo;
+//!
+//! async fn peer(info: axum::Extension<ConnectionInfo>) -> String {
+//!     match info.0.peer_address {
+//!         Some(address) => format!("peer {address}"),
+//!         None => "peer unknown".to_string(),
+//!     }
+//! }
+//! ```
+//!
+//! A caller who specifically wants axum's own `ConnectInfo<SocketAddr>`
+//! extractor can restore it in two steps: enable axum's `tokio` feature *in
+//! their own crate*, then insert `ConnectInfo(addr)` into the request extensions
+//! from the [`ConnectionInfo`](winasio_util::ConnectionInfo) peer address with a
+//! tiny `tower` layer (measured to satisfy the extractor; `winasio-tests`
+//! carries the worked recipe and its control).
+//!
+//! **Feature-unification caveat.** Cargo unifies features across a workspace
+//! build, so a *sibling* crate enabling `axum/tokio` (as `winasio-tests` does,
+//! only to name the `ConnectInfo` type for that recipe test) makes that feature
+//! present in a `--workspace --all-features` build. The runtime-free guarantee
+//! is therefore defined on **`winasio-axum`'s own normal dependency tree** and
+//! is enforced by an isolated check — `cargo tree -e normal -p winasio-axum`
+//! shows none of tokio/mio/hyper/hyper-util (asserted by
+//! `winasio-tests::dependencies::winasio_axum_pulls_in_no_async_runtime`).
+//!
+//! # Dependencies (R6)
+//!
+//! The only non-workspace-internal runtime dependencies are `axum`
+//! (default features off), `winasio-util`, and `futures-util` (with
+//! `default-features = false, features = ["std"]`), the last used solely for
+//! [`FuturesUnordered`](futures_util::stream::FuturesUnordered) (the
+//! [`CurrentThread`] executor's concurrency) and
+//! [`catch_unwind`](futures_util::future::FutureExt::catch_unwind) (panic
+//! containment). `futures-util` was chosen over the full `futures` facade to
+//! keep the dependency narrow; it brings no runtime.
+//!
+//! # Invariants and obligations
+//!
+//! - **Framing, decoding, and backpressure are `winasio-util`'s.** This crate
+//!   adds only the concurrent loop; request decoding, response framing (a
+//!   handler-supplied `Transfer-Encoding` is an error), body handling, and the
+//!   `poll_ready` semantics all remain `winasio-util`'s.
+//! - **[`CurrentThread`] spawns nothing.** Its concurrency is cooperative on the
+//!   loop's own thread; a handler that blocks that thread blocks the loop. Use
+//!   [`ThreadPerRequest`] (or a real runtime) for blocking handlers.
+//! - **Errors and panics are observed, not swallowed.** Every per-request
+//!   failure and caught panic is routed to the caller's [`Serve::on_error`]
+//!   observer; the crate takes no logging dependency.
+//! - **Shutdown is abrupt.** [`serve`] returns without draining in-flight work;
+//!   a [`ThreadPerRequest`] task (and its observer callback) may still run after
+//!   `serve` returns. A caller needing "all work finished" must coordinate it.
 
 // Re-exported so downstream code can name the exact `axum` this crate builds on,
 // and to anchor the normal (runtime-free) `axum` dependency and its version,

@@ -140,7 +140,7 @@ impl Executor<RequestTask> for CurrentThread {
 /// A thread-spawning executor: runs each request on a fresh [`std::thread`],
 /// giving real parallelism.
 ///
-/// Each task is driven to completion by a private, runtime-free [`block_on`]
+/// Each task is driven to completion by a private, runtime-free `block_on`
 /// (an owned park-based waker, no timeout). A zero-sized, [`Send`] + [`Sync`]
 /// unit — it tracks nothing, because spawned threads finish on their own.
 ///

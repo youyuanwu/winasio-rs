@@ -4,7 +4,7 @@
 // license information.
 // ------------------------------------------------------------
 
-//! The concurrent serve loop: an [`axum::serve`]-shaped driver over
+//! The concurrent serve loop: an `axum::serve`-shaped driver over
 //! [`winasio_util::Server`].
 //!
 //! [`serve`] accepts requests in a loop and dispatches each to a caller-supplied
@@ -189,7 +189,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 
 type ErrorObserver = Arc<dyn Fn(ServeError) + Send + Sync + 'static>;
 
-/// A concurrent [`axum::serve`]-shaped driver, awaitable via [`IntoFuture`].
+/// A concurrent `axum::serve`-shaped driver, awaitable via [`IntoFuture`].
 ///
 /// Build one with [`serve`], optionally attach an error observer with
 /// [`on_error`](Serve::on_error), then `.await` it.

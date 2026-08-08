@@ -350,11 +350,74 @@ cut-off request body as an error.
 on a bare executor; the test suite compiles it, runs it, and asserts textually
 that it contains no `unsafe`.
 
+# Winasio-axum
+A concurrent driver that serves an `axum::Router` over HTTP.sys. An axum router
+already runs on `winasio-util`'s server -- a `Router` is a `tower::Service` and
+that is all `serve_one` needs -- so this crate adds not "axum support" but the
+**driver**: a concurrent accept-and-dispatch loop shaped like `axum::serve`, an
+`Executor` seam so concurrency is the caller's choice of runtime (or none), and
+axum-shaped ergonomics. Request decoding, response framing, body handling,
+`poll_ready` backpressure, and connection info stay `winasio-util`'s.
+
+```rs
+let session = ServerSession::new()?;
+let server = winasio_util::Server::builder(&session)
+    .url("http://localhost:8080/axum/")
+    .build(&ThreadPool)?;
+
+// HTTP.sys delivers the registered prefix, so routes carry it: `/axum/greet`.
+let app = axum::Router::new().route("/axum/greet", axum::routing::get(|| async { "hi" }));
+
+// No runtime anywhere: `block_on` is a bare single-threaded executor and
+// `CurrentThread` drives many in-flight requests on it, spawning nothing.
+futures::executor::block_on(serve(&server, app, CurrentThread::new()))?;
+```
+
+**Concurrency is a trait the caller supplies.** `Executor<Fut>` has the shape of
+`hyper::rt::Executor` -- one `execute(&self, fut)` method -- plus a defaulted
+`poll_progress` hook a current-thread executor needs and a spawning one ignores,
+so plugging in tokio is a few lines and pulls no tokio into this crate. Two
+executors ship built in: `CurrentThread` interleaves many in-flight requests on
+the caller's own thread through a `FuturesUnordered`, spawning nothing and
+keeping the runtime-free story; `ThreadPerRequest` runs each request on a fresh
+`std::thread` for real parallelism. The distinction is proved by tests that only
+complete when several requests are in flight at once -- served one at a time they
+would deadlock -- so the concurrency is measured, not asserted.
+
+**Shutdown is abrupt, and uniform across both executors.** When the queue closes
+`serve` returns immediately without draining in-flight work; a `ThreadPerRequest`
+task (and its error-observer callback) may still run after `serve` has returned.
+Draining only `CurrentThread` would make the contract depend on the executor, so
+a single abrupt rule was chosen instead. A handler panic is caught per task and
+reported to a caller-supplied `on_error` observer as a `HandlerPanic` rather than
+unwinding the loop -- which matters most for `CurrentThread`, whose tasks share
+the loop's thread -- and a recoverable accept error (`RequestTooLarge`) is
+reported and stepped over rather than allowed to spin or abort.
+
+**No `ConnectInfo`, by choice.** axum's `ConnectInfo<SocketAddr>` extractor is
+gated behind axum's `tokio` feature, and enabling it pulls tokio + mio + hyper +
+hyper-util into the normal dependency graph (measured) -- the cost that would
+contradict this workspace's runtime-agnostic stance. This crate depends on `axum`
+with `default-features = false` and skips it; the peer address remains reachable
+through the `winasio_util::ConnectionInfo` extension on the request. A caller who
+specifically wants the extractor can enable axum's `tokio` feature in their own
+crate and insert `ConnectInfo(addr)` into the request extensions with a tiny
+layer (measured to satisfy it). The runtime-free guarantee is defined on this
+crate's own normal dependency tree -- a sibling crate enabling `axum/tokio`
+unifies that feature into a `--workspace` build -- and is checked by
+`cargo tree -e normal -p winasio-axum`.
+
+`crates/winasio-tests/examples/axum_server.rs` is a complete concurrent axum
+server in safe code on a bare executor; the test suite compiles it, runs it, and
+asserts textually that it contains no `unsafe`.
+
 # Layout
 This repo is a cargo workspace:
 - `crates/winasio`: the library crate.
 - `crates/winasio-util`: higher-level HTTP client over `winasio::winhttp` and
   HTTP server over `winasio::httpsys`.
+- `crates/winasio-axum`: concurrent driver that serves an `axum::Router` over
+  HTTP.sys through a caller-supplied executor.
 - `crates/winasio-tests`: test only crate holding the integration tests.
 
 # MISC
