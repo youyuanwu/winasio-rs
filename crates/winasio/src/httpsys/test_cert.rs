@@ -302,54 +302,11 @@ impl SelfSignedCert {
                 pbData: name_blob.as_mut_ptr(),
             };
 
-            // 2. Create a named, persisted CNG key up front (see D1). Its scope
-            //    matches the store (see D3).
-            let container_w = wide(&container);
-            let provider_w = wide(PROVIDER);
-            let mut prov = NCRYPT_PROV_HANDLE::default();
-            NCryptOpenStorageProvider(&mut prov, PCWSTR(provider_w.as_ptr()), 0)?;
-            let prov = ProvHandle(prov);
-
-            let mut key = NCRYPT_KEY_HANDLE::default();
-            let algo_w = wide("RSA");
-            let create_flags = NCRYPT_FLAGS(NCRYPT_OVERWRITE_KEY_FLAG | store.ncrypt_scope_flags());
-            NCryptCreatePersistedKey(
-                prov.0,
-                &mut key,
-                PCWSTR(algo_w.as_ptr()),
-                PCWSTR(container_w.as_ptr()),
-                CERT_KEY_SPEC(0),
-                create_flags,
-            )?;
-            let bits: u32 = 2048;
-            let length_prop = wide("Length");
-            NCryptSetProperty(
-                NCRYPT_HANDLE(key.0),
-                PCWSTR(length_prop.as_ptr()),
-                &bits.to_ne_bytes(),
-                NCRYPT_FLAGS(0),
-            )?;
-            NCryptFinalizeKey(key, NCRYPT_FLAGS(0))?;
-
-            // 3. Provider info naming the container. For a machine key, set
-            //    CRYPT_MACHINE_KEYSET so it resolves the machine-scoped container.
-            let prov_info_flags = if store.is_machine() {
-                CRYPT_MACHINE_KEYSET
-            } else {
-                CRYPT_KEY_FLAGS(0)
-            };
-            let key_info = CRYPT_KEY_PROV_INFO {
-                pwszContainerName: PWSTR(container_w.as_ptr() as *mut u16),
-                pwszProvName: PWSTR(provider_w.as_ptr() as *mut u16),
-                dwProvType: 0,
-                dwFlags: prov_info_flags,
-                cProvParam: 0,
-                rgProvParam: std::ptr::null_mut(),
-                dwKeySpec: CERT_NCRYPT_KEY_SPEC,
-            };
-
-            // 4. A DNS:localhost SAN extension (see D2), encoded and passed via
-            //    pExtensions.
+            // 2. Encode the DNS:localhost SAN extension (see D2) up front. This
+            //    is pure in-memory work independent of the key, so doing it
+            //    before the key container exists means an encode failure can
+            //    never orphan a container. The buffers below must outlive the
+            //    CertCreateSelfSignCertificate call.
             let dns_w = wide("localhost");
             let alt_entry = CERT_ALT_NAME_ENTRY {
                 dwAltNameChoice: CERT_ALT_NAME_DNS_NAME,
@@ -395,6 +352,53 @@ impl SelfSignedCert {
                 rgExtension: &san_ext as *const _ as *mut _,
             };
 
+            // 3. Create a named, persisted CNG key up front (see D1). Its scope
+            //    matches the store (see D3). Everything past this point that can
+            //    fail must roll the container back.
+            let container_w = wide(&container);
+            let provider_w = wide(PROVIDER);
+            let mut prov = NCRYPT_PROV_HANDLE::default();
+            NCryptOpenStorageProvider(&mut prov, PCWSTR(provider_w.as_ptr()), 0)?;
+            let prov = ProvHandle(prov);
+
+            let mut key = NCRYPT_KEY_HANDLE::default();
+            let algo_w = wide("RSA");
+            let create_flags = NCRYPT_FLAGS(NCRYPT_OVERWRITE_KEY_FLAG | store.ncrypt_scope_flags());
+            NCryptCreatePersistedKey(
+                prov.0,
+                &mut key,
+                PCWSTR(algo_w.as_ptr()),
+                PCWSTR(container_w.as_ptr()),
+                CERT_KEY_SPEC(0),
+                create_flags,
+            )?;
+            let bits: u32 = 2048;
+            let length_prop = wide("Length");
+            NCryptSetProperty(
+                NCRYPT_HANDLE(key.0),
+                PCWSTR(length_prop.as_ptr()),
+                &bits.to_ne_bytes(),
+                NCRYPT_FLAGS(0),
+            )?;
+            NCryptFinalizeKey(key, NCRYPT_FLAGS(0))?;
+
+            // 4. Provider info naming the container. For a machine key, set
+            //    CRYPT_MACHINE_KEYSET so it resolves the machine-scoped container.
+            let prov_info_flags = if store.is_machine() {
+                CRYPT_MACHINE_KEYSET
+            } else {
+                CRYPT_KEY_FLAGS(0)
+            };
+            let key_info = CRYPT_KEY_PROV_INFO {
+                pwszContainerName: PWSTR(container_w.as_ptr() as *mut u16),
+                pwszProvName: PWSTR(provider_w.as_ptr() as *mut u16),
+                dwProvType: 0,
+                dwFlags: prov_info_flags,
+                cProvParam: 0,
+                rgProvParam: std::ptr::null_mut(),
+                dwKeySpec: CERT_NCRYPT_KEY_SPEC,
+            };
+
             // SHA-256 signature algorithm.
             let mut sig_oid = oid_bytes(szOID_RSA_SHA256RSA);
             let sig_algo = CRYPT_ALGORITHM_IDENTIFIER {
@@ -422,7 +426,23 @@ impl SelfSignedCert {
                 return Err(Error::from_thread());
             }
 
-            // 5. Install into the store.
+            // 5. Read the SHA-1 thumbprint. Done before store installation so a
+            //    failure here only has to roll back the cert context and key
+            //    container, not a store copy.
+            let mut thumbprint = [0u8; THUMBPRINT_LEN];
+            let mut hash_len = THUMBPRINT_LEN as u32;
+            if let Err(e) = CertGetCertificateContextProperty(
+                cert,
+                CERT_HASH_PROP_ID,
+                Some(thumbprint.as_mut_ptr() as *mut c_void),
+                &mut hash_len,
+            ) {
+                let _ = CertFreeCertificateContext(Some(cert));
+                delete_key_container(&container, store);
+                return Err(e);
+            }
+
+            // 6. Install into the store.
             let store_w = wide(STORE_NAME);
             let hstore = match CertOpenStore(
                 CERT_STORE_PROV_SYSTEM_W,
@@ -450,16 +470,6 @@ impl SelfSignedCert {
                 delete_key_container(&container, store);
                 return Err(e);
             }
-
-            // 6. Read the SHA-1 thumbprint.
-            let mut thumbprint = [0u8; THUMBPRINT_LEN];
-            let mut hash_len = THUMBPRINT_LEN as u32;
-            CertGetCertificateContextProperty(
-                cert,
-                CERT_HASH_PROP_ID,
-                Some(thumbprint.as_mut_ptr() as *mut c_void),
-                &mut hash_len,
-            )?;
 
             Ok(SelfSignedCert {
                 cert,
