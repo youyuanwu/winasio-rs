@@ -374,13 +374,26 @@ impl SelfSignedCert {
             )?;
             let bits: u32 = 2048;
             let length_prop = wide("Length");
-            NCryptSetProperty(
+            // The persisted key handle (and, after finalize, its container) now
+            // exists. Any failure before the handle is duplicated into the
+            // cert's provider info must free the handle AND delete the container,
+            // matching the rollback ladder used for every later step; a bare `?`
+            // here would orphan machine-global CNG state.
+            if let Err(e) = NCryptSetProperty(
                 NCRYPT_HANDLE(key.0),
                 PCWSTR(length_prop.as_ptr()),
                 &bits.to_ne_bytes(),
                 NCRYPT_FLAGS(0),
-            )?;
-            NCryptFinalizeKey(key, NCRYPT_FLAGS(0))?;
+            ) {
+                let _ = NCryptFreeObject(NCRYPT_HANDLE(key.0));
+                delete_key_container(&container, store);
+                return Err(e);
+            }
+            if let Err(e) = NCryptFinalizeKey(key, NCRYPT_FLAGS(0)) {
+                let _ = NCryptFreeObject(NCRYPT_HANDLE(key.0));
+                delete_key_container(&container, store);
+                return Err(e);
+            }
 
             // 4. Provider info naming the container. For a machine key, set
             //    CRYPT_MACHINE_KEYSET so it resolves the machine-scoped container.
@@ -486,10 +499,16 @@ impl SelfSignedCert {
         self.thumbprint
     }
 
-    /// The store name to pass to [`bind_ssl_certificate`](super::bind_ssl_certificate),
-    /// spelled as HTTP.sys expects (`"MY"`).
-    pub fn store_name(&self) -> &'static str {
-        "MY"
+    /// The store name to pass to
+    /// [`bind_ssl_certificate`](super::bind_ssl_certificate) for this
+    /// certificate, spelled as HTTP.sys expects (`"MY"`).
+    ///
+    /// Returns `Some("MY")` only for a [`CertStore::LocalMachine`] certificate.
+    /// HTTP.sys resolves the SSL table's store name in the machine namespace, so
+    /// a [`CertStore::CurrentUser`] certificate cannot be bound and yields
+    /// `None` rather than a name that would produce an unresolvable binding.
+    pub fn store_name(&self) -> Option<&'static str> {
+        matches!(self.store, CertStore::LocalMachine).then_some("MY")
     }
 
     /// The store the certificate is installed in.
@@ -608,7 +627,12 @@ fn delete_key_container(container: &str, store: CertStore) {
         )
         .is_ok()
         {
-            let _ = NCryptDeleteKey(key, 0);
+            // NCryptDeleteKey frees the handle only on success; free it
+            // ourselves on failure so a persistently-failing delete cannot leak
+            // one handle per sweep iteration.
+            if NCryptDeleteKey(key, 0).is_err() {
+                let _ = NCryptFreeObject(NCRYPT_HANDLE(key.0));
+            }
         }
     }
 }
@@ -682,18 +706,26 @@ unsafe fn cert_container_has_prefix(ctx: *const CERT_CONTEXT, prop_id: u32) -> b
     if CertGetCertificateContextProperty(ctx, prop_id, None, &mut len).is_err() || len == 0 {
         return false;
     }
-    let mut buf = vec![0u8; len as usize];
+    // SAFETY: allocate an 8-byte-aligned backing store (`Vec<u64>`) and let the
+    // OS write the record into it, so the `CRYPT_KEY_PROV_INFO` — whose leading
+    // field is a `PWSTR` needing 8-byte alignment on x64, and whose string
+    // fields point back *into* this same buffer — is read through a well-aligned
+    // reference and its internal pointers stay valid while `aligned` lives. This
+    // is the idiom `ssl.rs::query_ssl_binding` uses for `HTTP_SERVICE_CONFIG_SSL_SET`.
+    let words = (len as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut aligned = vec![0u64; words.max(1)];
     if CertGetCertificateContextProperty(
         ctx,
         prop_id,
-        Some(buf.as_mut_ptr() as *mut c_void),
+        Some(aligned.as_mut_ptr() as *mut c_void),
         &mut len,
     )
     .is_err()
+        || (len as usize) < std::mem::size_of::<CRYPT_KEY_PROV_INFO>()
     {
         return false;
     }
-    let info = &*(buf.as_ptr() as *const CRYPT_KEY_PROV_INFO);
+    let info = &*(aligned.as_ptr() as *const CRYPT_KEY_PROV_INFO);
     if info.pwszContainerName.is_null() {
         return false;
     }

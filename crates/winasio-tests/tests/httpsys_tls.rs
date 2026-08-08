@@ -33,12 +33,14 @@
 //!
 //! # Ports
 //!
-//! This binary owns the range **`12480..=12499`**, disjoint from every other
-//! suite. An HTTP.sys SSL binding is keyed by `ip:port` and is machine-global,
-//! a stronger conflict domain than a URL prefix: two tests binding the same
-//! port with different certificates would fight. A file-scoped [`TLS_LOCK`]
-//! therefore serialises all tests in this binary (R3), and each test uses a
-//! distinct port so a crashed predecessor's residue cannot alias a successor.
+//! This binary owns the range **`12480..=12489`**; `httpsys_ssl.rs` owns
+//! `12490..=12492`, so the two suites' bindings and pre-test sweeps cannot
+//! reach into each other's ports. An HTTP.sys SSL binding is keyed by `ip:port`
+//! and is machine-global, a stronger conflict domain than a URL prefix: two
+//! tests binding the same port with different certificates would fight. A
+//! file-scoped [`TLS_LOCK`] therefore serialises all tests in this binary (R3),
+//! and each test uses a distinct port so a crashed predecessor's residue cannot
+//! alias a successor.
 //!
 //! # Cleanup
 //!
@@ -78,11 +80,12 @@ use winasio_util::IncomingBody;
 /// bindings (R3).
 static TLS_LOCK: Mutex<()> = Mutex::new(());
 
-/// The port range this binary owns. Used both to pick per-test ports and to
-/// scope the pre-test leftover sweep.
-const RESERVED_PORTS: [u16; 20] = [
-    12480, 12481, 12482, 12483, 12484, 12485, 12486, 12487, 12488, 12489, 12490, 12491, 12492,
-    12493, 12494, 12495, 12496, 12497, 12498, 12499,
+/// The port range this binary owns (`12480..=12489`). Used both to pick
+/// per-test ports and to scope the pre-test leftover sweep. Kept disjoint from
+/// `httpsys_ssl.rs`'s `12490..=12492` so neither suite's sweep can delete the
+/// other's binding.
+const RESERVED_PORTS: [u16; 10] = [
+    12480, 12481, 12482, 12483, 12484, 12485, 12486, 12487, 12488, 12489,
 ];
 
 /// Generous client timeouts: a stuck handshake should surface as an error, not
@@ -156,7 +159,9 @@ fn setup_https(port: u16) -> Option<HttpsFixture> {
     let cert = SelfSignedCert::create("CN=localhost", CertStore::LocalMachine)
         .expect("self-signed certificate creation succeeds on an elevated host");
     let thumbprint = cert.thumbprint();
-    let store_name = cert.store_name();
+    let store_name = cert
+        .store_name()
+        .expect("a LocalMachine certificate has a bindable store name");
 
     // 4. Bind to both wildcard families for the reasons in the module docs.
     let v4: SocketAddr = format!("0.0.0.0:{port}")
@@ -274,12 +279,30 @@ fn https_roundtrip_positive() {
     let mut service = tower::service_fn(|_req: Request<IncomingBody>| async {
         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(HELLO_BODY))))
     });
-    block_on(server.serve_one(&mut service)).expect("serve_one");
+    // If the TLS handshake fails — the exact regression this test guards — the
+    // client returns a `WinHttpError` within CLIENT_TIMEOUT_MS while `serve_one`
+    // never receives a request and eventually trips the harness deadline with a
+    // generic "timed out" panic. Catch that so the client's real error (the only
+    // useful diagnostic) reaches the log instead of the server-side symptom.
+    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(server.serve_one(&mut service))
+    }));
+    let client = client.join().expect("client thread");
 
-    let (status, body) = client
-        .join()
-        .expect("client thread")
-        .expect("the HTTPS request succeeds when the CA is trusted");
+    let (status, body) = match (client, served) {
+        (Ok(resp), Ok(serve_result)) => {
+            serve_result.expect("serve_one");
+            resp
+        }
+        (Err(e), _) => panic!(
+            "the HTTPS request failed: {e:?} \
+             (server never received a request — likely a TLS handshake failure)"
+        ),
+        (Ok(_), Err(_)) => panic!(
+            "serve_one failed or timed out while the client did not error; \
+             the server side did not complete the request"
+        ),
+    };
     assert_eq!(status, 200, "an accepted HTTPS request returns 200");
     assert_eq!(
         body, HELLO_BODY,
@@ -346,6 +369,11 @@ fn https_negative_control_unrelaxed_fails() {
         Err(WinHttpError::SecureFailure) => {
             // The certificate check fired exactly as intended.
         }
+        Err(WinHttpError::Timeout) => panic!(
+            "an unrelaxed client TIMED OUT rather than being rejected — the most likely cause is \
+             that the handshake SUCCEEDED (certificate validation is not being enforced) and then \
+             no server loop answered the request; a working control must fail with SecureFailure"
+        ),
         Err(other) => panic!(
             "expected SecureFailure from an unrelaxed client against a self-signed cert, \
              got {other:?} (a different error means the control failed for the wrong reason)"

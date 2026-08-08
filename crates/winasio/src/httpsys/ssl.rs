@@ -271,10 +271,12 @@ impl IpPort {
 ///
 /// `endpoint` is the address HTTP.sys will present the certificate on — use a
 /// wildcard address such as `0.0.0.0:PORT` or `[::]:PORT` to cover every local
-/// interface. `thumbprint` is the certificate's SHA-1 hash (20 bytes;
-/// see [`THUMBPRINT_LEN`]). `store_name` is the system store the certificate
-/// lives in, spelled as HTTP.sys expects it (for example `"MY"` for the personal
-/// store). `app_id` is an ownership marker; pass [`SSL_BINDING_APP_ID`].
+/// interface. `thumbprint` is the certificate's SHA-1 hash — exactly
+/// [`THUMBPRINT_LEN`] (20) bytes, enforced at the type level so a wrong-length
+/// hash cannot be written into the machine-global table. `store_name` is the
+/// system store the certificate lives in, spelled as HTTP.sys expects it (for
+/// example `"MY"` for the personal store). `app_id` is an ownership marker;
+/// pass [`SSL_BINDING_APP_ID`].
 ///
 /// Returns an [`SslCertBinding`] guard that removes the row on drop. See the
 /// module's precondition: a live
@@ -303,7 +305,7 @@ impl IpPort {
 /// ```
 pub fn bind_ssl_certificate(
     endpoint: SocketAddr,
-    thumbprint: &[u8],
+    thumbprint: &[u8; THUMBPRINT_LEN],
     store_name: &str,
     app_id: GUID,
 ) -> Result<SslCertBinding, SslBindError> {
