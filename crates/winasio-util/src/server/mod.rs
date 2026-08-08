@@ -649,6 +649,29 @@ impl<S: Backend> Accepted<S> {
         ready(&mut service).await?;
         responder.dispatch(service.call(request)).await
     }
+
+    /// Answer this request with a service, framing the reply as raw HTTP/2 with
+    /// trailers (the gRPC path).
+    ///
+    /// Identical to [`serve`](Self::serve) except the response is sent through
+    /// [`Responder::send_streaming`] rather than [`Responder::send`], so a
+    /// tonic service's streaming body and its terminating `grpc-status` trailer
+    /// reach the peer as real HTTP/2 DATA and trailers frames. The caller
+    /// selects this explicitly because it knows it is serving gRPC — the choice
+    /// never rides on server-side request-version sniffing (which the M2 defect
+    /// would poison).
+    pub async fn serve_streaming<Svc, B>(self, mut service: Svc) -> Result<(), ServeError>
+    where
+        Svc: tower_service::Service<HttpRequest<IncomingBody<S>>, Response = HttpResponse<B>>,
+        Svc::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        B: Body,
+        B::Data: Buf,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (request, responder) = self.into_parts();
+        ready(&mut service).await?;
+        responder.dispatch_streaming(service.call(request)).await
+    }
 }
 
 /// The right to answer one request, exactly once.
@@ -818,6 +841,36 @@ impl<S: Backend> Responder<S> {
                 // error itself: the crate does not decide that a failed handler
                 // is nothing worth reporting. A failure to send the 500 is
                 // discarded because the interesting failure is the first one.
+                let _ = self.send_status(StatusCode::INTERNAL_SERVER_ERROR).await;
+                Err(ServeError::Service(error.into()))
+            }
+        }
+    }
+
+    /// Like [`dispatch`](Self::dispatch), but frames the response as raw HTTP/2
+    /// with trailers ([`send_streaming`](Self::send_streaming)) rather than by
+    /// size hint.
+    ///
+    /// This is the gRPC dispatch path: a tonic service's response is a streaming
+    /// body ending in a `grpc-status` trailer, and the size-hint framing that
+    /// [`dispatch`](Self::dispatch) uses would either drop the trailer (the
+    /// `Content-Length` fast path) or hand-frame the body in a way HTTP/2 cannot
+    /// carry (M7). The error path is identical — a bodiless `500` so the peer is
+    /// not left waiting.
+    async fn dispatch_streaming<F, B, E>(self, call: F) -> Result<(), ServeError>
+    where
+        F: Future<Output = Result<HttpResponse<B>, E>>,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+        B: Body,
+        B::Data: Buf,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        match call.await {
+            Ok(response) => self
+                .send_streaming(response)
+                .await
+                .map_err(ServeError::Response),
+            Err(error) => {
                 let _ = self.send_status(StatusCode::INTERNAL_SERVER_ERROR).await;
                 Err(ServeError::Service(error.into()))
             }

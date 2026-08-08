@@ -1,0 +1,57 @@
+[package]
+name = "winasio-tonic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "tonic (gRPC) transport for winasio-rs: a WinHTTP-backed client Channel and HTTP.sys server glue."
+
+[dependencies]
+# tonic with default-features = false + only `codegen` is the whole point of
+# this crate's dependency story (M13, measured): tonic 0.14.6 resolved that way
+# pulls NO hyper, NO h2, NO mio. `codegen` adds only `async-trait` (the derive
+# support the generated client stub uses). We deliberately do NOT enable:
+#   * `transport` / `channel` — they pull hyper + hyper-util (the built-in
+#     hyper-based Channel this crate exists to replace); `build.rs` sets
+#     `build_transport(false)` so the generated `connect()` block that would
+#     reference `tonic::transport::Channel` is never emitted.
+#   * `server` — it pulls h2, hyper, hyper-util, socket2 and tokio `net`/`macros`
+#     (a full runtime), violating D2. The server stub is therefore generated in
+#     `winasio-tests` (a test crate, where a runtime is allowed), not here; this
+#     crate's server story is generic glue over `winasio-axum` that needs no
+#     generated server type.
+# tonic still pulls `tokio` (features `default` + `sync`, via `tokio-stream`) and
+# `tracing`; the runtime-feature ban is enforced by the
+# `winasio_tonic_pulls_in_no_async_runtime_beyond_tokio` test in winasio-tests.
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
+# tonic 0.14 split prost support into a separate crate (M13). `tonic-prost`
+# carries the prost codec at runtime; `tonic-prost-build` (below) is build-only.
+tonic-prost = "0.14"
+# The generated message types derive `::prost::Message`, so `prost` must be a
+# direct dependency for that absolute path to resolve. prost pulls no runtime.
+prost = "0.14"
+winasio-util = { workspace = true }
+winasio-axum = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+bytes = { workspace = true }
+tower-service = { workspace = true }
+# `tokio` is admitted into this crate's graph by design decision D2 — but ONLY
+# its non-runtime pieces. It is declared with its OWN minimal feature set rather
+# than `tokio.workspace = true`, because the workspace `tokio` is `features =
+# ["full"]`, which would drag in `rt`, `net`, `mio`, and defeat the entire
+# runtime-free premise. `sync` is what tonic's client machinery reaches for
+# (channels/oneshots) without a reactor. The ban on `rt`/`net`/`mio`/`hyper`/
+# `hyper-util` is tested.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[build-dependencies]
+# Build-only codegen from the checked-in `.proto` (D3). tonic 0.14 moved prost
+# codegen into `tonic-prost-build`. This runs `protoc`; CI installs it (see the
+# workflow) and locally it must be on PATH or pointed at via `PROTOC`.
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+winasio = { workspace = true }
+http-body-util = { workspace = true }
+futures = { workspace = true }

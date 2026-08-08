@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/winasio", "crates/winasio-axum", "crates/winasio-tests", "crates/winasio-util"]
+members = ["crates/winasio", "crates/winasio-axum", "crates/winasio-tests", "crates/winasio-util", "crates/winasio-tonic"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/youyuanwu/winasio-rs"
 winasio = { path = "crates/winasio" }
 winasio-util = { path = "crates/winasio-util" }
 winasio-axum = { path = "crates/winasio-axum" }
+winasio-tonic = { path = "crates/winasio-tonic" }
 
 # Versions chosen to match hyper 1.x, so that a hyper user's `http` types are
 # the same types this workspace's client accepts.
