@@ -138,6 +138,8 @@ mod request;
 mod response;
 mod session;
 mod ssl;
+#[cfg(feature = "test-util")]
+mod test_cert;
 
 pub use header::{RequestHeader, ResponseHeader};
 pub use init::HttpInitializer;
@@ -153,6 +155,8 @@ pub use ssl::{
     bind_ssl_certificate, query_ssl_binding, SslBindError, SslCertBinding, SSL_BINDING_APP_ID,
     THUMBPRINT_LEN,
 };
+#[cfg(feature = "test-util")]
+pub use test_cert::{cert_present, key_container_present, CertStore, SelfSignedCert};
 
 /// The element the request buffer is allocated as.
 ///
