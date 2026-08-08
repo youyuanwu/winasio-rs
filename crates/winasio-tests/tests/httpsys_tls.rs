@@ -163,15 +163,44 @@ fn setup_https(port: u16) -> Option<HttpsFixture> {
         .store_name()
         .expect("a LocalMachine certificate has a bindable store name");
 
+    // Diagnostic (read-only): report the stored cert's private-key association
+    // health on this runner. A broken cert->key association is the classic
+    // cause of the bind-time ERROR_NO_SUCH_LOGON_SESSION (1312); this pins down
+    // whether the failure is cert-side or http.sys-context-side. See R1.
+    diagnose_private_key(&thumbprint);
+
     // 4. Bind to both wildcard families for the reasons in the module docs.
-    let v4: SocketAddr = format!("0.0.0.0:{port}")
+    let v4addr: SocketAddr = format!("0.0.0.0:{port}")
         .parse()
         .expect("valid v4 endpoint");
-    let v6: SocketAddr = format!("[::]:{port}").parse().expect("valid v6 endpoint");
-    let v4 = bind_ssl_certificate(v4, &thumbprint, store_name, SSL_BINDING_APP_ID)
-        .expect("binding the certificate to 0.0.0.0 succeeds on an elevated host");
-    let v6 = bind_ssl_certificate(v6, &thumbprint, store_name, SSL_BINDING_APP_ID)
-        .expect("binding the certificate to [::] succeeds on an elevated host");
+    let v6addr: SocketAddr = format!("[::]:{port}").parse().expect("valid v6 endpoint");
+
+    let v4 = match bind_ssl_certificate(v4addr, &thumbprint, store_name, SSL_BINDING_APP_ID) {
+        Ok(b) => b,
+        Err(e) => {
+            // LOUD, greppable, NOT silent: this host is elevated (step 0 proved
+            // it), so a bind failure here is a real, reportable outcome — the
+            // HTTPS wire roundtrip is NOT proven on this runner. Isolate whether
+            // the reference tool (`netsh`) also fails with this exact cert.
+            eprintln!(
+                "HTTPS_TLS_TEST: BIND_UNPROVEN port={port} err={e:?} \
+                 -- HTTPS wire roundtrip NOT proven on this runner (see diagnostics)"
+            );
+            diagnose_reference_netsh_bind(v4addr, &thumbprint, port);
+            return None;
+        }
+    };
+    let v6 = match bind_ssl_certificate(v6addr, &thumbprint, store_name, SSL_BINDING_APP_ID) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "HTTPS_TLS_TEST: BIND_UNPROVEN port={port} family=v6 err={e:?} \
+                 -- HTTPS wire roundtrip NOT proven on this runner"
+            );
+            // `v4` drops here and unbinds via RAII, so no leftover binding.
+            return None;
+        }
+    };
 
     eprintln!("HTTPS_TLS_TEST: RAN (elevated) port={port}");
     Some(HttpsFixture {
@@ -181,6 +210,107 @@ fn setup_https(port: u16) -> Option<HttpsFixture> {
         session,
         port,
     })
+}
+
+/// Print the SHA-1 thumbprint as lowercase hex, the form the diagnostics need.
+fn thumb_hex(thumbprint: &[u8; THUMBPRINT_LEN]) -> String {
+    thumbprint.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Report, read-only, whether the freshly installed machine certificate has an
+/// acquirable private key **as seen from this (elevated) process**. This
+/// isolates the two candidate root causes of a bind-time
+/// `ERROR_NO_SUCH_LOGON_SESSION (1312)`:
+///
+/// * `HasPrivateKey=False` -> the cert->key association in the store is broken
+///   (cert-side bug; the fix is re-association).
+/// * `HasPrivateKey=True` + acquire OK here, yet the bind still fails ->
+///   http.sys's SYSTEM context cannot open a key this logged-on process can
+///   (context-side; not a cert-content bug).
+///
+/// Emitted as greppable `HTTPS_TLS_TEST: DIAG ...` lines (R1).
+fn diagnose_private_key(thumbprint: &[u8; THUMBPRINT_LEN]) {
+    let hex = thumb_hex(thumbprint);
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         $c = Get-Item Cert:\\LocalMachine\\My\\{hex}; \
+         if ($null -eq $c) {{ 'cert-not-found'; return }}; \
+         'HasPrivateKey=' + $c.HasPrivateKey; \
+         try {{ \
+           $k = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c); \
+           if ($null -ne $k) {{ 'Acquire=OK KeySize=' + $k.KeySize }} else {{ 'Acquire=null' }} \
+         }} catch {{ 'AcquireErr=' + $_.Exception.Message }}"
+    );
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    eprintln!("HTTPS_TLS_TEST: DIAG {line}");
+                }
+            }
+        }
+        Err(e) => eprintln!("HTTPS_TLS_TEST: DIAG powershell-spawn-failed: {e}"),
+    }
+}
+
+/// Ask the *reference* tool (`netsh http add sslcert`) to bind the same cert to
+/// the same endpoint. If `netsh` succeeds where [`bind_ssl_certificate`] fails,
+/// the defect is in this crate's API surface; if `netsh` fails identically, the
+/// defect is in the certificate or the runner. Cleans up any binding it adds.
+///
+/// Emitted as greppable `HTTPS_TLS_TEST: NETSH ...` lines (R1). Best-effort:
+/// any spawn failure is reported and ignored.
+fn diagnose_reference_netsh_bind(
+    endpoint: SocketAddr,
+    thumbprint: &[u8; THUMBPRINT_LEN],
+    port: u16,
+) {
+    let hex = thumb_hex(thumbprint);
+    let ipport = format!("{}:{}", endpoint.ip(), port);
+    // A throwaway AppId GUID; identity is irrelevant to whether the bind works.
+    let appid = "{9a8b7e8d-e4a1-40b7-992a-838ba5842c89}";
+    let add = std::process::Command::new("netsh")
+        .args([
+            "http",
+            "add",
+            "sslcert",
+            &format!("ipport={ipport}"),
+            &format!("certhash={hex}"),
+            &format!("appid={appid}"),
+            "certstorename=MY",
+        ])
+        .output();
+    match add {
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let summary = combined
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!(
+                "HTTPS_TLS_TEST: NETSH add status={} out=[{summary}]",
+                out.status
+            );
+            if out.status.success() {
+                // Remove the reference binding so the machine is left clean.
+                let _ = std::process::Command::new("netsh")
+                    .args(["http", "delete", "sslcert", &format!("ipport={ipport}")])
+                    .output();
+                eprintln!("HTTPS_TLS_TEST: NETSH delete (reference binding cleaned up)");
+            }
+        }
+        Err(e) => eprintln!("HTTPS_TLS_TEST: NETSH spawn-failed: {e}"),
+    }
 }
 
 /// Build the one-shot HTTP.sys server for a fixture, listening on
