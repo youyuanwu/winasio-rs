@@ -77,7 +77,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::core::{Error, Result, PCSTR, PCWSTR, PSTR, PWSTR};
+use windows::core::{Error, Result, BOOL, PCSTR, PCWSTR, PSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -86,14 +86,15 @@ use windows::Win32::Security::Cryptography::{
     szOID_RSA_SHA256RSA, szOID_SUBJECT_ALT_NAME2, CertAddCertificateContextToStore, CertCloseStore,
     CertCreateSelfSignCertificate, CertDeleteCertificateFromStore, CertEnumCertificatesInStore,
     CertFindCertificateInStore, CertFreeCertificateContext, CertGetCertificateContextProperty,
-    CertOpenStore, CertStrToNameW, CryptEncodeObjectEx, NCryptCreatePersistedKey, NCryptDeleteKey,
-    NCryptEnumKeys, NCryptFinalizeKey, NCryptFreeBuffer, NCryptFreeObject, NCryptKeyName,
-    NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty, CERT_ALT_NAME_ENTRY,
-    CERT_ALT_NAME_ENTRY_0, CERT_ALT_NAME_INFO, CERT_CONTEXT, CERT_CREATE_SELFSIGN_FLAGS,
-    CERT_EXTENSION, CERT_EXTENSIONS, CERT_FIND_HASH, CERT_HASH_PROP_ID, CERT_KEY_PROV_INFO_PROP_ID,
-    CERT_KEY_SPEC, CERT_OID_NAME_STR, CERT_OPEN_STORE_FLAGS, CERT_QUERY_ENCODING_TYPE,
-    CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
-    CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE, CRYPT_ALGORITHM_IDENTIFIER,
+    CertOpenStore, CertStrToNameW, CryptAcquireCertificatePrivateKey, CryptEncodeObjectEx,
+    NCryptCreatePersistedKey, NCryptDeleteKey, NCryptEnumKeys, NCryptFinalizeKey, NCryptFreeBuffer,
+    NCryptFreeObject, NCryptKeyName, NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty,
+    CERT_ALT_NAME_ENTRY, CERT_ALT_NAME_ENTRY_0, CERT_ALT_NAME_INFO, CERT_CONTEXT,
+    CERT_CREATE_SELFSIGN_FLAGS, CERT_EXTENSION, CERT_EXTENSIONS, CERT_FIND_HASH, CERT_HASH_PROP_ID,
+    CERT_KEY_PROV_INFO_PROP_ID, CERT_KEY_SPEC, CERT_OID_NAME_STR, CERT_OPEN_STORE_FLAGS,
+    CERT_QUERY_ENCODING_TYPE, CERT_STORE_ADD_REPLACE_EXISTING, CERT_STORE_PROV_SYSTEM_REGISTRY_W,
+    CERT_SYSTEM_STORE_CURRENT_USER, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, CRYPT_ACQUIRE_SILENT_FLAG, CRYPT_ALGORITHM_IDENTIFIER,
     CRYPT_ENCODE_OBJECT_FLAGS, CRYPT_INTEGER_BLOB, CRYPT_KEY_FLAGS, CRYPT_KEY_PROV_INFO,
     CRYPT_MACHINE_KEYSET, HCERTSTORE, HCRYPTPROV_OR_NCRYPT_KEY_HANDLE, NCRYPT_FLAGS, NCRYPT_HANDLE,
     NCRYPT_KEY_HANDLE, NCRYPT_MACHINE_KEY_FLAG, NCRYPT_PROV_HANDLE, X509_ALTERNATE_NAME,
@@ -544,6 +545,36 @@ impl SelfSignedCert {
     /// The CNG key container name, for diagnostics and cleanup checks.
     pub fn container(&self) -> &str {
         &self.container
+    }
+
+    /// Whether the certificate's private key can be acquired **in this process**
+    /// through `CryptAcquireCertificatePrivateKey`, the same call HTTP.sys makes
+    /// when it validates an SSL binding.
+    ///
+    /// A diagnostic (see the `httpsys_tls` tests): this process is elevated and
+    /// holds a logon session, so success here isolates a bind-time
+    /// `ERROR_NO_SUCH_LOGON_SESSION (1312)` to HTTP.sys's own `SYSTEM`/no-logon
+    /// context rather than a broken certificate->key association (which would
+    /// fail here too).
+    pub fn verify_private_key_acquirable(&self) -> Result<()> {
+        let mut key = HCRYPTPROV_OR_NCRYPT_KEY_HANDLE::default();
+        let mut caller_free = BOOL(0);
+        // SAFETY: `self.cert` is a live cert context owned by `self`; the output
+        // handle is freed below if the API says the caller owns it.
+        unsafe {
+            CryptAcquireCertificatePrivateKey(
+                self.cert,
+                CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG,
+                None,
+                &mut key,
+                None,
+                Some(&mut caller_free),
+            )?;
+            if caller_free.as_bool() && key.0 != 0 {
+                let _ = NCryptFreeObject(NCRYPT_HANDLE(key.0));
+            }
+        }
+        Ok(())
     }
 
     /// Best-effort removal of this crate's leftover state before a test starts.

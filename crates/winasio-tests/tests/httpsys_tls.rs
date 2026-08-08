@@ -168,6 +168,14 @@ fn setup_https(port: u16) -> Option<HttpsFixture> {
     // cause of the bind-time ERROR_NO_SUCH_LOGON_SESSION (1312); this pins down
     // whether the failure is cert-side or http.sys-context-side. See R1.
     diagnose_private_key(&thumbprint);
+    // Decisive: can THIS elevated, logged-on process acquire the private key the
+    // same way HTTP.sys does? Success => the cert->key link is intact and the
+    // 1312 is HTTP.sys's SYSTEM/no-logon context; failure => the association is
+    // broken.
+    match cert.verify_private_key_acquirable() {
+        Ok(()) => eprintln!("HTTPS_TLS_TEST: DIAG in_proc_key_acquire=OK"),
+        Err(e) => eprintln!("HTTPS_TLS_TEST: DIAG in_proc_key_acquire=ERR {e:?}"),
+    }
 
     // 4. Bind to both wildcard families for the reasons in the module docs.
     let v4addr: SocketAddr = format!("0.0.0.0:{port}")
