@@ -1178,7 +1178,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
- "futures-util",
  "http",
  "http-body",
  "http-body-util",
