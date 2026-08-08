@@ -1,0 +1,42 @@
+// The echo service exercised by winasio-tonic's tests. It deliberately covers
+// all four gRPC call shapes so a single service proves the transport handles
+// each one:
+//
+//   * Unary            — one request  -> one response
+//   * ServerStreaming  — one request  -> a stream of responses
+//   * ClientStreaming  — a stream of requests -> one response   (needs duplex)
+//   * BidiStreaming    — a stream each way                       (needs duplex)
+//
+// Client-streaming and bidirectional depend on the WinHTTP duplex ordering
+// enabled in Phase 1 (send headers, start receiving the response before the
+// request body finishes). See the crate docs and M6/M9.
+
+syntax = "proto3";
+
+package winasio.echo.v1;
+
+// A single echoed message.
+message EchoRequest {
+  string message = 1;
+}
+
+message EchoReply {
+  string message = 1;
+}
+
+service Echo {
+  // Unary: the simplest gRPC call. Proves request framing + a single response
+  // message + the terminating `grpc-status` trailer.
+  rpc Unary(EchoRequest) returns (EchoReply);
+
+  // Server-streaming: one request, many responses. Proves the client reads a
+  // stream of DATA frames and the final trailers frame.
+  rpc ServerStreaming(EchoRequest) returns (stream EchoReply);
+
+  // Client-streaming: many requests, one response. Requires duplex — the client
+  // keeps writing the request body while the server has already been reached.
+  rpc ClientStreaming(stream EchoRequest) returns (EchoReply);
+
+  // Bidirectional: a stream each way. The strongest duplex test.
+  rpc BidiStreaming(stream EchoRequest) returns (stream EchoReply);
+}

@@ -46,11 +46,11 @@ pub fn live_context_count() -> usize {
 
 /// Which transfer an outstanding operation is.
 ///
-/// Used to check that an arriving completion matches the operation actually in
-/// flight. Only one transfer can be outstanding on a request at a time, so this
-/// is a consistency check rather than a demultiplexer — but a mismatch means
-/// the state machine is wrong, and it is better to find that in a test than to
-/// resolve the wrong future.
+/// Used to route an arriving completion to the slot ([`Side`]) holding the
+/// operation it belongs to, and to check that the completion matches the
+/// operation actually in flight on that side. At most one operation can be
+/// outstanding **per side**; a mismatch means the state machine is wrong, and
+/// it is better to find that in a test than to resolve the wrong future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpKind {
     Send,
@@ -58,6 +58,40 @@ pub(crate) enum OpKind {
     ReceiveResponse,
     QueryDataAvailable,
     Read,
+}
+
+/// Which of a request's two concurrent operation slots an operation belongs to.
+///
+/// WinHTTP permits **one outstanding write and one outstanding
+/// receive/read at the same time** on a single request handle — that is the
+/// whole mechanism behind HTTP/2 duplex (M6): the response head can be received
+/// while the request body is still being written. To model that, the request's
+/// completion state is split into two independent slots. The *write* slot
+/// carries `Send` and `Write`; the *read* slot carries `ReceiveResponse`,
+/// `QueryDataAvailable` and `Read`. Each slot has its own generation, its own
+/// pending/abandoned/complete state and its own waker, so a completion on one
+/// side never disturbs an operation in flight on the other.
+///
+/// For an ordinary HTTP/1.1 request nothing ever uses both slots at once — the
+/// caller drives `Send → Write → Receive → Read` strictly in order, and each
+/// slot is idle whenever the other is busy — so the split is invisible to the
+/// existing single-operation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Side {
+    /// The request-body side: `Send` and `Write`.
+    Write,
+    /// The response side: `ReceiveResponse`, `QueryDataAvailable` and `Read`.
+    Read,
+}
+
+impl OpKind {
+    /// Which slot this operation completes against.
+    pub(crate) fn side(self) -> Side {
+        match self {
+            OpKind::Send | OpKind::Write => Side::Write,
+            OpKind::ReceiveResponse | OpKind::QueryDataAvailable | OpKind::Read => Side::Read,
+        }
+    }
 }
 
 /// The outcome of a completed operation.
@@ -68,20 +102,22 @@ pub(crate) enum Completion {
     Failed(Error),
 }
 
-/// State of the request's single operation slot.
+/// State of one of the request's operation slots.
 ///
 /// # Invariant G
 ///
-/// The slot is **never** overwritten by a new submission while it holds
+/// A slot is **never** overwritten by a new submission while it holds
 /// `Pending` or `Abandoned`. Only the arrival of the matching terminal
 /// notification returns it to `Idle`.
 ///
 /// This invariant is what makes the generation counter sufficient. A completion
 /// notification carries no generation of its own — WinHTTP hands back only the
 /// context pointer, which is identical for every operation on the request. It
-/// is only because at most one operation can be outstanding, and because an
-/// abandoned one is not replaced until its completion lands, that the
-/// generation in the slot identifies the completion unambiguously.
+/// is only because at most one operation can be outstanding **per slot**, and
+/// because an abandoned one is not replaced until its completion lands, that the
+/// generation in the slot identifies the completion unambiguously. The
+/// operation's [`OpKind`] additionally identifies *which* slot a completion
+/// belongs to (see [`Side`]).
 pub(crate) enum OpState {
     /// Nothing outstanding; a submission may proceed.
     Idle,
@@ -98,12 +134,37 @@ pub(crate) enum OpState {
     },
 }
 
-pub(crate) struct Inner {
-    /// Monotonic counter; a fresh value is taken for each submission and each
-    /// abandonment.
-    pub(crate) next_generation: u64,
+/// One independently-drivable operation slot, with its own state and waker.
+///
+/// A request has two of these — see [`Side`] — so that a write and a
+/// receive/read can be outstanding at the same time (HTTP/2 duplex, M6).
+pub(crate) struct Slot {
     pub(crate) op: OpState,
     pub(crate) waker: Option<Waker>,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Slot {
+            op: OpState::Idle,
+            waker: None,
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        matches!(self.op, OpState::Idle)
+    }
+}
+
+pub(crate) struct Inner {
+    /// Monotonic counter; a fresh value is taken for each submission and each
+    /// abandonment. Shared across both slots so a generation is unique across
+    /// the whole request, which keeps the `retired` bookkeeping unambiguous.
+    pub(crate) next_generation: u64,
+    /// The request-body slot: `Send` and `Write`.
+    pub(crate) write: Slot,
+    /// The response slot: `ReceiveResponse`, `QueryDataAvailable` and `Read`.
+    pub(crate) read: Slot,
     /// Buffers belonging to abandoned operations, keyed by the generation that
     /// owned them. WinHTTP may still be writing into these, so they are held
     /// until the matching completion arrives — or until `HANDLE_CLOSING`, which
@@ -131,19 +192,30 @@ pub(crate) struct RequestContext {
 }
 
 impl Inner {
-    /// Whether a new operation may be submitted.
+    /// The slot for a [`Side`].
+    pub(crate) fn slot_mut(&mut self, side: Side) -> &mut Slot {
+        match side {
+            Side::Write => &mut self.write,
+            Side::Read => &mut self.read,
+        }
+    }
+
+    /// Whether a new operation may be submitted on `side`.
     ///
     /// `Complete` counts as busy: an uncollected result belongs to a future
     /// that has not been polled since its completion landed, and overwriting it
     /// would lose that future's answer.
-    pub(crate) fn is_idle(&self) -> bool {
-        matches!(self.op, OpState::Idle)
+    pub(crate) fn is_idle(&self, side: Side) -> bool {
+        match side {
+            Side::Write => self.write.is_idle(),
+            Side::Read => self.read.is_idle(),
+        }
     }
 
-    /// Claim the slot for a new operation. Invariant G is upheld by the caller,
-    /// which checks [`Inner::is_idle`] first under the same lock.
+    /// Claim the appropriate slot for a new operation. Invariant G is upheld by
+    /// the caller, which checks [`Inner::is_idle`] first under the same lock.
     pub(crate) fn begin(&mut self, kind: OpKind, generation: u64) {
-        self.op = OpState::Pending { kind, generation };
+        self.slot_mut(kind.side()).op = OpState::Pending { kind, generation };
     }
 
     /// Undo a claim whose WinHTTP call failed synchronously.
@@ -151,25 +223,27 @@ impl Inner {
     /// Only if the slot is still ours *and* still pending. A synchronous
     /// failure can race an inline completion for the very same operation;
     /// clobbering a `Complete` here would strand the future forever.
-    pub(crate) fn rollback(&mut self, generation: u64) {
-        if let OpState::Pending { generation: g, .. } = self.op {
+    pub(crate) fn rollback(&mut self, side: Side, generation: u64) {
+        let slot = self.slot_mut(side);
+        if let OpState::Pending { generation: g, .. } = slot.op {
             if g == generation {
-                self.op = OpState::Idle;
+                slot.op = OpState::Idle;
             }
         }
     }
 
-    /// Collect the outcome of `generation`, if it has landed.
-    pub(crate) fn take_completion(&mut self, generation: u64) -> Option<Completion> {
-        match &self.op {
+    /// Collect the outcome of `generation` on `side`, if it has landed.
+    pub(crate) fn take_completion(&mut self, side: Side, generation: u64) -> Option<Completion> {
+        let slot = self.slot_mut(side);
+        match &slot.op {
             OpState::Complete { generation: g, .. } if *g == generation => {
-                match std::mem::replace(&mut self.op, OpState::Idle) {
+                match std::mem::replace(&mut slot.op, OpState::Idle) {
                     OpState::Complete { outcome, .. } => Some(outcome),
                     // Unreachable: just matched. Restore and report nothing
                     // rather than panicking, because this type is reachable
                     // from the callback.
                     other => {
-                        self.op = other;
+                        slot.op = other;
                         None
                     }
                 }
@@ -178,31 +252,46 @@ impl Inner {
         }
     }
 
-    /// A future for `generation` is being dropped.
-    pub(crate) fn abandon(&mut self, generation: u64, buffer: Option<Box<dyn Any + Send>>) {
-        match &self.op {
-            OpState::Pending {
-                kind,
-                generation: g,
-            } if *g == generation => {
-                // Still in flight. WinHTTP owns the buffer until its completion
-                // arrives, so the buffer is retired rather than freed, and the
-                // slot stays occupied so that no later operation can be
-                // confused with this one.
-                let kind = *kind;
-                self.op = OpState::Abandoned { kind, generation };
-                if let Some(buffer) = buffer {
-                    self.retired.push((generation, buffer));
+    /// A future for `generation` on `side` is being dropped.
+    pub(crate) fn abandon(
+        &mut self,
+        side: Side,
+        generation: u64,
+        buffer: Option<Box<dyn Any + Send>>,
+    ) {
+        // Decide the transition against the slot, then touch `retired` only
+        // after the slot borrow has ended (they are different fields of the
+        // same `Inner`, so the borrow checker will not let both live at once).
+        let retire = {
+            let slot = self.slot_mut(side);
+            match &slot.op {
+                OpState::Pending {
+                    kind,
+                    generation: g,
+                } if *g == generation => {
+                    // Still in flight. WinHTTP owns the buffer until its
+                    // completion arrives, so the buffer is retired rather than
+                    // freed, and the slot stays occupied so that no later
+                    // operation can be confused with this one.
+                    let kind = *kind;
+                    slot.op = OpState::Abandoned { kind, generation };
+                    true
                 }
+                OpState::Complete { generation: g, .. } if *g == generation => {
+                    // Already finished; nothing is holding the buffer. Discard
+                    // the uncollected result and reopen the slot.
+                    slot.op = OpState::Idle;
+                    false
+                }
+                // Never submitted, or belongs to someone else. The buffer, if
+                // any, is dropped normally by the caller.
+                _ => false,
             }
-            OpState::Complete { generation: g, .. } if *g == generation => {
-                // Already finished; nothing is holding the buffer. Discard the
-                // uncollected result and reopen the slot.
-                self.op = OpState::Idle;
+        };
+        if retire {
+            if let Some(buffer) = buffer {
+                self.retired.push((generation, buffer));
             }
-            // Never submitted, or belongs to someone else. The buffer, if any,
-            // is dropped normally by the caller.
-            _ => {}
         }
     }
 }
@@ -213,8 +302,8 @@ impl RequestContext {
         Arc::new(RequestContext {
             inner: Mutex::new(Inner {
                 next_generation: 1,
-                op: OpState::Idle,
-                waker: None,
+                write: Slot::new(),
+                read: Slot::new(),
                 retired: Vec::new(),
                 send_retention: Vec::new(),
             }),
@@ -243,60 +332,116 @@ impl Drop for RequestContext {
     }
 }
 
-/// Record a completion against the operation slot, and return the waker to be
-/// woken *after* the lock is released.
+/// Record a completion against the slot the operation belongs to, and return
+/// the waker to be woken *after* the lock is released.
 ///
 /// Returns `None` — doing nothing at all — when the completion does not match
-/// what is outstanding. That is the right response to a notification the state
-/// machine did not expect: dropping it on the floor cannot corrupt anything,
-/// whereas guessing could resolve the wrong future.
-fn record(
-    context: &RequestContext,
-    expected: Option<OpKind>,
-    outcome: Completion,
-) -> Option<Waker> {
+/// what is outstanding on that slot. That is the right response to a
+/// notification the state machine did not expect: dropping it on the floor
+/// cannot corrupt anything, whereas guessing could resolve the wrong future.
+///
+/// `expected` names the exact operation, which also selects the slot
+/// ([`OpKind::side`]). Terminal *errors* (`REQUEST_ERROR`) do not carry a kind
+/// and are handled by [`record_error`] instead.
+fn record(context: &RequestContext, expected: OpKind, outcome: Completion) -> Option<Waker> {
     let mut inner = context.lock();
     // A completed receive-response is the point at which WinHTTP is documented
     // to be finished with the request body it was given at send time. Freeing
     // here rather than at send-complete is the whole reason `send_retention`
     // exists; freeing is deferred to the end of the borrow so that no user
     // destructor runs while the lock is held.
-    let release = if expected == Some(OpKind::ReceiveResponse) {
+    let release = if expected == OpKind::ReceiveResponse {
         std::mem::take(&mut inner.send_retention)
     } else {
         Vec::new()
     };
-    let waker = match inner.op {
-        OpState::Pending { kind, generation } if expected.is_none_or(|k| k == kind) => {
-            inner.op = OpState::Complete {
-                generation,
-                outcome,
-            };
-            inner.waker.take()
+    let side = expected.side();
+    // The generation of an abandoned operation whose retired buffer can now be
+    // freed — decided under the slot borrow, acted on once it has ended.
+    let mut free_generation: Option<u64> = None;
+    let waker = {
+        let slot = inner.slot_mut(side);
+        match slot.op {
+            OpState::Pending { kind, generation } if kind == expected => {
+                slot.op = OpState::Complete {
+                    generation,
+                    outcome,
+                };
+                slot.waker.take()
+            }
+            OpState::Abandoned { kind, generation } if kind == expected => {
+                // The future that started this is gone. Discard the status, the
+                // length and the error: attributing any of them to a later
+                // operation is precisely the defect this design exists to
+                // prevent.
+                //
+                // WinHTTP has now delivered the terminal notification for this
+                // operation, so it is provably finished with the buffer and the
+                // buffer can be freed here rather than being held until the
+                // handle closes.
+                slot.op = OpState::Idle;
+                free_generation = Some(generation);
+                // Wake anything waiting: a later submission may be parked behind
+                // `OperationInProgress`.
+                slot.waker.take()
+            }
+            _ => None,
         }
-        OpState::Abandoned { kind, generation } if expected.is_none_or(|k| k == kind) => {
-            // The future that started this is gone. Discard the status, the
-            // length and the error: attributing any of them to a later
-            // operation is precisely the defect this design exists to prevent.
-            //
-            // WinHTTP has now delivered the terminal notification for this
-            // operation, so it is provably finished with the buffer and the
-            // buffer can be freed here rather than being held until the handle
-            // closes.
-            inner.op = OpState::Idle;
-            inner.retired.retain(|(g, _)| *g != generation);
-            // Wake anything waiting: a later submission may be parked behind
-            // `OperationInProgress`.
-            inner.waker.take()
-        }
-        _ => None,
     };
+    if let Some(generation) = free_generation {
+        inner.retired.retain(|(g, _)| *g != generation);
+    }
     drop(inner);
     // Outside the lock: dropping these runs caller-supplied destructors, and a
     // destructor that re-entered this context would deadlock against a lock
     // still held here.
     drop(release);
     waker
+}
+
+/// Fault every slot that has an operation in flight, and return their wakers.
+///
+/// `REQUEST_ERROR` carries no [`OpKind`], and with two slots active either or
+/// both of a write and a receive/read could be the operation that failed. A
+/// request error is terminal for the whole handle, though — WinHTTP will not
+/// let a surviving operation make progress once one has faulted — so the
+/// correct and simplest response is to fail *both* slots with the same error
+/// and wake both futures. Waking only one would leave the other parked forever
+/// (its completion is never coming), which is exactly the hang this avoids.
+///
+/// A slot that is `Idle` or already `Complete` is left untouched: there is no
+/// live future there to fault.
+fn record_error(context: &RequestContext, error: Error) -> [Option<Waker>; 2] {
+    let mut inner = context.lock();
+    // A terminal error ends the request, so the body WinHTTP was reading is no
+    // longer needed; release it here as a receive-response would.
+    let release = std::mem::take(&mut inner.send_retention);
+    let mut free: Vec<u64> = Vec::new();
+    let mut wakers = [None, None];
+    for (index, side) in [Side::Write, Side::Read].into_iter().enumerate() {
+        let slot = inner.slot_mut(side);
+        wakers[index] = match slot.op {
+            OpState::Pending { generation, .. } => {
+                slot.op = OpState::Complete {
+                    generation,
+                    outcome: Completion::Failed(error.clone()),
+                };
+                slot.waker.take()
+            }
+            OpState::Abandoned { generation, .. } => {
+                slot.op = OpState::Idle;
+                free.push(generation);
+                slot.waker.take()
+            }
+            _ => None,
+        };
+    }
+    if !free.is_empty() {
+        inner.retired.retain(|(g, _)| !free.contains(g));
+    }
+    drop(inner);
+    drop(release);
+    wakers
 }
 
 /// The WinHTTP status callback.
@@ -383,7 +528,7 @@ unsafe fn dispatch_callback(
     let borrowed = ManuallyDrop::new(unsafe { Arc::from_raw(raw) });
     let context: Arc<RequestContext> = ManuallyDrop::into_inner(borrowed.clone());
 
-    let waker = match status {
+    let wakers: Vec<Waker> = match status {
         WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING => {
             // The one and only place WinHTTP's reference is released. This
             // notification is delivered exactly once per handle, is the last
@@ -405,24 +550,35 @@ unsafe fn dispatch_callback(
             // Likewise for a request body whose response was never received:
             // the handle is gone, so WinHTTP cannot re-send it.
             let release = std::mem::take(&mut inner.send_retention);
-            let waker = inner.waker.take();
+            // Wake whatever is parked on *either* slot: the handle is gone, so
+            // both a stalled writer and a stalled reader must be woken to learn
+            // their operations will never complete.
+            let mut wakers = Vec::new();
+            wakers.extend(inner.write.waker.take());
+            wakers.extend(inner.read.waker.take());
             drop(inner);
             drop(release);
-            waker
+            wakers
         }
 
         WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
-            record(&context, Some(OpKind::Send), Completion::Done(0))
+            record(&context, OpKind::Send, Completion::Done(0))
+                .into_iter()
+                .collect()
         }
 
         WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
-            record(&context, Some(OpKind::ReceiveResponse), Completion::Done(0))
+            record(&context, OpKind::ReceiveResponse, Completion::Done(0))
+                .into_iter()
+                .collect()
         }
 
         WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE => {
             // `lpvStatusInformation` points at a DWORD holding the byte count.
             let written = read_u32(information, information_length);
-            record(&context, Some(OpKind::Write), Completion::Done(written))
+            record(&context, OpKind::Write, Completion::Done(written))
+                .into_iter()
+                .collect()
         }
 
         WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
@@ -430,39 +586,43 @@ unsafe fn dispatch_callback(
             let available = read_u32(information, information_length);
             record(
                 &context,
-                Some(OpKind::QueryDataAvailable),
+                OpKind::QueryDataAvailable,
                 Completion::Done(available),
             )
+            .into_iter()
+            .collect()
         }
 
         WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
             // Here the *length* parameter carries the byte count, and
             // `lpvStatusInformation` points at the caller's own buffer. This
             // asymmetry with WRITE_COMPLETE is WinHTTP's, not ours.
-            record(
-                &context,
-                Some(OpKind::Read),
-                Completion::Done(information_length),
-            )
+            record(&context, OpKind::Read, Completion::Done(information_length))
+                .into_iter()
+                .collect()
         }
 
         WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
             let error = read_async_error(information, information_length);
-            // No expected kind: any outstanding operation can fail this way,
-            // and only one can be outstanding.
-            record(&context, None, Completion::Failed(error))
+            // No expected kind: a terminal error can fault either or both of an
+            // outstanding write and receive/read, so both slots are failed and
+            // both wakers collected. See [`record_error`].
+            record_error(&context, error)
+                .into_iter()
+                .flatten()
+                .collect()
         }
 
         // Progress notifications — resolving, connecting, sending, secure
         // failure, handle created, redirects — and anything a future version of
         // WinHTTP invents. Ignored, deliberately and silently. The previous
         // implementation panicked here, from a thread it did not own.
-        _ => None,
+        _ => Vec::new(),
     };
 
     // Outside the lock: `wake` may run arbitrary executor code, including code
     // that immediately polls the future and takes this same lock.
-    if let Some(waker) = waker {
+    for waker in wakers {
         waker.wake();
     }
 }
@@ -523,14 +683,36 @@ mod tests {
         // guess: resolving the wrong future is worse than hanging, because a
         // hang shows up in a test and a wrong answer does not.
         let context = RequestContext::new();
-        context.lock().op = OpState::Pending {
+        context.lock().read.op = OpState::Pending {
             kind: OpKind::Read,
             generation: 7,
         };
-        let waker = record(&context, Some(OpKind::Write), Completion::Done(99));
+        // A write completion routes to the write slot, which is idle, so the
+        // read slot is untouched.
+        let waker = record(&context, OpKind::Write, Completion::Done(99));
         assert!(waker.is_none());
         assert!(matches!(
-            context.lock().op,
+            context.lock().read.op,
+            OpState::Pending {
+                kind: OpKind::Read,
+                generation: 7
+            }
+        ));
+    }
+
+    #[test]
+    fn a_wrong_kind_on_the_same_slot_is_ignored() {
+        // Two kinds share the read slot; a completion for the wrong one must
+        // still be ignored rather than resolve the operation in flight.
+        let context = RequestContext::new();
+        context.lock().read.op = OpState::Pending {
+            kind: OpKind::Read,
+            generation: 7,
+        };
+        let waker = record(&context, OpKind::ReceiveResponse, Completion::Done(0));
+        assert!(waker.is_none());
+        assert!(matches!(
+            context.lock().read.op,
             OpState::Pending {
                 kind: OpKind::Read,
                 generation: 7
@@ -546,7 +728,7 @@ mod tests {
         let context = RequestContext::new();
         {
             let mut inner = context.lock();
-            inner.op = OpState::Abandoned {
+            inner.read.op = OpState::Abandoned {
                 kind: OpKind::Read,
                 generation: 4,
             };
@@ -554,18 +736,97 @@ mod tests {
             inner.retired.push((5, Box::new(vec![0u8; 16])));
         }
 
-        record(&context, Some(OpKind::Read), Completion::Done(16));
+        record(&context, OpKind::Read, Completion::Done(16));
 
         let inner = context.lock();
-        assert!(matches!(inner.op, OpState::Idle));
+        assert!(matches!(inner.read.op, OpState::Idle));
         assert_eq!(inner.retired.len(), 1, "only generation 4 should be freed");
         assert_eq!(inner.retired[0].0, 5);
     }
 
     #[test]
-    fn a_request_error_matches_whatever_is_outstanding() {
-        // Any operation can fail this way and only one can be outstanding, so
-        // the error arm deliberately does not check the kind.
+    fn a_write_and_a_receive_may_be_outstanding_at_once_and_complete_in_either_order() {
+        // The whole point of the two-slot design (HTTP/2 duplex, M6): a write
+        // on the request body and a receive of the response head are in flight
+        // together, and their completions arrive independently — here, the
+        // receive completes first, then the write — without either disturbing
+        // the other.
+        let context = RequestContext::new();
+        {
+            let mut inner = context.lock();
+            inner.write.op = OpState::Pending {
+                kind: OpKind::Write,
+                generation: 1,
+            };
+            inner.read.op = OpState::Pending {
+                kind: OpKind::ReceiveResponse,
+                generation: 2,
+            };
+        }
+
+        // Receive completes first.
+        record(&context, OpKind::ReceiveResponse, Completion::Done(0));
+        {
+            let inner = context.lock();
+            assert!(
+                matches!(inner.read.op, OpState::Complete { generation: 2, .. }),
+                "the receive should be complete"
+            );
+            assert!(
+                matches!(inner.write.op, OpState::Pending { generation: 1, .. }),
+                "the write must be untouched by the receive completing"
+            );
+        }
+
+        // Then the write completes.
+        record(&context, OpKind::Write, Completion::Done(42));
+        let inner = context.lock();
+        assert!(matches!(
+            inner.write.op,
+            OpState::Complete {
+                generation: 1,
+                outcome: Completion::Done(42)
+            }
+        ));
+        assert!(matches!(
+            inner.read.op,
+            OpState::Complete { generation: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn a_request_error_faults_both_slots_at_once() {
+        // A terminal error can fault either or both of an outstanding write and
+        // receive/read; both are failed so neither future is left parked on a
+        // completion that will never arrive.
+        let context = RequestContext::new();
+        {
+            let mut inner = context.lock();
+            inner.write.op = OpState::Pending {
+                kind: OpKind::Write,
+                generation: 1,
+            };
+            inner.read.op = OpState::Pending {
+                kind: OpKind::Read,
+                generation: 2,
+            };
+        }
+        record_error(&context, Error::from_hresult(HRESULT::from_win32(12017)));
+        let inner = context.lock();
+        assert!(
+            matches!(inner.write.op, OpState::Complete { .. }),
+            "the write slot should be failed"
+        );
+        assert!(
+            matches!(inner.read.op, OpState::Complete { .. }),
+            "the read slot should be failed"
+        );
+    }
+
+    #[test]
+    fn a_request_error_faults_whichever_single_slot_is_outstanding() {
+        // Only one operation is outstanding: the error faults that slot and
+        // leaves the idle slot alone.
         for kind in [
             OpKind::Send,
             OpKind::Write,
@@ -574,17 +835,16 @@ mod tests {
             OpKind::Read,
         ] {
             let context = RequestContext::new();
-            context.lock().op = OpState::Pending {
+            context.lock().slot_mut(kind.side()).op = OpState::Pending {
                 kind,
                 generation: 1,
             };
-            record(
-                &context,
-                None,
-                Completion::Failed(Error::from_hresult(HRESULT::from_win32(12017))),
-            );
+            record_error(&context, Error::from_hresult(HRESULT::from_win32(12017)));
             assert!(
-                matches!(context.lock().op, OpState::Complete { .. }),
+                matches!(
+                    context.lock().slot_mut(kind.side()).op,
+                    OpState::Complete { .. }
+                ),
                 "{kind:?} should have been completed"
             );
         }

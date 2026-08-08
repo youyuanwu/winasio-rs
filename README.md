@@ -468,6 +468,68 @@ unifies that feature into a `--workspace` build -- and is checked by
 server in safe code on a bare executor; the test suite compiles it, runs it, and
 asserts textually that it contains no `unsafe`.
 
+# Winasio-tonic
+gRPC (tonic) over WinHTTP (client) and HTTP.sys (server). tonic's generated
+**server** is an `axum::Router`, so it rides directly on `winasio-axum`'s driver
+via `winasio_tonic::serve_grpc`, which selects the raw HTTP/2 DATA-frame +
+trailers response path so a service's terminating `grpc-status` trailer reaches
+the peer. The **client** side is `winasio_tonic::WinHttpChannel`, a `Channel`-like
+`tower::Service` that satisfies `tonic::client::GrpcService<BoxBody>`, so a
+generated tonic client speaks to it directly.
+
+```rs
+// Server: mount a tonic service (an axum Router under the hood) and serve it.
+let router = axum::Router::new().fallback_service(EchoServer::new(MyService));
+winasio_tonic::serve_grpc(&server, router, CurrentThread::new()).await?;
+
+// Client: build a channel over WinHTTP and hand it to the generated client.
+let channel = winasio_tonic::WinHttpChannel::new(
+    "https://localhost:12495".parse()?,
+    "winasio-tonic/0.1",
+)?;
+let mut client = EchoClient::new(channel);
+```
+
+**All four call types are supported** — unary, server-streaming, client-streaming,
+and bidirectional — built on the WinHTTP HTTP/2 duplex path (start the response
+receive before finishing the request body; end the request body with an explicit
+empty DATA frame carrying END_STREAM) and HTTP.sys response trailers.
+
+**TLS is mandatory.** HTTP.sys speaks HTTP/2 only over a TLS binding (there is no
+h2c), and Microsoft supports gRPC over `WinHttpHandler` only over TLS. Every e2e
+gRPC test therefore depends on the provisioned certificate (see *Server-side TLS*)
+and uses the same require/skip idiom as the other TLS tests.
+
+**Duplex streaming is platform-dependent (M9/M11).** On Windows 11 / Server 2022+
+all four call types work. On Windows Server 2019/2022 without the automatic-chunking
+backport, only unary and server-streaming are guaranteed; client-streaming and
+bidirectional need the duplex request path. The client probes the
+`WINHTTP_FLAG_AUTOMATIC_CHUNKING` capability at request time and falls back to
+manual chunking (which downgrades to HTTP/1.1 and cannot carry gRPC) when it is
+absent. That same probe is the duplex discriminator: Microsoft's own
+`WinHttpHandler` tests treat the automatic-chunking backport and bidirectional
+support as one capability. So the e2e suite gates *all* gRPC on the probe — a
+platform without it logs a **visible, narrowly-scoped** `SKIPPED` for the whole
+gRPC suite (no silent green) — and once the probe passes, **all four call types
+are required and asserted**: a duplex failure past the probe is a real bug that
+fails loudly, never a skip that could mask a regression. The tests log greppable
+`GRPC_TLS_TEST:` and `GRPC_DUPLEX:` tokens recording exactly which call types ran.
+
+**`tokio`, but no runtime.** `winasio-tonic` allows bare `tokio` in its graph
+(tonic pulls it via `tokio-stream`, features `default` + `sync` only) but no
+async *runtime*: `rt`, `net`, `mio`, `hyper`, and `hyper-util` must not appear.
+This is enforced by `winasio_tonic_pulls_in_no_async_runtime_beyond_tokio` in
+`crates/winasio-tests/tests/dependencies.rs`.
+
+**No `protoc` to use the crate.** `winasio-tonic` is a transport, not a service:
+it has no build script and runs no codegen, so a consumer needs no protobuf
+compiler to build it. The example `Echo` service used by the end-to-end tests —
+its `.proto` and every generated stub — lives in `crates/winasio-tests`, so
+`protoc` is required only to build the **tests** (CI installs it via
+`arduino/setup-protoc`; locally it must be on `PATH` or pointed at by `PROTOC`).
+Callers generate stubs from their own `.proto` and pass a `WinHttpChannel` as
+the transport.
+
 # Layout
 This repo is a cargo workspace:
 - `crates/winasio`: the library crate.
@@ -475,6 +537,8 @@ This repo is a cargo workspace:
   HTTP server over `winasio::httpsys`.
 - `crates/winasio-axum`: concurrent driver that serves an `axum::Router` over
   HTTP.sys through a caller-supplied executor.
+- `crates/winasio-tonic`: gRPC (tonic) client transport and server glue over
+  `winasio-util`/`winasio-axum`.
 - `crates/winasio-tests`: test only crate holding the integration tests.
 
 # MISC

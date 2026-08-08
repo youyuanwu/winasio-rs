@@ -199,6 +199,10 @@ pub struct Serve<'srv, 'sess, S: Backend, Svc, E> {
     service: Svc,
     executor: E,
     on_error: ErrorObserver,
+    /// Frame each response as raw HTTP/2 + trailers (the gRPC path) rather than
+    /// by size hint. Set by [`serve_grpc`]; see it for why the loop needs to
+    /// know.
+    grpc: bool,
 }
 
 impl<'srv, 'sess, S: Backend, Svc, E> Serve<'srv, 'sess, S, Svc, E> {
@@ -251,6 +255,42 @@ where
         service,
         executor,
         on_error: Arc::new(|_| {}),
+        grpc: false,
+    }
+}
+
+/// Serve a tonic gRPC service (an [`axum::Router`]) over HTTP.sys concurrently,
+/// framing every response as raw HTTP/2 DATA + trailers.
+///
+/// Identical to [`serve`] in every way — same concurrent accept loop,
+/// backpressure, panic containment, [`on_error`](Serve::on_error) — except that
+/// each response is dispatched through
+/// [`Accepted::serve_streaming`](winasio_util::Accepted::serve_streaming)
+/// instead of [`serve`](winasio_util::Accepted::serve). That is the one thing
+/// gRPC needs: a tonic response is a streaming body ending in a `grpc-status`
+/// trailer, and the size-hint framing [`serve`] uses would either drop the
+/// trailer or hand-frame the body in a way HTTP/2 cannot carry (M7). The choice
+/// is made here, explicitly, because the caller knows it is serving gRPC — it
+/// never rides on server-side request-version sniffing (which the M2 defect
+/// would poison).
+///
+/// The reply framing does not depend on the peer actually speaking HTTP/2: a
+/// gRPC client always does (M9/M10 — gRPC is HTTP/2-only), so a request that
+/// reaches this loop is one whose response HTTP.sys will frame as HTTP/2.
+pub fn serve_grpc<'srv, 'sess, S, Svc, E>(
+    server: &'srv Server<'sess, S>,
+    service: Svc,
+    executor: E,
+) -> Serve<'srv, 'sess, S, Svc, E>
+where
+    S: Backend,
+{
+    Serve {
+        server,
+        service,
+        executor,
+        on_error: Arc::new(|_| {}),
+        grpc: true,
     }
 }
 
@@ -272,7 +312,13 @@ where
     type IntoFuture = Pin<Box<dyn Future<Output = Result<(), ServeError>> + 'srv>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(run(self.server, self.service, self.executor, self.on_error))
+        Box::pin(run(
+            self.server,
+            self.service,
+            self.executor,
+            self.on_error,
+            self.grpc,
+        ))
     }
 }
 
@@ -283,6 +329,7 @@ async fn run<S, Svc, B, E>(
     service: Svc,
     executor: E,
     on_error: ErrorObserver,
+    grpc: bool,
 ) -> Result<(), ServeError>
 where
     S: Backend + Send + Sync,
@@ -327,7 +374,19 @@ where
                 let task: RequestTask = Box::pin(async move {
                     // Panic containment (D5): a handler panic becomes an observer
                     // report, never an unwind through the loop.
-                    match AssertUnwindSafe(accepted.serve(svc)).catch_unwind().await {
+                    //
+                    // gRPC responses are framed as raw HTTP/2 + trailers
+                    // (`serve_streaming`); everything else uses the size-hint
+                    // framing (`serve`). Both futures have identical bounds, so
+                    // the branch just picks which terminal send path runs.
+                    let outcome = if grpc {
+                        AssertUnwindSafe(accepted.serve_streaming(svc))
+                            .catch_unwind()
+                            .await
+                    } else {
+                        AssertUnwindSafe(accepted.serve(svc)).catch_unwind().await
+                    };
+                    match outcome {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => on_error_task(error),
                         Err(panic) => {

@@ -154,14 +154,53 @@ pub(crate) fn parse(raw: &str) -> Result<Head, RequestError> {
     Ok(Head { version, headers })
 }
 
-/// The HTTP version named by a status line.
+/// Parse a trailer block: the same `name: value` lines as [`parse`], but with
+/// no status line at the front.
+///
+/// WinHTTP reports response trailers through the same
+/// `WINHTTP_QUERY_RAW_HEADERS_CRLF` format as headers (with the
+/// `WINHTTP_QUERY_FLAG_TRAILERS` modifier), but trailers have no status line —
+/// they are the fields that arrive *after* the body, which for gRPC is where
+/// `grpc-status` and `grpc-message` live. A line that looks like a status line
+/// (begins `HTTP/`) is skipped defensively rather than parsed as a header,
+/// because some platforms prepend one and a `HeaderName` of `HTTP/1.1` is not a
+/// trailer any server sent.
+pub(crate) fn parse_trailers(raw: &str) -> Result<HeaderMap, RequestError> {
+    let mut headers = HeaderMap::new();
+    for line in raw.split("\r\n") {
+        if line.is_empty() || line.starts_with("HTTP/") {
+            continue;
+        }
+        let (name, value) =
+            line.split_once(':')
+                .ok_or_else(|| RequestError::MalformedResponseHeader {
+                    line: line.to_string(),
+                })?;
+        let name = HeaderName::from_bytes(name.trim().as_bytes()).map_err(|_| {
+            RequestError::MalformedResponseHeader {
+                line: line.to_string(),
+            }
+        })?;
+        let value = HeaderValue::from_str(value.trim()).map_err(|_| {
+            RequestError::MalformedResponseHeader {
+                line: line.to_string(),
+            }
+        })?;
+        headers.append(name, value);
+    }
+    Ok(headers)
+}
+
+/// The HTTP version named by an HTTP/1.x status line.
 ///
 /// A version the parser does not recognise becomes `HTTP/1.1` rather than an
-/// error. WinHTTP does not speak HTTP/2 or HTTP/3 through this API and reports
-/// what it negotiated, so an unrecognised token means the status line was
-/// malformed — and a malformed status line accompanying a status code and body
-/// the platform was happy with is not worth failing an otherwise good response
-/// over.
+/// error. This parses the textual status line, which only exists on the
+/// HTTP/1.x wire; when the request negotiated HTTP/2 (via
+/// `WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL`, Phase 1) there is no textual status
+/// line and the negotiated version is read from the response object instead. So
+/// an unrecognised token here means an HTTP/1.x status line was malformed — and
+/// a malformed status line accompanying a status code and body the platform was
+/// happy with is not worth failing an otherwise good response over.
 fn parse_version(status_line: &str) -> Version {
     match status_line.split(' ').next().unwrap_or_default() {
         "HTTP/0.9" => Version::HTTP_09,
@@ -311,6 +350,32 @@ X-Spaces: padded\r\n\r\n";
             String::from_utf16(&encoded).unwrap(),
             "accept: text/plain\r\n"
         );
+    }
+
+    #[test]
+    fn trailers_parse_without_a_status_line() {
+        // The gRPC case: `grpc-status`/`grpc-message` arrive after the body,
+        // with no status line in the block.
+        let map = parse_trailers("grpc-status: 0\r\ngrpc-message: \r\n\r\n").unwrap();
+        assert_eq!(text(&map, "grpc-status"), ["0"]);
+        assert_eq!(text(&map, "grpc-message"), [""]);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn a_status_line_prefixing_a_trailer_block_is_ignored() {
+        // Defensive: if a platform prepends a status line, it must not become a
+        // `HeaderName` of `HTTP/1.1`.
+        let map = parse_trailers("HTTP/2 200\r\ngrpc-status: 5\r\n\r\n").unwrap();
+        assert!(map.get("HTTP/2").is_none());
+        assert_eq!(text(&map, "grpc-status"), ["5"]);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_trailer_block_parses_to_an_empty_map() {
+        assert!(parse_trailers("").unwrap().is_empty());
+        assert!(parse_trailers("\r\n\r\n").unwrap().is_empty());
     }
 
     #[test]

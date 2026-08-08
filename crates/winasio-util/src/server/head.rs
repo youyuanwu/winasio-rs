@@ -197,9 +197,34 @@ fn uri_of(request: &Request) -> Result<Uri, AcceptError> {
 }
 
 fn version_of(request: &Request) -> Version {
-    match request.version() {
+    // HTTP.sys does NOT report the negotiated protocol in the version tuple:
+    // measured (M2), an h2 request reports `Version = (1, 1)` exactly like an
+    // h1.1 request, and signals h2 only through `HTTP_REQUEST.Flags`
+    // (`HTTP_REQUEST_FLAG_HTTP2`). So the flag is consulted first; the tuple is
+    // only a fallback for the older protocols the flag says nothing about.
+    if request.is_http2() {
+        return Version::HTTP_2;
+    }
+    if request.is_http3() {
+        return Version::HTTP_3;
+    }
+    let (major, minor) = request.version();
+    version_from_tuple(major, minor)
+}
+
+/// Map the raw `HTTP_REQUEST.Version` tuple to an [`http::Version`].
+///
+/// This is only the fallback for requests whose protocol is *not* flagged
+/// (h2/h3 are detected from `HTTP_REQUEST.Flags` — see [`version_of`]); for h1.x
+/// and older the tuple is all HTTP.sys gives. Kept as a pure function so the
+/// mirroring test can exercise the table directly, without a real request.
+fn version_from_tuple(major: u16, minor: u16) -> Version {
+    match (major, minor) {
         (0, 9) => Version::HTTP_09,
         (1, 0) => Version::HTTP_10,
+        // These two are retained even though the flag path handles a genuine
+        // h2/h3 request: if a future HTTP.sys ever did populate the tuple, this
+        // would still be right rather than silently wrong.
         (2, _) => Version::HTTP_2,
         (3, _) => Version::HTTP_3,
         // Everything else, including the 1.1 that HTTP.sys speaks and the 0.0
@@ -537,24 +562,21 @@ mod tests {
 
     #[test]
     fn an_http_version_maps_to_what_the_platform_reported() {
-        // Exercised through the same table `version_of` uses; the platform
-        // reports a pair of `u16`s and nothing else.
-        fn map(major: u16, minor: u16) -> Version {
-            match (major, minor) {
-                (0, 9) => Version::HTTP_09,
-                (1, 0) => Version::HTTP_10,
-                (2, _) => Version::HTTP_2,
-                (3, _) => Version::HTTP_3,
-                _ => Version::HTTP_11,
-            }
-        }
-        assert_eq!(map(0, 9), Version::HTTP_09);
-        assert_eq!(map(1, 0), Version::HTTP_10);
-        assert_eq!(map(1, 1), Version::HTTP_11);
-        assert_eq!(map(2, 0), Version::HTTP_2);
+        // The tuple fallback (`version_from_tuple`) covers the protocols HTTP.sys
+        // reports in `HTTP_REQUEST.Version`. The negotiated h2/h3 case is NOT in
+        // this table: measured (M2), HTTP.sys reports `(1, 1)` for an h2 request
+        // and flags it via `HTTP_REQUEST.Flags` instead, so `version_of` checks
+        // `is_http2`/`is_http3` before consulting this table. That flag path
+        // needs a real h2 request; it is asserted end-to-end by the gRPC-over-TLS
+        // suite (`winasio-tests/tests/grpc_tls.rs::grpc_unary`, which fails unless
+        // the server observes the request as HTTP/2).
+        assert_eq!(version_from_tuple(0, 9), Version::HTTP_09);
+        assert_eq!(version_from_tuple(1, 0), Version::HTTP_10);
+        assert_eq!(version_from_tuple(1, 1), Version::HTTP_11);
+        assert_eq!(version_from_tuple(2, 0), Version::HTTP_2);
         // A version the platform could not parse is reported as 0.0; an
         // unparseable version line is not worth failing a request over.
-        assert_eq!(map(0, 0), Version::HTTP_11);
+        assert_eq!(version_from_tuple(0, 0), Version::HTTP_11);
     }
 
     #[test]
