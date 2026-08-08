@@ -9,10 +9,16 @@
 //! Each test binary owns a distinct port (see `ImplementationPlan.md`), because
 //! cargo runs integration binaries in parallel and two processes cannot bind the
 //! same HTTP.sys prefix.
+//!
+//! The one exception is the certificate-bound HTTPS port, which is provisioned
+//! once out of process and so must be *shared* by `httpsys_tls.rs` and
+//! `grpc_tls.rs`. Those two serialise against each other with the cross-process
+//! named mutex in [`tls_lock`], since an in-process lock cannot span binaries.
 
 #![allow(dead_code)]
 
 pub mod tls_config;
+pub mod tls_lock;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

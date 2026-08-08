@@ -24,7 +24,7 @@ serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
-windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock", "Win32_Security"] }
+windows = { workspace = true, features = ["Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Threading"] }
 criterion = { workspace = true }
 tower = { workspace = true }
 # gRPC / tonic e2e stack (Phase 4). These are dev-dependencies of the TEST crate

@@ -323,9 +323,16 @@ impl GrpcEnv {
     }
 }
 
-/// Serialises the gRPC tests within this binary: they share the one provisioned
-/// port and its root URL prefix.
-static GRPC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serialises the gRPC tests against every process using the one provisioned
+/// port — including the `httpsys_tls.rs` binary, which cargo runs concurrently.
+/// This suite registers the **root** prefix (tonic sends absolute
+/// `/{service}/{method}` paths), which measurement shows is mutually exclusive
+/// with that file's `/tls/` prefix in both orders (`ERROR_ACCESS_DENIED`). A
+/// `static Mutex` cannot serialise across binaries, so the lock is the
+/// cross-process named mutex in [`common::tls_lock`].
+fn grpc_guard() -> common::tls_lock::HttpsPortGuard {
+    common::tls_lock::lock_https_port()
+}
 
 /// Stand up the Echo server over HTTP.sys+TLS, run `body` (which gets a ready
 /// [`EchoClient`]), then shut the server down and join it.
@@ -449,7 +456,7 @@ fn duplex_ran(call: &str) {
 /// `(1,1)` version tuple).
 #[test]
 fn grpc_unary() {
-    let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grpc_guard();
     let Some(env) = require_grpc_env() else {
         return;
     };
@@ -478,7 +485,7 @@ fn grpc_unary() {
 /// Required whenever TLS + chunking are present (does not need duplex).
 #[test]
 fn grpc_server_streaming() {
-    let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grpc_guard();
     let Some(env) = require_grpc_env() else {
         return;
     };
@@ -513,7 +520,7 @@ fn grpc_server_streaming() {
 /// model); a failure is a real bug, not a skip.
 #[test]
 fn grpc_client_streaming() {
-    let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grpc_guard();
     let Some(env) = require_grpc_env() else {
         return;
     };
@@ -548,7 +555,7 @@ fn grpc_client_streaming() {
 /// failure here is a real bug, not a skip (module capability model).
 #[test]
 fn grpc_bidi_streaming() {
-    let _lock = GRPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = grpc_guard();
     let Some(env) = require_grpc_env() else {
         return;
     };

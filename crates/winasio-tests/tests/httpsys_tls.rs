@@ -69,7 +69,11 @@
 //!
 //! An HTTP.sys SSL binding is keyed by `ip:port` and is machine-global, and only
 //! one URL group may own a given prefix at a time. All tests here share the one
-//! provisioned port, so a file-scoped [`TLS_LOCK`] serialises them (R3).
+//! provisioned port — and so does `grpc_tls.rs`, in a *separate process*, which
+//! registers the root prefix that is mutually exclusive with this file's
+//! `/tls/` one (measured, both orders → `ERROR_ACCESS_DENIED`). Serialisation is
+//! therefore the cross-process named mutex in [`common::tls_lock`], not a
+//! `static Mutex`, which could only ever cover this binary (R3).
 
 #![cfg(windows)]
 
@@ -77,11 +81,10 @@ mod common;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 
 use windows::core::HSTRING;
 
-use common::{block_on, tls_config};
+use common::{block_on, tls_config, tls_lock};
 use winasio::httpsys::{query_ssl_binding, THUMBPRINT_LEN};
 use winasio::iocp::{OpResult, ThreadPool};
 use winasio::winhttp::{CertificateRelaxations, Session, WinHttpError};
@@ -91,10 +94,13 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Full;
 
-/// Serialises every TLS test: the provisioned binding and URL prefix are global
-/// per `ip:port`, so two tests running at once would contend for the same
-/// prefix (R3).
-static TLS_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises every TLS test against *all* processes touching the provisioned
+/// binding — including the `grpc_tls.rs` binary, which cargo runs concurrently
+/// and whose root prefix collides with this file's `/tls/` one (R3). A
+/// `static Mutex` cannot do this: it is invisible across binaries.
+fn tls_guard() -> tls_lock::HttpsPortGuard {
+    tls_lock::lock_https_port()
+}
 
 /// Generous client timeouts: a stuck handshake should surface as an error, not
 /// hang the suite. 15s is far longer than a loopback handshake needs.
@@ -287,7 +293,7 @@ fn from_err(error: windows::core::Error) -> WinHttpError {
 /// succeeds end to end (SC-001, FR-008).
 #[test]
 fn https_roundtrip_positive() {
-    let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = tls_guard();
     let Some(env) = require_bound_endpoint() else {
         return;
     };
@@ -347,7 +353,7 @@ fn https_roundtrip_positive() {
 /// (SC-003) — i.e. the setup script's dual-family binding contract holds.
 #[test]
 fn https_binding_observable_on_both_families() {
-    let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = tls_guard();
     let Some(env) = require_bound_endpoint() else {
         return;
     };
@@ -379,7 +385,7 @@ fn https_binding_observable_on_both_families() {
 /// the failure is the certificate check and nothing else (SC-002, FR-009).
 #[test]
 fn https_negative_control_unrelaxed_fails() {
-    let _lock = TLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = tls_guard();
     let Some(env) = require_bound_endpoint() else {
         return;
     };
