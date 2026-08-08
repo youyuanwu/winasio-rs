@@ -554,6 +554,18 @@ pub enum ResponseBodyError {
     },
     /// A WinHTTP read failed.
     Read(windows::core::Error),
+    /// Writing the outbound request body failed while the response was being
+    /// read.
+    ///
+    /// Only the HTTP/2 (duplex) path can produce this: it keeps sending the
+    /// request body *after* the response head has arrived — the response is
+    /// already in the caller's hands — so a send failure surfaces here on the
+    /// body rather than from
+    /// [`Client::request`](crate::Client::request). The HTTP/1.1 path drains
+    /// the whole request body before returning, so its write failures are a
+    /// [`RequestError`] instead. Boxed because the source may be either a
+    /// WinHTTP error or the outbound body's own error type.
+    Write(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl ResponseBodyError {
@@ -564,7 +576,9 @@ impl ResponseBodyError {
     pub fn win_http(&self) -> Option<WinHttpError> {
         match self {
             ResponseBodyError::Read(source) => Some(WinHttpError::from_error(source)),
-            ResponseBodyError::Truncated { .. } => None,
+            // A write failure's source may not be a WinHTTP error at all (it can
+            // be the outbound body's own), so no single WinHTTP meaning fits.
+            ResponseBodyError::Write(_) | ResponseBodyError::Truncated { .. } => None,
         }
     }
 }
@@ -579,6 +593,9 @@ impl fmt::Display for ResponseBodyError {
             ResponseBodyError::Read(source) => {
                 write!(f, "reading the response body failed: {source}")
             }
+            ResponseBodyError::Write(source) => {
+                write!(f, "writing the request body failed: {source}")
+            }
         }
     }
 }
@@ -587,6 +604,7 @@ impl std::error::Error for ResponseBodyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ResponseBodyError::Read(source) => Some(source),
+            ResponseBodyError::Write(source) => Some(&**source),
             ResponseBodyError::Truncated { .. } => None,
         }
     }

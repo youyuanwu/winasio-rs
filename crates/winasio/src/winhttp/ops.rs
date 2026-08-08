@@ -79,15 +79,16 @@ impl Request {
             Some(current) => current,
             None => {
                 // First poll. Claim the slot.
+                let side = kind.side();
                 let claimed = {
                     let mut inner = self.context.lock();
-                    if !inner.is_idle() {
+                    if !inner.is_idle(side) {
                         None
                     } else {
                         let claimed = inner.next_generation;
                         inner.next_generation = inner.next_generation.wrapping_add(1);
                         inner.begin(kind, claimed);
-                        inner.waker = Some(cx.waker().clone());
+                        inner.slot_mut(side).waker = Some(cx.waker().clone());
                         Some(claimed)
                     }
                 };
@@ -104,7 +105,7 @@ impl Request {
                         // pending. A synchronous failure can race an inline
                         // completion, and clobbering a completion that already
                         // landed would hang the future forever.
-                        self.context.lock().rollback(claimed);
+                        self.context.lock().rollback(side, claimed);
                         return Poll::Ready(Err(error));
                     }
                 }
@@ -114,28 +115,29 @@ impl Request {
 
         // Completion check. On the first poll this is the recheck that catches
         // an inline completion; on later polls it is the ordinary path.
+        let side = kind.side();
         let mut inner = self.context.lock();
-        match inner.take_completion(current) {
+        match inner.take_completion(side, current) {
             Some(Completion::Done(length)) => Poll::Ready(Ok(length)),
             Some(Completion::Failed(error)) => Poll::Ready(Err(error)),
             None => {
                 // Replace rather than keep: an executor may poll a future from
                 // a different task, with a different waker, at any time.
-                inner.waker = Some(cx.waker().clone());
+                inner.slot_mut(side).waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
     }
 
     /// Give up on an operation whose future is being dropped.
-    fn abandon(&self, generation: Option<u64>, buffer: Option<Box<dyn Any + Send>>) {
+    fn abandon(&self, kind: OpKind, generation: Option<u64>, buffer: Option<Box<dyn Any + Send>>) {
         let Some(generation) = generation else {
             // Never submitted: constructing a future and dropping it without
             // polling it is a no-op, which is why submission happens in `poll`
             // and not in the constructor.
             return;
         };
-        self.context.lock().abandon(generation, buffer);
+        self.context.lock().abandon(kind.side(), generation, buffer);
     }
 
     /// Hand a request body or header block to the context for safekeeping.
@@ -286,7 +288,7 @@ impl<B: Send + 'static> Drop for SendRequest<'_, B> {
         // which case the body and headers are still owned by this future and
         // are dropped with it, or it did, in which case `poll` already moved
         // them into the request context where they outlive this future.
-        self.request.abandon(self.generation, None);
+        self.request.abandon(OpKind::Send, self.generation, None);
     }
 }
 
@@ -376,7 +378,8 @@ impl<B: Send + 'static> Drop for WriteData<'_, B> {
             .buffer
             .take()
             .map(|buffer| Box::new(buffer) as Box<dyn Any + Send>);
-        self.request.abandon(self.generation, retired);
+        self.request
+            .abandon(OpKind::Write, self.generation, retired);
     }
 }
 
@@ -418,7 +421,8 @@ impl Future for ReceiveResponse<'_> {
 
 impl Drop for ReceiveResponse<'_> {
     fn drop(&mut self) {
-        self.request.abandon(self.generation, None);
+        self.request
+            .abandon(OpKind::ReceiveResponse, self.generation, None);
     }
 }
 
@@ -461,7 +465,8 @@ impl Future for QueryDataAvailable<'_> {
 
 impl Drop for QueryDataAvailable<'_> {
     fn drop(&mut self) {
-        self.request.abandon(self.generation, None);
+        self.request
+            .abandon(OpKind::QueryDataAvailable, self.generation, None);
     }
 }
 
@@ -575,6 +580,6 @@ impl<B: Send + 'static> Drop for ReadData<'_, B> {
             .buffer
             .take()
             .map(|buffer| Box::new(buffer) as Box<dyn Any + Send>);
-        self.request.abandon(self.generation, retired);
+        self.request.abandon(OpKind::Read, self.generation, retired);
     }
 }

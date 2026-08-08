@@ -211,11 +211,12 @@ use windows::Win32::Networking::WinHttp::{
     SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE,
     SECURITY_FLAG_IGNORE_UNKNOWN_CA, WINHTTP_ACCESS_TYPE, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
     WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, WINHTTP_FLAG_ASYNC,
-    WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_OPTION_CONTEXT_VALUE,
+    WINHTTP_FLAG_AUTOMATIC_CHUNKING, WINHTTP_FLAG_SECURE, WINHTTP_OPEN_REQUEST_FLAGS,
+    WINHTTP_OPTION_CONTEXT_VALUE, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
     WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS,
     WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP, WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
-    WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_RAW_HEADERS_CRLF,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_PROTOCOL_FLAG_HTTP2, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_FLAG_TRAILERS, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_QUERY_STATUS_CODE,
 };
 
 use crate::iocp::{IoBuf, IoBufMut};
@@ -227,7 +228,6 @@ use handle::Handle;
 pub use context::live_context_count;
 pub use error::WinHttpError;
 pub use ops::{QueryDataAvailable, ReadData, ReceiveResponse, SendRequest, WriteData};
-
 /// How a session reaches the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessType {
@@ -471,6 +471,40 @@ impl Connection {
         accept_types: &[HSTRING],
         secure: bool,
     ) -> Result<Request, Error> {
+        self.open_request_with(
+            verb,
+            object_name,
+            accept_types,
+            secure,
+            RequestFlags::default(),
+        )
+    }
+
+    /// Open a request, choosing extra `WinHttpOpenRequest` flags.
+    ///
+    /// This is the general form behind [`Connection::open_request`]. The only
+    /// flag it adds beyond secure/insecure is
+    /// [`RequestFlags::automatic_chunking`], which turns on
+    /// `WINHTTP_FLAG_AUTOMATIC_CHUNKING` (M4). That flag is what lets an HTTP/2
+    /// request stream a body of unknown length **without** the manual chunk
+    /// framing that would otherwise downgrade the request to HTTP/1.1 (M7): with
+    /// it, WinHTTP frames the request body itself. It is a necessary part of the
+    /// duplex recipe (M6) and is only meaningful together with HTTP/2
+    /// negotiation ([`Request::enable_http2`]).
+    ///
+    /// Not every platform accepts the flag. Where it is unsupported,
+    /// `WinHttpOpenRequest` returns an invalid handle and `ERROR_INVALID_PARAMETER`
+    /// (M8); a caller that wants to fall back to manual chunking should probe
+    /// with [`Connection::supports_automatic_chunking`] first, or match that
+    /// error here and reopen without the flag.
+    pub fn open_request_with(
+        &self,
+        verb: &HSTRING,
+        object_name: &HSTRING,
+        accept_types: &[HSTRING],
+        secure: bool,
+        flags: RequestFlags,
+    ) -> Result<Request, Error> {
         // A null-terminated array of pointers, as the API expects. The `HSTRING`
         // values live in the caller's slice for the whole call.
         let mut accept: Vec<PCWSTR> = accept_types.iter().map(wide).collect();
@@ -481,11 +515,14 @@ impl Connection {
             accept.as_mut_ptr()
         };
 
-        let flags = if secure {
+        let mut open_flags = if secure {
             WINHTTP_FLAG_SECURE
         } else {
             WINHTTP_OPEN_REQUEST_FLAGS::default()
         };
+        if flags.automatic_chunking {
+            open_flags |= WINHTTP_OPEN_REQUEST_FLAGS(WINHTTP_FLAG_AUTOMATIC_CHUNKING);
+        }
 
         // SAFETY: every string and the accept array outlive the call.
         let raw = unsafe {
@@ -496,7 +533,7 @@ impl Connection {
                 PCWSTR::null(),
                 PCWSTR::null(),
                 accept_ptr,
-                flags,
+                open_flags,
             )
         };
         if raw.is_null() {
@@ -507,6 +544,67 @@ impl Connection {
 
         Request::arm(handle, Arc::clone(&self.session))
     }
+
+    /// Whether this platform accepts `WINHTTP_FLAG_AUTOMATIC_CHUNKING` (M8).
+    ///
+    /// The probe is exactly Microsoft's own: attempt to open a request with the
+    /// flag and read the outcome. On a platform that supports it the open
+    /// succeeds; on one that does not, `WinHttpOpenRequest` fails with
+    /// `ERROR_INVALID_PARAMETER` (87). Measured on this machine: the flagged
+    /// open succeeds, and a control open *without* the flag succeeds too, so the
+    /// probe is discriminating a capability rather than a broken argument (M4).
+    ///
+    /// The probe opens a throwaway `GET` against `object_name` and closes it
+    /// immediately; it sends nothing. A caller that needs automatic chunking on
+    /// many requests should call this once and cache the answer — the capability
+    /// is a property of the platform, not of a request.
+    ///
+    /// Any error *other* than `ERROR_INVALID_PARAMETER` is reported as-is: a
+    /// probe that failed for an unrelated reason (a bad host, say) must not be
+    /// read as "unsupported".
+    pub fn supports_automatic_chunking(
+        &self,
+        object_name: &HSTRING,
+        secure: bool,
+    ) -> Result<bool, Error> {
+        let verb = HSTRING::from("GET");
+        match self.open_request_with(
+            &verb,
+            object_name,
+            &[],
+            secure,
+            RequestFlags {
+                automatic_chunking: true,
+            },
+        ) {
+            Ok(request) => {
+                // Opened cleanly: supported. Drop closes the throwaway handle.
+                drop(request);
+                Ok(true)
+            }
+            Err(error) => {
+                let invalid = windows::core::HRESULT::from_win32(
+                    windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0,
+                );
+                if error.code() == invalid {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+/// Extra flags for [`Connection::open_request_with`].
+///
+/// Defaults to all-off, which reproduces [`Connection::open_request`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestFlags {
+    /// Ask WinHTTP to frame the request body itself
+    /// (`WINHTTP_FLAG_AUTOMATIC_CHUNKING`). See
+    /// [`Connection::open_request_with`] for why this matters for HTTP/2.
+    pub automatic_chunking: bool,
 }
 
 /// A request, and the only handle transfers happen on.
@@ -643,7 +741,81 @@ impl Request {
         }
     }
 
-    /// Send the request, with an optional header block and an optional body.
+    /// Ask WinHTTP to negotiate HTTP/2 for this request.
+    ///
+    /// Sets `WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL` (133) to
+    /// `WINHTTP_PROTOCOL_FLAG_HTTP2` (1). Must be called before
+    /// [`Request::send`], and only makes sense on a `secure` request — the
+    /// native Windows stacks negotiate HTTP/2 over TLS only, and there is no
+    /// `h2c` (M10). Negotiation is best-effort: if the server does not offer
+    /// HTTP/2 the request proceeds over HTTP/1.1.
+    ///
+    /// For a duplex, non-downgrading HTTP/2 request (the gRPC case) this pairs
+    /// with opening the request via
+    /// [`RequestFlags::automatic_chunking`](RequestFlags): the option asks for
+    /// the protocol, the flag keeps the request body from being framed by hand
+    /// (M7). Note that there is **no** `WinHttpWriteDataEx`/duplex *function*
+    /// (M5); duplex is achieved by *ordering* the receive ahead of the body
+    /// write (M6), which the two-slot request state supports.
+    pub fn enable_http2(&mut self) -> Result<(), Error> {
+        let bytes = WINHTTP_PROTOCOL_FLAG_HTTP2.to_ne_bytes();
+        // SAFETY: the handle is live and the buffer outlives the call.
+        unsafe {
+            WinHttpSetOption(
+                Some(self.handle.as_raw().cast_const()),
+                WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL,
+                Some(&bytes),
+            )
+        }
+    }
+
+    /// Split the request into a writer half and a reader half that can be
+    /// driven **at the same time**.
+    ///
+    /// This is the duplex seam (M6). The writer carries [`RequestWriter::send`]
+    /// and [`RequestWriter::write_data`]; the reader carries
+    /// [`RequestReader::receive_response`],
+    /// [`RequestReader::query_data_available`] and [`RequestReader::read_data`].
+    /// They borrow the same underlying handle but complete against independent
+    /// operation slots (see the request context), so a body write and a
+    /// response receive/read may be outstanding concurrently — which is exactly
+    /// what HTTP/2 duplex needs and what ordinary `&mut self` methods forbid.
+    ///
+    /// The two halves are held for the request's lifetime; polling them
+    /// concurrently (for example with `futures_util::future::join`) drives the
+    /// duplex exchange. Within each half operations remain sequential — one
+    /// write at a time, one read at a time — which is all WinHTTP permits per
+    /// slot.
+    pub fn split(&mut self) -> (RequestWriter<'_>, RequestReader<'_>) {
+        let request: &Request = &*self;
+        (RequestWriter { request }, RequestReader { request })
+    }
+
+    /// The response trailers, as one CRLF-separated block, if the server sent
+    /// any.
+    ///
+    /// Queries `WINHTTP_QUERY_RAW_HEADERS_CRLF` with the
+    /// `WINHTTP_QUERY_FLAG_TRAILERS` (0x0200_0000) modifier (M12), which is how
+    /// WinHTTP exposes HTTP-trailer fields (as gRPC uses for `grpc-status`).
+    /// Trailers only exist once the body has been fully read, so this must be
+    /// called **after** [`Request::query_data_available`] has returned zero.
+    ///
+    /// Returns `Ok(None)` when the response carried no trailers — an ordinary
+    /// answer, not a failure — distinguished from a query error the same way
+    /// [`Request::header`] distinguishes a missing header.
+    pub fn raw_trailers(&self) -> Result<Option<String>, Error> {
+        match self.query_string(
+            WINHTTP_QUERY_RAW_HEADERS_CRLF | WINHTTP_QUERY_FLAG_TRAILERS,
+            PCWSTR::null(),
+        ) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if WinHttpError::from_error(&error) == WinHttpError::HeaderNotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     ///
     /// `headers` is a raw `name: value` block encoded as UTF-16;
     /// [`encode_headers`] builds one. It is taken by value because WinHTTP
@@ -808,6 +980,72 @@ impl Request {
         // This time the length excludes the NUL.
         let elements = (length as usize / 2).min(buffer.len());
         Ok(String::from_utf16_lossy(&buffer[..elements]))
+    }
+}
+
+/// The request-body half of a [`Request`], obtained from [`Request::split`].
+///
+/// Carries [`send`](RequestWriter::send) and
+/// [`write_data`](RequestWriter::write_data). Held alongside a
+/// [`RequestReader`] so that a body write can be in flight at the same time as
+/// a response receive/read — the mechanism behind HTTP/2 duplex (M6). Each
+/// method takes `&mut self`, so within the writer operations stay sequential;
+/// the concurrency is *between* the writer and the reader.
+pub struct RequestWriter<'a> {
+    request: &'a Request,
+}
+
+impl RequestWriter<'_> {
+    /// Send the request, with an optional header block and an optional body.
+    ///
+    /// See [`Request::send`]; this is the same operation, reachable on the
+    /// writer half.
+    pub fn send<B: IoBuf + Send>(
+        &mut self,
+        headers: Option<Vec<u16>>,
+        body: B,
+        total_length: u32,
+    ) -> SendRequest<'_, B> {
+        SendRequest::new(self.request, headers, body, total_length)
+    }
+
+    /// Write one chunk of the request body. See [`Request::write_data`].
+    pub fn write_data<B: IoBuf + Send>(&mut self, buffer: B) -> WriteData<'_, B> {
+        WriteData::new(self.request, buffer)
+    }
+}
+
+/// The response half of a [`Request`], obtained from [`Request::split`].
+///
+/// Carries [`receive_response`](RequestReader::receive_response),
+/// [`query_data_available`](RequestReader::query_data_available) and
+/// [`read_data`](RequestReader::read_data). Held alongside a [`RequestWriter`]
+/// for duplex (M6). Each method takes `&mut self`, so reads stay sequential
+/// within the reader; the concurrency is *between* the reader and the writer.
+pub struct RequestReader<'a> {
+    request: &'a Request,
+}
+
+impl RequestReader<'_> {
+    /// Await the response headers. See [`Request::receive_response`].
+    ///
+    /// In the duplex recipe (M6) this is started **before** the request body is
+    /// written, concurrently with the write loop, because the response can
+    /// arrive with `END_STREAM` on its headers and a body write attempted after
+    /// that would fault the request.
+    pub fn receive_response(&mut self) -> ReceiveResponse<'_> {
+        ReceiveResponse::new(self.request)
+    }
+
+    /// Ask how many body bytes can be read without waiting.
+    /// See [`Request::query_data_available`].
+    pub fn query_data_available(&mut self) -> QueryDataAvailable<'_> {
+        QueryDataAvailable::new(self.request)
+    }
+
+    /// Read body bytes into a caller-owned buffer. See [`Request::read_data`].
+    pub fn read_data<B: IoBufMut + Send>(&mut self, buffer: B) -> ReadData<'_, B> {
+        ReadData::new(self.request, buffer)
     }
 }
 

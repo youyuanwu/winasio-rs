@@ -122,9 +122,15 @@
 //! * **A reply that may not have a body does not get one.** Measured, HTTP.sys
 //!   sends the body of a `HEAD` reply and of a `204` given one; this crate
 //!   suppresses both and never polls a body it will not send.
-//! * **Trailers are not sent and not received.** A request body's trailers
-//!   frame is skipped; neither platform exposes a way to send or read trailers
-//!   through these APIs.
+//! * **Trailers: the client reads them; the HTTP/1.1 server does not send
+//!   them.** On the HTTP/2 client path (see [`h2`]) a response's trailers are
+//!   read after the body ends (`WINHTTP_QUERY_FLAG_TRAILERS`, M12) and yielded
+//!   as a trailers frame — this is what carries gRPC's `grpc-status`. A request
+//!   body's own trailers frame is still skipped, since WinHTTP has no way to
+//!   send request trailers. The server side's response-trailer support is a
+//!   separate concern documented in [`server`]; the older claim that *neither*
+//!   platform can send or read trailers was measured false and is corrected
+//!   here.
 //! * **Nothing is spawned and nothing is swallowed.** The server never creates
 //!   a task or a thread; a service that returns `Err` gets a bodiless `500` on
 //!   the wire and the error is still returned as [`ServeError::Service`].
@@ -156,6 +162,10 @@ mod client;
 /// on any one of them. Every type is also re-exported at the crate root, so the
 /// module path is documentation, not a required import.
 pub mod error;
+/// The HTTP/2 (duplex) client transport, used for gRPC. Public only so its
+/// module documentation — which records the measured duplex recipe — is
+/// rendered; its types are reached through [`Client`].
+pub mod h2;
 mod headers;
 pub mod server;
 mod uri;

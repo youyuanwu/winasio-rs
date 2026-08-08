@@ -60,6 +60,7 @@ fn describe_response_body(error: &ResponseBodyError) -> &'static str {
     match error {
         ResponseBodyError::Truncated { .. } => "truncated",
         ResponseBodyError::Read(_) => "read",
+        ResponseBodyError::Write(_) => "write",
     }
 }
 

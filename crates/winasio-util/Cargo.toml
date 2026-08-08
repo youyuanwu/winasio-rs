@@ -13,6 +13,10 @@ http = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
 tower-service = { workspace = true }
+# Runtime-free concurrency primitives (`select`, `join`, `poll_fn`, `noop_waker`).
+# `default-features = false` keeps this off any async runtime — see the
+# `winasio_util_pulls_in_no_async_runtime` dependency-guard test.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # Deliberately not tokio. The client is runtime-agnostic and the doc examples

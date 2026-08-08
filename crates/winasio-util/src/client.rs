@@ -105,6 +105,7 @@
 //! `ERROR_INVALID_PARAMETER`.)
 
 use std::pin::Pin;
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
 use bytes::Buf;
@@ -115,7 +116,7 @@ use windows::core::HSTRING;
 
 use crate::body::ResponseBody;
 use crate::error::{BodyError, ClientConfigError, ClientConfigStage, RequestError, RequestStage};
-use crate::{headers, uri};
+use crate::{h2, headers, uri};
 
 /// The most this crate will write to the platform in one call.
 ///
@@ -142,6 +143,7 @@ pub struct ClientBuilder {
     timeouts: Option<(i32, i32, i32, i32)>,
     relaxations: CertificateRelaxations,
     platform_redirects: bool,
+    http2: bool,
 }
 
 impl ClientBuilder {
@@ -176,6 +178,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Negotiate HTTP/2 and use the duplex request path (for gRPC).
+    ///
+    /// Off by default, and a deliberate opt-in rather than an automatic
+    /// upgrade: the HTTP/2 path is a different transport — see [`crate::h2`] —
+    /// that streams the request body without the manual chunk framing the
+    /// HTTP/1.1 path uses (which would downgrade h2, M7), starts the response
+    /// receive before the body is fully sent (M6), and reads response trailers
+    /// (M12). It only negotiates h2 over TLS (M10); against an HTTP/1.1-only
+    /// server the request still completes, over HTTP/1.1.
+    ///
+    /// A client left on the default keeps the exact HTTP/1.1 behaviour its
+    /// existing users depend on; nothing about that path changes.
+    pub fn http2(mut self, enable: bool) -> Self {
+        self.http2 = enable;
+        self
+    }
+
     /// Open the session.
     pub fn build(self) -> Result<Client, ClientConfigError> {
         let session = Session::new(&self.agent)
@@ -197,6 +216,8 @@ impl ClientBuilder {
         Ok(Client {
             session: Arc::new(session),
             relaxations: self.relaxations,
+            http2: self.http2,
+            chunking: Arc::new(AtomicU8::new(0)),
         })
     }
 }
@@ -229,6 +250,11 @@ impl ClientBuilder {
 pub struct Client {
     session: Arc<Session>,
     relaxations: CertificateRelaxations,
+    /// Whether requests use the HTTP/2 duplex path (see [`crate::h2`]).
+    http2: bool,
+    /// The cached automatic-chunking capability (M8), shared across clones so
+    /// the platform is probed at most once. `0` unknown, `1` yes, `2` no.
+    chunking: Arc<AtomicU8>,
 }
 
 impl std::fmt::Debug for Client {
@@ -237,6 +263,7 @@ impl std::fmt::Debug for Client {
         // handle value would be noise rather than information.
         f.debug_struct("Client")
             .field("relaxations", &self.relaxations)
+            .field("http2", &self.http2)
             .finish_non_exhaustive()
     }
 }
@@ -254,6 +281,7 @@ impl Client {
             timeouts: None,
             relaxations: CertificateRelaxations::default(),
             platform_redirects: false,
+            http2: false,
         }
     }
 
@@ -278,10 +306,19 @@ impl Client {
         request: HttpRequest<B>,
     ) -> Result<HttpResponse<ResponseBody>, RequestError>
     where
-        B: Body + Unpin,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        B: Body + Send + Unpin + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
     {
         let (parts, body) = request.into_parts();
+
+        // The HTTP/2 duplex path is a separate transport; see `crate::h2`. A
+        // client built without `http2` never reaches it, so its HTTP/1.1
+        // behaviour is untouched.
+        if self.http2 {
+            return h2::request(&self.session, self.relaxations, &self.chunking, parts, body).await;
+        }
+
         let target = uri::decompose(&parts.uri)?;
         let block = headers::encode(&parts.headers)?;
 

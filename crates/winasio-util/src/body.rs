@@ -135,13 +135,40 @@ enum State {
 /// ends is fine and closes the request handle promptly; the bytes that were
 /// still in flight are discarded.
 ///
+/// # Two shapes behind one type
+///
+/// Most responses are the **native** shape: an HTTP/1.1 body read straight off
+/// the WinHTTP handle with the owned-future state machine described in this
+/// module. An HTTP/2 response (the gRPC case) is instead a **boxed** inner body
+/// — see [`crate::h2`] — which also drives the outbound request body and
+/// surfaces response *trailers*. Both are `Response<ResponseBody>` so the
+/// client's return type does not fork; the enum is an implementation detail.
+///
 /// # Truncation
 ///
 /// If the response declared a `Content-Length` and the connection ends before
 /// that many bytes arrive, the final poll yields [`ResponseBodyError::Truncated`]
 /// rather than end-of-stream. A body without a declared length cannot be
-/// checked; see the module documentation.
+/// checked; see the module documentation. (Truncation detection is a property
+/// of the native shape; a boxed HTTP/2 body reports its own end-of-stream.)
 pub struct ResponseBody {
+    repr: Repr,
+}
+
+/// Which of the two body shapes a [`ResponseBody`] is.
+enum Repr {
+    /// Read straight off a WinHTTP handle (the HTTP/1.1 path).
+    Native(Native),
+    /// A boxed inner body that owns its own machinery (the HTTP/2 path).
+    ///
+    /// Kept behind a box so the outer type stays object-safe-free and
+    /// non-generic: the client returns one `ResponseBody` whether the wire was
+    /// HTTP/1.1 or HTTP/2.
+    Boxed(Pin<Box<dyn Body<Data = Bytes, Error = ResponseBodyError> + Send>>),
+}
+
+/// The native (HTTP/1.1) body: an owned-future read loop over a WinHTTP handle.
+struct Native {
     state: State,
     /// How many bytes the response still owes, when it declared a length.
     remaining: Option<u64>,
@@ -153,9 +180,11 @@ impl ResponseBody {
     /// A body that will read from `request` until the platform says stop.
     pub(crate) fn new(request: Request, declared: Option<u64>) -> Self {
         ResponseBody {
-            state: State::Idle(request),
-            remaining: declared,
-            delivered: 0,
+            repr: Repr::Native(Native {
+                state: State::Idle(request),
+                remaining: declared,
+                delivered: 0,
+            }),
         }
     }
 
@@ -170,12 +199,25 @@ impl ResponseBody {
         // reason.
         drop(request);
         ResponseBody {
-            state: State::Finished,
-            remaining: Some(0),
-            delivered: 0,
+            repr: Repr::Native(Native {
+                state: State::Finished,
+                remaining: Some(0),
+                delivered: 0,
+            }),
         }
     }
 
+    /// Wrap an already-built inner body (the HTTP/2 path; see [`crate::h2`]).
+    pub(crate) fn boxed(
+        inner: Pin<Box<dyn Body<Data = Bytes, Error = ResponseBodyError> + Send>>,
+    ) -> Self {
+        ResponseBody {
+            repr: Repr::Boxed(inner),
+        }
+    }
+}
+
+impl Native {
     /// Whether the body owes bytes it is never going to receive.
     fn shortfall(&self) -> Option<ResponseBodyError> {
         match self.remaining {
@@ -186,70 +228,9 @@ impl ResponseBody {
             }),
         }
     }
-}
-
-/// One turn of the platform's two-call read protocol, owning the request.
-///
-/// `Ok(None)` means the platform reported end of body. `Ok(Some(bytes))` is a
-/// non-empty chunk.
-async fn read_once(mut request: Request, cap: Option<u64>) -> Step {
-    let available = match request.query_data_available().await {
-        Ok(available) => available,
-        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
-    };
-    if available == 0 {
-        return (request, Ok(None));
-    }
-
-    // `available` is a lower bound and `read_data` fills what it is given, so
-    // the buffer is the smaller of what is claimed and what latency permits.
-    // A declared remainder caps it further: reading past the declared length
-    // would block waiting for bytes the response promised not to send.
-    let mut wanted = (available as usize).min(MAX_READ);
-    if let Some(remaining) = cap {
-        wanted = wanted.min(remaining.max(1) as usize);
-    }
-
-    let OpResult(read, mut buffer) = request.read_data(Vec::<u8>::with_capacity(wanted)).await;
-    let read = match read {
-        Ok(read) => read,
-        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
-    };
-    buffer.truncate(read);
-    if buffer.is_empty() {
-        // Never observed: the platform reports availability before it reports
-        // data, and a zero-length read after a non-zero availability did not
-        // occur in any measurement. Treated as end of body anyway, because the
-        // alternative is a loop that cannot make progress.
-        return (request, Ok(None));
-    }
-    (request, Ok(Some(buffer)))
-}
-
-impl std::fmt::Debug for ResponseBody {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Hand-written because the boxed future in `Busy` has no `Debug`, and
-        // because a caller debugging a body wants to know how much is left and
-        // whether a read is in flight, not what a handle value is.
-        let state = match self.state {
-            State::Idle(_) => "idle",
-            State::Busy(_) => "reading",
-            State::Finished => "finished",
-        };
-        f.debug_struct("ResponseBody")
-            .field("state", &state)
-            .field("remaining", &self.remaining)
-            .field("delivered", &self.delivered)
-            .finish()
-    }
-}
-
-impl Body for ResponseBody {
-    type Data = Bytes;
-    type Error = ResponseBodyError;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, ResponseBodyError>>> {
         loop {
@@ -330,6 +311,100 @@ impl Body for ResponseBody {
     }
 }
 
+/// One turn of the platform's two-call read protocol, owning the request.
+///
+/// `Ok(None)` means the platform reported end of body. `Ok(Some(bytes))` is a
+/// non-empty chunk.
+async fn read_once(mut request: Request, cap: Option<u64>) -> Step {
+    let available = match request.query_data_available().await {
+        Ok(available) => available,
+        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
+    };
+    if available == 0 {
+        return (request, Ok(None));
+    }
+
+    // `available` is a lower bound and `read_data` fills what it is given, so
+    // the buffer is the smaller of what is claimed and what latency permits.
+    // A declared remainder caps it further: reading past the declared length
+    // would block waiting for bytes the response promised not to send.
+    let mut wanted = (available as usize).min(MAX_READ);
+    if let Some(remaining) = cap {
+        wanted = wanted.min(remaining.max(1) as usize);
+    }
+
+    let OpResult(read, mut buffer) = request.read_data(Vec::<u8>::with_capacity(wanted)).await;
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => return (request, Err(ResponseBodyError::Read(error))),
+    };
+    buffer.truncate(read);
+    if buffer.is_empty() {
+        // Never observed: the platform reports availability before it reports
+        // data, and a zero-length read after a non-zero availability did not
+        // occur in any measurement. Treated as end of body anyway, because the
+        // alternative is a loop that cannot make progress.
+        return (request, Ok(None));
+    }
+    (request, Ok(Some(buffer)))
+}
+
+impl std::fmt::Debug for ResponseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written because the boxed future in `Busy` has no `Debug`, and
+        // because a caller debugging a body wants to know how much is left and
+        // whether a read is in flight, not what a handle value is.
+        match &self.repr {
+            Repr::Native(native) => {
+                let state = match native.state {
+                    State::Idle(_) => "idle",
+                    State::Busy(_) => "reading",
+                    State::Finished => "finished",
+                };
+                f.debug_struct("ResponseBody")
+                    .field("shape", &"native")
+                    .field("state", &state)
+                    .field("remaining", &native.remaining)
+                    .field("delivered", &native.delivered)
+                    .finish()
+            }
+            Repr::Boxed(_) => f
+                .debug_struct("ResponseBody")
+                .field("shape", &"boxed")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Body for ResponseBody {
+    type Data = Bytes;
+    type Error = ResponseBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, ResponseBodyError>>> {
+        match &mut self.repr {
+            Repr::Native(native) => native.poll_frame(context),
+            Repr::Boxed(inner) => inner.as_mut().poll_frame(context),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.repr {
+            Repr::Native(native) => native.is_end_stream(),
+            Repr::Boxed(inner) => inner.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.repr {
+            Repr::Native(native) => native.size_hint(),
+            Repr::Boxed(inner) => inner.size_hint(),
+        }
+    }
+}
+
 /// A body that could not cross a thread boundary would be useless in most of
 /// the places a response goes, and this is where that stops being true
 /// silently.
@@ -346,25 +421,25 @@ mod tests {
     fn a_body_that_cannot_carry_bytes_is_over_before_it_starts() {
         // Constructed without a request, because `empty` is only reachable
         // with one and the assertions here are about the reported shape.
-        let body = ResponseBody {
+        let native = Native {
             state: State::Finished,
             remaining: Some(0),
             delivered: 0,
         };
-        assert!(body.is_end_stream());
-        assert_eq!(body.size_hint().exact(), Some(0));
-        assert!(body.shortfall().is_none());
+        assert!(native.is_end_stream());
+        assert_eq!(native.size_hint().exact(), Some(0));
+        assert!(native.shortfall().is_none());
     }
 
     #[test]
     fn an_undelivered_remainder_is_a_truncation_and_names_both_numbers() {
-        let body = ResponseBody {
+        let native = Native {
             state: State::Finished,
             remaining: Some(7),
             delivered: 3,
         };
         assert!(matches!(
-            body.shortfall(),
+            native.shortfall(),
             Some(ResponseBodyError::Truncated {
                 expected: 10,
                 received: 3
@@ -376,35 +451,35 @@ mod tests {
     fn a_body_of_unknown_length_reports_an_open_hint_and_no_shortfall() {
         // The chunked and close-delimited case: nothing was promised, so
         // nothing can be owed.
-        let body = ResponseBody {
+        let native = Native {
             state: State::Finished,
             remaining: None,
             delivered: 99,
         };
-        assert_eq!(body.size_hint().exact(), None);
-        assert_eq!(body.size_hint().lower(), 0);
-        assert!(body.shortfall().is_none());
+        assert_eq!(native.size_hint().exact(), None);
+        assert_eq!(native.size_hint().lower(), 0);
+        assert!(native.shortfall().is_none());
     }
 
     #[test]
     fn the_size_hint_is_what_the_response_still_owes() {
-        let body = ResponseBody {
+        let native = Native {
             state: State::Finished,
             remaining: Some(4),
             delivered: 6,
         };
-        assert_eq!(body.size_hint().exact(), Some(4));
+        assert_eq!(native.size_hint().exact(), Some(4));
     }
 
     #[test]
     fn a_body_that_still_owes_bytes_is_not_at_end_of_stream() {
         // The `Finished` fixtures above cannot show this, because a finished
         // body is at end of stream whatever it owes. This one is mid-read.
-        let body = ResponseBody {
+        let native = Native {
             state: State::Busy(Box::pin(std::future::pending())),
             remaining: Some(4),
             delivered: 6,
         };
-        assert!(!body.is_end_stream());
+        assert!(!native.is_end_stream());
     }
 }
