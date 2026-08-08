@@ -15,8 +15,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::FileSystem::SetFileCompletionNotificationModes;
 use windows::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus,
-    OVERLAPPED_ENTRY,
+    CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
 
 /// Do not queue a completion packet when an operation succeeds inline.
@@ -84,9 +83,6 @@ const WAIT_TIMEOUT_CODE: u32 = 258;
 
 /// Completion key marking packets that belong to a `winasio` proactor.
 pub(crate) const KEY_OPERATION: usize = 0x7761_7331;
-
-/// Completion key used by the wakeup sentinel.
-pub(crate) const KEY_WAKEUP: usize = 0x7761_7332;
 
 /// Why registering a handle failed.
 ///
@@ -241,14 +237,6 @@ impl CompletionPort {
         skip_notification_on_inline_success(handle)
     }
 
-    /// Post the wakeup sentinel, unblocking a waiting [`CompletionPort::poll`].
-    ///
-    /// The public path is [`Notify`](crate::iocp::Notify), which can cross
-    /// threads; this is the direct form.
-    pub(crate) fn wake(&self) -> Result<()> {
-        unsafe { PostQueuedCompletionStatus(self.handle, 0, KEY_WAKEUP, None) }
-    }
-
     /// Retrieve up to `entries.len()` completions.
     ///
     /// Returns the number written. A timeout yields `Ok(0)`.
@@ -306,19 +294,6 @@ pub(crate) fn entry_result(entry: &OVERLAPPED_ENTRY) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn port_can_be_created_and_woken() {
-        let port = CompletionPort::new().unwrap();
-        port.wake().unwrap();
-
-        let mut entries = [OVERLAPPED_ENTRY::default(); 4];
-        let n = port
-            .poll(&mut entries, Some(Duration::from_millis(500)))
-            .unwrap();
-        assert_eq!(n, 1);
-        assert_eq!(entries[0].lpCompletionKey, KEY_WAKEUP);
-    }
 
     #[test]
     fn poll_times_out_cleanly() {

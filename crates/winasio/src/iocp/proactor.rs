@@ -10,7 +10,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
@@ -21,7 +20,7 @@ use windows::Win32::System::IO::{OVERLAPPED, OVERLAPPED_ENTRY};
 use super::future::Submit;
 use super::op::OpCode;
 use super::port::{
-    entry_result, entry_transferred, CompletionPort, RegistrationError, KEY_OPERATION, KEY_WAKEUP,
+    entry_result, entry_transferred, CompletionPort, RegistrationError, KEY_OPERATION,
 };
 use super::raw::{dispatch_completion_with, ErasedCancel, Key};
 
@@ -47,6 +46,33 @@ const BATCH: usize = 64;
 /// // Fails to compile: a Proactor is bound to the thread that created it.
 /// requires_send(proactor);
 /// ```
+///
+/// # No cross-thread wakeup
+///
+/// There is deliberately no handle that another thread can use to interrupt a
+/// blocked [`poll`](Proactor::poll). This is the single decision that keeps the
+/// proactor free of shared-memory synchronisation: the completion port is owned
+/// outright rather than reference-counted, because nothing else can hold it.
+///
+/// The cost is real and worth stating. `poll(None)` can only be ended by a
+/// completion, so a driver that must respond to anything else — a task made
+/// runnable by another thread, a shutdown request — has to pass a timeout and
+/// accept that latency instead. An earlier version of this type exposed a
+/// `Notify` handle that posted a sentinel packet with `PostQueuedCompletionStatus`
+/// (the Windows analogue of the eventfd that `glommio` polls, or of
+/// `IORING_OP_MSG_RING`); it was removed because it forced the port behind an
+/// `Arc` for a capability no caller in this workspace used.
+///
+/// Note what this does *not* cost. A task woken on the driving thread never
+/// needed the sentinel: the driver polls the future before it waits, so a wake
+/// that happens during a poll is observed on the next turn of the loop without
+/// any packet at all. That is the same reason single-threaded `io_uring`
+/// runtimes drain their ready queue before calling `io_uring_enter`. Only a
+/// *foreign* thread ever had anything to signal.
+///
+/// If a future caller needs one, the sentinel is a few lines to restore — but
+/// the port would go back behind a refcount, so it should be a deliberate
+/// choice rather than a convenience.
 ///
 /// # Driving it
 ///
@@ -75,7 +101,10 @@ pub struct Proactor {
 }
 
 struct ProactorInner {
-    port: Arc<CompletionPort>,
+    /// Owned outright, not shared. Nothing else holds a reference: the proactor
+    /// has no cross-thread wakeup handle, so there is no second owner to
+    /// refcount for. See "No cross-thread wakeup" on [`Proactor`].
+    port: CompletionPort,
     /// Operations in flight, so shutdown can cancel them. Only touched from the
     /// owning thread; completion callbacks never reach it.
     pending: RefCell<HashMap<usize, ErasedCancel>>,
@@ -88,28 +117,12 @@ struct ProactorInner {
     unclaimed: std::cell::Cell<usize>,
 }
 
-/// Wakes a blocked [`Proactor::poll`] from another thread.
-///
-/// Holds a reference to the port, so waking after the proactor is dropped is
-/// harmless rather than a use-after-close.
-#[derive(Clone)]
-pub struct Notify {
-    port: Arc<CompletionPort>,
-}
-
-impl Notify {
-    /// Post the sentinel, so a waiting `poll` returns promptly.
-    pub fn wake(&self) -> Result<()> {
-        self.port.wake()
-    }
-}
-
 impl Proactor {
     /// Create a proactor with its own completion port.
     pub fn new() -> Result<Self> {
         Ok(Proactor {
             inner: ProactorInner {
-                port: Arc::new(CompletionPort::new()?),
+                port: CompletionPort::new()?,
                 pending: RefCell::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-util"))]
                 unclaimed: std::cell::Cell::new(0),
@@ -139,13 +152,6 @@ impl Proactor {
     /// submitting operations for it is unsound. Close it.
     pub fn attach(&self, handle: HANDLE) -> std::result::Result<(), RegistrationError> {
         self.inner.port.attach(handle)
-    }
-
-    /// A handle that can wake a blocked [`Proactor::poll`] from another thread.
-    pub fn notify(&self) -> Notify {
-        Notify {
-            port: Arc::clone(&self.inner.port),
-        }
     }
 
     /// Submit an operation.
@@ -202,7 +208,9 @@ impl Proactor {
     /// Retrieve and dispatch available completions.
     ///
     /// Returns how many were delivered. With `timeout` of `None` this blocks
-    /// until at least one packet arrives or [`Notify::wake`] is called.
+    /// until at least one packet arrives — and, because there is no
+    /// cross-thread wakeup, *only* a completion can end that wait. Pass a
+    /// timeout if the driving thread must stay responsive to anything else.
     pub fn poll(&self, timeout: Option<Duration>) -> Result<usize> {
         self.inner.poll(timeout)
     }
@@ -306,9 +314,6 @@ impl ProactorInner {
         {
             let mut pending = self.pending.borrow_mut();
             for entry in entries.iter().take(count) {
-                if entry.lpCompletionKey == KEY_WAKEUP {
-                    continue;
-                }
                 if entry.lpCompletionKey != KEY_OPERATION {
                     // Not ours; another component may share this port.
                     continue;
@@ -525,38 +530,6 @@ mod tests {
 
         let n = proactor.poll(Some(Duration::from_millis(20))).unwrap();
         assert_eq!(n, 0, "a failed start queues no packet");
-    }
-
-    #[test]
-    fn notify_is_send_and_outlives_the_proactor() {
-        fn is_send<T: Send>() {}
-        is_send::<Notify>();
-
-        let notify = {
-            let proactor = Proactor::new().unwrap();
-            proactor.notify()
-        };
-        // The port is kept alive by the Notify, so this is not a use-after-close.
-        notify.wake().unwrap();
-    }
-
-    #[test]
-    fn notify_wakes_a_blocked_poll() {
-        let proactor = Proactor::new().unwrap();
-        let notify = proactor.notify();
-
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            notify.wake().unwrap();
-        });
-
-        let started = std::time::Instant::now();
-        proactor.poll(Some(Duration::from_secs(10))).unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "poll should return as soon as the sentinel arrives"
-        );
-        handle.join().unwrap();
     }
 
     #[test]
