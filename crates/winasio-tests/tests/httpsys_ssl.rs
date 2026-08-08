@@ -6,25 +6,22 @@
 
 //! Tests for the HTTP.sys SSL certificate binding API (`winasio::httpsys::ssl`).
 //!
-//! The binding table is machine-wide and writing it needs administrator rights,
-//! so this file is split by what a given host can prove:
+//! **Every test here runs unelevated and mutates no machine state.** Writing the
+//! SSL binding table is an administrator-only, machine-wide side effect, so no
+//! test performs it — that is the exclusive job of `scripts/setup-https-test.ps1`
+//! (run deliberately and elevated). These tests exercise only:
 //!
-//! * **Always-on** — error classification, the `#[non_exhaustive]`
-//!   exhaustiveness proof, and a real (unelevated) read of the SSL config table
-//!   via `query_ssl_binding` on an unbound port (C7: reads need no admin). These
-//!   run on any host without setup.
-//! * **Elevation-gated** — the one behavioural test that actually calls the bind
-//!   API. On an unelevated host it asserts the call reports
-//!   [`SslBindError::RequiresElevation`]; on an elevated host it would succeed at
-//!   binding, which the end-to-end suite (`httpsys_tls.rs`) covers, so here it
-//!   just notes that and returns. Either way it never fails for being on the
-//!   "wrong" kind of host.
+//! * **Error classification** — built purely from raw Win32 codes (no syscall,
+//!   no side effect), including the load-bearing proof that `ERROR_ACCESS_DENIED`
+//!   maps to a distinct [`SslBindError::RequiresElevation`], and the
+//!   `#[non_exhaustive]` exhaustiveness proof.
+//! * **The read path** — a real (unelevated) `query_ssl_binding` of the SSL
+//!   config table on an unbound port (C7: reads need no admin). Read-only, so it
+//!   behaves identically whether or not the process is elevated.
 //!
-//! This binary installs no certificate and, on the unelevated path, writes
-//! nothing that persists: a refused bind changes no machine state. The
-//! certificate itself is provisioned out-of-process by
-//! `scripts/setup-https-test.ps1` (see `httpsys_tls.rs`), so nothing here
-//! generates or installs one.
+//! No test's outcome depends on the process's privilege level, and none installs
+//! a certificate or binds a port. The certificate is provisioned out-of-process
+//! by `scripts/setup-https-test.ps1` (see `httpsys_tls.rs`).
 
 #![cfg(windows)]
 
@@ -32,22 +29,16 @@ mod common;
 
 use std::net::SocketAddr;
 
-use common::is_elevated;
 use winasio::httpsys::{
-    bind_ssl_certificate, query_ssl_binding, HttpInitializer, SslBindError, SSL_BINDING_APP_ID,
-    THUMBPRINT_LEN,
+    query_ssl_binding, HttpInitializer, SslBindError, SSL_BINDING_APP_ID, THUMBPRINT_LEN,
 };
 use windows::core::Error;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND};
 
-/// This binary owns 12490..=12492 for its throwaway bind attempt, inside the
-/// TLS range reserved in the plan and disjoint from the e2e port in
-/// `httpsys_tls.rs`.
-const PORT_ELEVATION_PROBE: u16 = 12490;
-
 /// A never-bound port this binary reads back through `query_ssl_binding` to
-/// prove the read path is unelevated (C7). Distinct from the bind probe so a
-/// stray elevated `add` on one cannot perturb the other.
+/// prove the read path is unelevated (C7). Inside the TLS range reserved in the
+/// plan and disjoint from the e2e port in `httpsys_tls.rs`. Nothing here ever
+/// *binds* a port — see the note where the bind test used to live.
 const PORT_QUERY_PROBE: u16 = 12491;
 
 fn win32_error(code: windows::Win32::Foundation::WIN32_ERROR) -> Error {
@@ -150,42 +141,17 @@ fn query_unbound_port_reads_none_unelevated() {
 }
 
 // ---------------------------------------------------------------------------
-// Elevation-gated: the real bind path classifies elevation correctly
+// No behavioural bind test lives here by design.
+//
+// Binding (`HttpSetServiceConfiguration`) is a mutating, machine-wide,
+// administrator-only operation. A test that *attempts* it is unsafe on two
+// counts: its outcome would depend on whether the test process happens to be
+// elevated (dev machine: no, GitHub runners: yes), and on an elevated host it
+// would leave a real, persistent SSL binding behind as a side effect — exactly
+// the machine-hygiene failure R2 exists to prevent. So creating and removing
+// that global state is the *exclusive* job of `scripts/setup-https-test.ps1`,
+// run deliberately and elevated by a human or CI. The `RequiresElevation`
+// classification is proved purely above (`access_denied_maps_to_requires_elevation`)
+// by building the error from a raw code — deterministic in every environment,
+// no syscall, no side effect.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn bind_without_elevation_reports_requires_elevation() {
-    // Proves the *real* API call — not just the `From` impl — classifies the
-    // unelevated failure as `RequiresElevation`, which is what the e2e suite's
-    // skip gate depends on. On an elevated host binding a throwaway thumbprint
-    // would instead succeed (covered end-to-end elsewhere), so we skip.
-    if is_elevated() {
-        eprintln!(
-            "HTTPS_TLS_TEST: SKIPPED (elevated host; unelevated-bind classification not applicable) \
-             test=bind_without_elevation_reports_requires_elevation"
-        );
-        return;
-    }
-
-    // Precondition: a live initializer must exist before touching the config
-    // subsystem (see the ssl module docs).
-    let _http = HttpInitializer::new().expect("HTTP.sys initialises");
-    let endpoint: SocketAddr = format!("0.0.0.0:{PORT_ELEVATION_PROBE}")
-        .parse()
-        .expect("a valid endpoint");
-    let thumbprint = [0u8; THUMBPRINT_LEN];
-
-    let result = bind_ssl_certificate(endpoint, &thumbprint, "MY", SSL_BINDING_APP_ID);
-    match result {
-        Err(SslBindError::RequiresElevation) => {
-            eprintln!(
-                "HTTPS_TLS_TEST: RAN (unelevated; real bind correctly reported RequiresElevation) \
-                 test=bind_without_elevation_reports_requires_elevation"
-            );
-        }
-        other => panic!(
-            "expected RequiresElevation from an unelevated real bind, got {other:?} \
-             (if this host is actually elevated, is_elevated() misreported)"
-        ),
-    }
-}

@@ -304,58 +304,6 @@ pub fn parse_response(raw: &[u8]) -> (String, Vec<(String, String)>, Vec<u8>) {
     (status, headers, body)
 }
 
-/// Whether this process is running with an elevated (administrator) token.
-///
-/// The HTTPS test path writes machine-wide state — the HTTP.sys SSL certificate
-/// table and the `LocalMachine\My` certificate store — both of which require
-/// administrator rights (measured: unelevated, the store open fails
-/// `ERROR_ACCESS_DENIED` and machine-key creation fails `NTE_PERM`). Tests use
-/// this as the skip gate rather than keying on any one step's failure code,
-/// because *which* step fails first is an implementation detail and an
-/// unelevated run must skip, never fail.
-///
-/// Implemented with `CheckTokenMembership` against the built-in Administrators
-/// alias, the same check `IsUserAnAdmin` performs. This reflects membership in
-/// the *effective* token, so it reports `false` under a filtered (non-elevated)
-/// token even for a member of the Administrators group — which is exactly the
-/// "am I allowed to write machine state right now" question the tests need.
-pub fn is_elevated() -> bool {
-    use windows::core::BOOL;
-    use windows::Win32::Security::{
-        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, PSID, SECURITY_NT_AUTHORITY,
-    };
-
-    // From <winnt.h>; not re-exported under the features this crate enables, so
-    // named here to avoid pulling `Win32_System_SystemServices` for two ints.
-    const SECURITY_BUILTIN_DOMAIN_RID: u32 = 32;
-    const DOMAIN_ALIAS_RID_ADMINS: u32 = 544;
-
-    // SAFETY: `authority` outlives the allocate call; on success `admins` is a
-    // valid SID freed exactly once below; `CheckTokenMembership(None, ..)` uses
-    // the current effective token and writes a `BOOL` we own.
-    unsafe {
-        let authority = SECURITY_NT_AUTHORITY;
-        let mut admins = PSID::default();
-        if AllocateAndInitializeSid(
-            &authority,
-            2,
-            SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            &mut admins,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        let mut is_member = BOOL::default();
-        let checked = CheckTokenMembership(None, admins, &mut is_member);
-        FreeSid(admins);
-        checked.is_ok() && is_member.as_bool()
-    }
-}
+// An `is_elevated` helper was removed with the bind test it served: no test
+// keys behavior on the process's privilege level. Detection of the HTTPS
+// binding is done by reading the SSL table — see `httpsys_tls.rs`.
