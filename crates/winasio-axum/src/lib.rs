@@ -123,6 +123,25 @@
 //! - **Shutdown is abrupt.** [`serve`] returns without draining in-flight work;
 //!   a [`ThreadPerRequest`] task (and its observer callback) may still run after
 //!   `serve` returns. A caller needing "all work finished" must coordinate it.
+//! - **Shutdown is observed between accepts, and readiness has priority.** The
+//!   loop notices a closed queue only at an accept point, and each accept is
+//!   preceded by the `poll_ready` gate (backpressure: a request is not pulled
+//!   while the service is unready). A service that never becomes ready therefore
+//!   parks the loop in that gate, and a concurrent queue-close is not observed
+//!   until readiness resolves. A realistic `axum::Router` is always ready, so
+//!   this affects only pathological always-unready services; it is the direct,
+//!   measured consequence of preserving `poll_ready` backpressure.
+//! - **The serve future is not `Send`.** It borrows the `Server` and is meant to
+//!   be driven on the caller's own thread (`block_on`) or awaited in the
+//!   caller's runtime — not spawned onto a work-stealing runtime. Parallelism
+//!   across requests comes from the [`Executor`], not from spawning the loop
+//!   itself; a caller needing the loop on another thread should move the
+//!   `Server` there and drive it locally.
+//! - **There is no built-in admission cap.** With an always-ready service,
+//!   [`ThreadPerRequest`] spawns one thread per in-flight request and
+//!   [`CurrentThread`]'s in-flight set grows unbounded. Bound concurrency with a
+//!   service-level limit (for example a `tower` concurrency layer) whose
+//!   `poll_ready` gates admission through the loop's readiness gate.
 
 // Re-exported so downstream code can name the exact `axum` this crate builds on,
 // and to anchor the normal (runtime-free) `axum` dependency and its version,

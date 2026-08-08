@@ -370,7 +370,11 @@ let app = axum::Router::new().route("/axum/greet", axum::routing::get(|| async {
 
 // No runtime anywhere: `block_on` is a bare single-threaded executor and
 // `CurrentThread` drives many in-flight requests on it, spawning nothing.
-futures::executor::block_on(serve(&server, app, CurrentThread::new()))?;
+// `serve` returns a `Serve`, which is `IntoFuture` (not `Future`), so it is
+// awaited inside the `block_on`ed async block.
+futures::executor::block_on(async {
+    serve(&server, app, CurrentThread::new()).await
+})?;
 ```
 
 **Concurrency is a trait the caller supplies.** `Executor<Fut>` has the shape of
