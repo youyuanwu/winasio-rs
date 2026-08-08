@@ -230,12 +230,22 @@ fn thumb_hex(thumbprint: &[u8; THUMBPRINT_LEN]) -> String {
 ///
 /// Emitted as greppable `HTTPS_TLS_TEST: DIAG ...` lines (R1).
 fn diagnose_private_key(thumbprint: &[u8; THUMBPRINT_LEN]) {
-    let hex = thumb_hex(thumbprint);
+    // The crate's own view of its machine store, via the same `CertOpenStore`
+    // path `create`/`sweep_leftovers` use. Comparing this against PowerShell's
+    // view distinguishes "cert never persisted" from "persisted somewhere the
+    // machine store readers don't see".
+    let crate_view = winasio::httpsys::cert_present(thumbprint, CertStore::LocalMachine);
+    eprintln!("HTTPS_TLS_TEST: DIAG crate_cert_present(LocalMachine\\My)={crate_view}");
+
+    // Uppercase hex is the form the `Cert:` PSDrive path expects.
+    let hex_upper: String = thumbprint.iter().map(|b| format!("{b:02X}")).collect();
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         $c = Get-Item Cert:\\LocalMachine\\My\\{hex}; \
-         if ($null -eq $c) {{ 'cert-not-found'; return }}; \
-         'HasPrivateKey=' + $c.HasPrivateKey; \
+         $all = @(Get-ChildItem Cert:\\LocalMachine\\My); \
+         'LM_My_count=' + $all.Count; \
+         $c = $all | Where-Object {{ $_.Thumbprint -eq '{hex_upper}' }} | Select-Object -First 1; \
+         if ($null -eq $c) {{ 'ps_cert_found=false'; return }}; \
+         'ps_cert_found=true HasPrivateKey=' + $c.HasPrivateKey; \
          try {{ \
            $k = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($c); \
            if ($null -ne $k) {{ 'Acquire=OK KeySize=' + $k.KeySize }} else {{ 'Acquire=null' }} \
