@@ -41,10 +41,11 @@ jobs:
     # the e2e tests genuinely run rather than silently skipping into a green run.
     # If provisioning ever legitimately cannot bind on a runner, that must be
     # surfaced and diagnosed here, not masked. The runner VM is ephemeral, so no
-    # teardown is needed.
+    # teardown is needed. `-NoElevate`: the runner is already elevated, and this
+    # guarantees the script never attempts an interactive UAC prompt in CI.
     - name: Provision HTTPS test binding
       shell: pwsh
-      run: ./scripts/setup-https-test.ps1
+      run: ./scripts/setup-https-test.ps1 -NoElevate
 
     - name: Run cargo check
       run: cargo check --workspace --all-targets --all-features

@@ -27,12 +27,27 @@ license information.
     of truth, `https-test-config.ps1`, which the Rust tests parse too, so the
     two sides cannot drift.
 
+    Elevation: when run interactively without administrator rights, the script
+    relaunches itself elevated and Windows shows a UAC prompt for you to approve.
+    In a non-interactive context, or with `-NoElevate` (which CI passes), it does
+    NOT prompt and instead fails loudly with a non-zero exit code so a hard CI
+    gate surfaces the problem rather than hanging.
+
 .PARAMETER Uninstall
     Remove the binding, the certificate, and its CNG key container. Leaving
     global machine state behind is unacceptable, so teardown is first-class.
 
+.PARAMETER NoElevate
+    Do not attempt to self-elevate via UAC; if not already elevated, fail loudly
+    with exit code 1. Set automatically on the elevated relaunch to avoid a UAC
+    loop, and passed by CI so a headless runner never blocks on a prompt.
+
 .EXAMPLE
-    # From an elevated PowerShell, once per machine:
+    # Interactively, from a NON-elevated PowerShell: approve the UAC prompt.
+    pwsh -File scripts/setup-https-test.ps1
+
+.EXAMPLE
+    # From an already-elevated PowerShell (no prompt), once per machine:
     pwsh -File scripts/setup-https-test.ps1
 
 .EXAMPLE
@@ -41,7 +56,13 @@ license information.
 #>
 [CmdletBinding()]
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+
+    # Internal / CI guard. Set automatically when this script relaunches itself
+    # elevated (to prevent a UAC loop), and passed explicitly by CI to force the
+    # deterministic loud-fail path instead of attempting an interactive UAC
+    # prompt on a headless runner (which would fail or hang).
+    [switch]$NoElevate
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,14 +70,23 @@ $ErrorActionPreference = 'Stop'
 # --- Single source of truth: port / AppId / subject / friendly name ----------
 . "$PSScriptRoot\https-test-config.ps1"
 
-# --- Elevation gate: fail loudly and clearly when not administrator ----------
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    # Write to stderr WITHOUT throwing (Write-Error under -Stop would abort
-    # before the explicit non-zero exit below), so the exit code is deterministic
-    # for a caller that scripts on top of this.
-    [Console]::Error.WriteLine(@"
+# --- Elevation: self-elevate via UAC when interactive, else fail loudly ------
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Test-IsAdministrator)) {
+    # Never attempt an interactive UAC prompt when we were told not to
+    # (`-NoElevate`, e.g. from CI) or when there is no interactive desktop to
+    # show the prompt on. In those cases fail loudly and deterministically so a
+    # hard CI gate surfaces the problem rather than hanging.
+    if ($NoElevate -or -not [Environment]::UserInteractive) {
+        # Write to stderr WITHOUT throwing (Write-Error under -Stop would abort
+        # before the explicit non-zero exit below), so the exit code is
+        # deterministic for a caller that scripts on top of this.
+        [Console]::Error.WriteLine(@"
 ERROR: This script configures machine-wide state (an HTTP.sys SSL binding and a
 LocalMachine\My certificate) and REQUIRES administrator rights.
 
@@ -64,7 +94,37 @@ Re-run it from an elevated PowerShell:
     Start an *Administrator* PowerShell, then:
     pwsh -File scripts/setup-https-test.ps1
 "@)
-    exit 1
+        exit 1
+    }
+
+    # Interactive: relaunch this exact script elevated. Windows shows a UAC
+    # prompt the user approves (or declines). Relaunch with the same host
+    # (pwsh.exe or powershell.exe), `-NoElevate` to break any loop, and forward
+    # `-Uninstall` if set.
+    $hostExe = (Get-Process -Id $PID).Path
+    if ([string]::IsNullOrWhiteSpace($hostExe)) { $hostExe = 'pwsh' }
+    $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-NoElevate')
+    if ($Uninstall) { $childArgs += '-Uninstall' }
+
+    Write-Host "This step needs administrator rights. A Windows UAC prompt will appear -- approve it to continue."
+    try {
+        $proc = Start-Process -FilePath $hostExe -ArgumentList $childArgs -Verb RunAs -Wait -PassThru
+    } catch {
+        [Console]::Error.WriteLine("ERROR: elevation was declined or could not start: $($_.Exception.Message)")
+        exit 1
+    }
+
+    $code = $proc.ExitCode
+    if ($code -eq 0 -and -not $Uninstall) {
+        # The elevated child ran in its own window that has now closed; show the
+        # result here using a read that is permitted UNELEVATED (C7).
+        Write-Host ""
+        Write-Host "Elevated provisioning completed. Current SSL binding (read unelevated):"
+        netsh http show sslcert ipport=("0.0.0.0:$HttpsTestPort") 2>&1 | Write-Host
+    } elseif ($code -ne 0) {
+        [Console]::Error.WriteLine("The elevated setup process exited with code $code.")
+    }
+    exit $code
 }
 
 $ipports = @("0.0.0.0:$HttpsTestPort", "[::]:$HttpsTestPort")

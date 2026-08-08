@@ -98,20 +98,20 @@ otherwise leaves to `netsh http add sslcert`.
 Because binding a certificate is a machine-wide, administrator-only operation,
 the end-to-end HTTPS tests do **not** bind anything themselves. Provisioning is a
 one-time, out-of-process step: run
-[`scripts/setup-https-test.ps1`](./scripts/setup-https-test.ps1) **from an
-elevated PowerShell** once per machine. It generates a self-signed `localhost`
-certificate (with a `DNS:localhost` SAN) into `LocalMachine\My` and binds it to a
-fixed port:
+[`scripts/setup-https-test.ps1`](./scripts/setup-https-test.ps1) once per
+machine. It generates a self-signed `localhost` certificate (with a
+`DNS:localhost` SAN) into `LocalMachine\My` and binds it to a fixed port:
 
 ```powershell
-# once, elevated:
+# once; run from an ordinary PowerShell -- the script self-elevates and Windows
+# shows a UAC prompt to approve. (Already elevated? It just runs, no prompt.)
 pwsh -File scripts/setup-https-test.ps1
 ```
 
 The tests then run **unelevated** (`cargo test`): they detect the binding and, if
 it is absent, skip with a greppable `HTTPS_TLS_TEST: SKIPPED` line rather than
 failing. Tear the machine state down completely — binding, certificate and CNG
-key container — with:
+key container — with (this also self-elevates):
 
 ```powershell
 pwsh -File scripts/setup-https-test.ps1 -Uninstall
