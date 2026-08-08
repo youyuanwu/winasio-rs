@@ -47,6 +47,16 @@
 //! suite already relies on. So the only privileged step is the one moved to the
 //! setup script; the request path here is fully unprivileged.
 //!
+//! **Invariant/obligation (R6):** these tests MUST register `localhost` URLs
+//! only. The unelevated success above comes from HTTP.sys's built-in allowance
+//! for the `localhost` hostname, not from any URL ACL (measured: there are no
+//! `urlacl` entries for `localhost`, yet `https://localhost:PORT/` registers
+//! `rc=0` unelevated, while the wildcard `https://+:PORT/` fails `rc=5`
+//! ACCESS_DENIED). Switching the prefix to `+`, `*`, or a machine name would
+//! silently require administrator rights and turn this whole suite into a silent
+//! skip — so the host is pinned to `localhost` at the one construction site
+//! below, and must stay that way.
+//!
 //! # Serialisation
 //!
 //! An HTTP.sys SSL binding is keyed by `ip:port` and is machine-global, and only
@@ -156,7 +166,8 @@ fn thumb_hex(thumbprint: &[u8; THUMBPRINT_LEN]) -> String {
 
 /// Build the one-shot HTTP.sys server for the environment, listening on
 /// `https://localhost:{port}/tls/`. Registering the prefix needs no elevation
-/// (R6).
+/// (R6) — but ONLY because the host is `localhost`; `+`/`*`/a machine name would
+/// silently require admin (see the module-level R6 invariant), so keep it here.
 fn build_server(env: &HttpsEnv) -> Server<'_> {
     Server::builder(env.session())
         .url(&format!("https://localhost:{}/tls/", env.port))
