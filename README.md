@@ -100,6 +100,17 @@ on drop. See [`httpsys_tls.rs`](./crates/winasio-tests/tests/httpsys_tls.rs) for
 an end-to-end WinHTTP-over-HTTPS test, paired with a negative control that
 confirms an unrelaxed client rejects the self-signed certificate.
 
+> **Measured CI caveat.** On the standard GitHub-hosted Windows runner the e2e
+> binding cannot be completed: although the runner is elevated and the cert's
+> private key is acquirable in-process, both `HttpSetServiceConfiguration` *and*
+> Microsoft's own `netsh http add sslcert` fail with
+> `ERROR_NO_SUCH_LOGON_SESSION (1312)` when HTTP.sys's `SYSTEM` context tries to
+> open the CNG machine key. Because the reference tool fails identically, this
+> is a runner-environment limitation rather than a defect in this crate. The
+> tests detect it, print a greppable `HTTPS_TLS_TEST: BIND_UNPROVEN` line, and
+> report the roundtrip as not proven on that runner instead of masking it; on an
+> interactive elevated host the full roundtrip runs.
+
 # Fs
 Safe asynchronous file I/O on top of the IOCP layer. Files are opened for
 overlapped I/O, registered immediately, and expose positional reads, writes, and

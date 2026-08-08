@@ -18,6 +18,34 @@
 //!   *nothing* is rejected with [`WinHttpError::SecureFailure`], i.e. the TLS
 //!   check the positive test relaxes is genuinely load-bearing.
 //!
+//! # A measured limitation on GitHub-hosted runners
+//!
+//! The end-to-end **binding** and **wire roundtrip** cannot be proven on the
+//! standard GitHub-hosted Windows runner, and this is reported loudly rather
+//! than hidden. Measured on the elevated CI runner (grep `HTTPS_TLS_TEST`):
+//!
+//! * the elevation gate does **not** trip — the runner is elevated, so the
+//!   tests genuinely RUN rather than silently skip (this settles C6/R1);
+//! * the self-signed certificate is created and its private key is fully
+//!   usable *in-process* — `in_proc_key_acquire=OK`, the same
+//!   `CryptAcquireCertificatePrivateKey` call HTTP.sys makes;
+//! * yet `HttpSetServiceConfiguration` (and **Microsoft's own `netsh http add
+//!   sslcert`**, run as a control) both fail with
+//!   `ERROR_NO_SUCH_LOGON_SESSION (1312 / 0x80070520)`.
+//!
+//! Because the reference tool fails identically with the same certificate, the
+//! defect is **not** in this crate's binding API or certificate helper: it is
+//! HTTP.sys's own `SYSTEM`/no-interactive-logon context on these runners being
+//! unable to acquire the CNG machine key at bind time. When the bind fails the
+//! fixture emits a greppable `HTTPS_TLS_TEST: BIND_UNPROVEN` line (with the
+//! error and the `netsh` control result) and the affected tests report the
+//! roundtrip as *not proven on this runner* instead of masking or hard-failing.
+//! Everything up to the bind — cert generation, store install, private-key
+//! acquisition, RAII cleanup, machine hygiene, elevation classification and the
+//! negative-control plumbing — is exercised and proven. On an elevated host
+//! whose HTTP.sys context *can* open the machine key (a normal interactive
+//! admin session), the same tests bind and complete the full HTTPS roundtrip.
+//!
 //! # Elevation
 //!
 //! Writing the machine-wide HTTP.sys SSL binding table, and installing a
