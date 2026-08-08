@@ -245,6 +245,17 @@ impl ServerSession {
             _initializer: initializer,
         })
     }
+
+    /// Whether HTTP.sys can send HTTP/2 response trailers on this host (M3).
+    ///
+    /// Delegates to [`HttpInitializer::supports_response_trailers`]; holding a
+    /// `ServerSession` proves the subsystem is initialised, which is the
+    /// precondition that call has (a pre-init query is a false negative). Used
+    /// to gate the trailer-capable response path — see
+    /// [`Responder::send_streaming`].
+    pub fn supports_response_trailers(&self) -> bool {
+        self._initializer.supports_response_trailers()
+    }
 }
 
 impl std::fmt::Debug for ServerSession {
@@ -310,6 +321,7 @@ impl<'a> ServerBuilder<'a> {
         Ok(Server {
             _group: group,
             queue: Arc::new(queue),
+            trailers_supported: self.session.supports_response_trailers(),
         })
     }
 }
@@ -323,6 +335,10 @@ pub struct Server<'a, S: Backend = ThreadPoolIo> {
     /// new connections here.
     _group: UrlGroup<'a>,
     queue: Arc<RequestQueue<S>>,
+    /// Whether the host can send HTTP/2 response trailers (M3), queried once at
+    /// build time and copied into each [`Responder`] so the trailer-capable
+    /// path can be gated without re-probing per request.
+    trailers_supported: bool,
 }
 
 impl<S: Backend> std::fmt::Debug for Server<'_, S> {
@@ -409,7 +425,7 @@ impl<S: Backend> Server<'_, S> {
             }
         };
         let id = request.id();
-        match Accepted::from_platform(Arc::clone(&self.queue), request) {
+        match Accepted::from_platform(Arc::clone(&self.queue), request, self.trailers_supported) {
             Ok(accepted) => Ok(accepted),
             Err(error) => {
                 // The request has already left the kernel queue, so nothing else
@@ -423,6 +439,7 @@ impl<S: Backend> Server<'_, S> {
                     queue: Arc::clone(&self.queue),
                     id,
                     method: http::Method::GET,
+                    trailers_supported: self.trailers_supported,
                 };
                 let _ = responder.send_status(StatusCode::BAD_REQUEST).await;
                 Err(error)
@@ -564,6 +581,7 @@ impl<S: Backend> Accepted<S> {
     fn from_platform(
         queue: Arc<RequestQueue<S>>,
         request: Request,
+        trailers_supported: bool,
     ) -> Result<Accepted<S>, AcceptError> {
         let head = head::to_http(&request)?;
         let declared = crate::headers::content_length(&head.headers);
@@ -578,6 +596,7 @@ impl<S: Backend> Accepted<S> {
             queue,
             id: request.id(),
             method: head.method.clone(),
+            trailers_supported,
         };
 
         let mut builder = HttpRequest::builder()
@@ -644,6 +663,10 @@ pub struct Responder<S: Backend = ThreadPoolIo> {
     /// Kept because the framing rules depend on it: a `HEAD` reply declares a
     /// length and sends no body.
     method: http::Method,
+    /// Whether the host can send HTTP/2 response trailers (M3). Copied from the
+    /// [`Server`] so [`send_streaming`](Self::send_streaming) can gate the
+    /// trailer chunk without re-probing per request.
+    trailers_supported: bool,
 }
 
 impl<S: Backend> std::fmt::Debug for Responder<S> {
@@ -685,6 +708,98 @@ impl<S: Backend> Responder<S> {
     {
         let (parts, body) = response.into_parts();
         self.send_parts(parts.status, &parts.headers, body).await
+    }
+
+    /// Send a response as raw HTTP/2 DATA frames, ending with trailers (M3).
+    ///
+    /// This is the gRPC-shaped path, and it is deliberately **not**
+    /// [`send`](Self::send). `send` chooses framing from the body's size hint:
+    /// a known length takes a `Content-Length` fast path that ends the response
+    /// with the body, and an unknown length takes `Transfer-Encoding: chunked`
+    /// framed by hand. Both are wrong for gRPC:
+    ///
+    /// * The `Content-Length` fast path terminates before trailers, so the
+    ///   `grpc-status` trailer a unary reply carries would be dropped.
+    /// * Manual chunked framing downgrades the connection to HTTP/1.1 —
+    ///   measured by Microsoft's own `WinHttpHandler` on the client half (M7),
+    ///   and the same rule holds for a hand-framed body on the server half.
+    ///   gRPC requires HTTP/2.
+    ///
+    /// So this method takes neither branch. It sends the head with more data to
+    /// follow, writes each body data frame **raw** (HTTP.sys wraps it in an
+    /// HTTP/2 DATA frame itself — no `Content-Length`, no `Transfer-Encoding`,
+    /// no hand framing), and terminates with the body's trailers as an HTTP/2
+    /// trailers frame via [`RequestQueue::send_trailers`](crate).
+    ///
+    /// The caller selects this path **explicitly** rather than by sniffing the
+    /// request version. Sniffing would be circular: the M2 defect meant an
+    /// HTTP/2 request was mis-read as HTTP/1.1, and a framing choice hung off
+    /// that read would inherit the bug. `winasio-tonic` knows it is speaking
+    /// gRPC and asks for this framing outright.
+    ///
+    /// # Trailer support
+    ///
+    /// If the host cannot send trailers ([`ServerSession::supports_response_trailers`]
+    /// is `false` — old HTTP.sys), the body is still streamed but its trailers
+    /// are dropped and the response is ended with an empty terminal frame. A
+    /// gRPC peer reads that as a missing `grpc-status`; there is no way to
+    /// deliver one on a host that cannot frame trailers, so the honest outcome
+    /// is to send what can be sent rather than fail a response that is otherwise
+    /// complete. On Windows 11 / Server 2022+ trailers are supported (M3).
+    pub async fn send_streaming<B>(self, response: HttpResponse<B>) -> Result<(), ResponseError>
+    where
+        B: Body,
+        B::Data: Buf,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let (parts, body) = response.into_parts();
+        let reply = head::from_http(parts.status, &parts.headers)?;
+
+        // Head first, with more data to follow. No length and no encoding are
+        // declared: HTTP.sys frames an HTTP/2 response body itself once the head
+        // says nothing about framing, which is exactly what gRPC needs.
+        let OpResult(sent, _) = self.queue.send_partial(self.id, reply).await;
+        sent.map_err(ResponseError::send(SendStage::Head))?;
+
+        let mut body = std::pin::pin!(body);
+        let mut trailers: Option<HeaderMap> = None;
+        loop {
+            match next_frame(body.as_mut()).await? {
+                Some(Frame::Data(bytes)) => {
+                    // Raw, un-framed. `write` never marks this last: the response
+                    // is closed by the trailers frame (or the empty terminal
+                    // frame below), never by a body chunk.
+                    if !bytes.is_empty() {
+                        self.write(bytes, false).await?;
+                    }
+                }
+                Some(Frame::Trailers(map)) => {
+                    // http_body yields trailers as the final frame; fold in case
+                    // a body somehow produces more than one map.
+                    trailers = Some(match trailers {
+                        Some(mut existing) => {
+                            existing.extend(map);
+                            existing
+                        }
+                        None => map,
+                    });
+                }
+                None => break,
+            }
+        }
+
+        match trailers {
+            Some(map) if self.trailers_supported && !map.is_empty() => {
+                let pairs = encode_trailers(&map);
+                let OpResult(sent, _) = self.queue.send_trailers(self.id, pairs).await;
+                sent.map_err(ResponseError::send(SendStage::Trailers))?;
+                Ok(())
+            }
+            _ => {
+                // No trailers, or a host that cannot frame them: end the body.
+                self.write(Vec::new(), true).await
+            }
+        }
     }
 
     /// Run a service's future and put whatever it produced on the wire.
@@ -930,9 +1045,12 @@ enum Framing {
 
 /// The next data frame of a body, skipping trailers.
 ///
-/// Trailers are dropped: HTTP.sys offers no way to send them, and a frame that
-/// cannot be sent is better dropped than reported as a failure of a response
-/// that is otherwise fine.
+/// Trailers are dropped here because the size-hint framing path
+/// ([`Responder::send`]) has no way to place them: a `Content-Length` response
+/// is already closed by its body, and a hand-framed chunked response would have
+/// to downgrade to HTTP/1.1 to carry them (M7). The trailer-capable path is
+/// [`Responder::send_streaming`], which uses [`next_frame`] instead and sends
+/// trailers as a real HTTP/2 trailers frame (M3, M14).
 async fn next_chunk<B>(mut body: std::pin::Pin<&mut B>) -> Result<Option<Vec<u8>>, BodyError>
 where
     B: Body,
@@ -959,6 +1077,61 @@ where
             Err(_trailers) => continue,
         }
     }
+}
+
+/// One frame of a body, preserving trailers.
+///
+/// Unlike [`next_chunk`], this keeps trailer frames so [`Responder::send_streaming`]
+/// can end an HTTP/2 response with them (M3). Empty data frames are still
+/// skipped — they carry nothing and are not an end-of-body signal.
+enum Frame {
+    /// A non-empty body data frame.
+    Data(Vec<u8>),
+    /// A trailers frame (HTTP/2 trailing header block).
+    Trailers(HeaderMap),
+}
+
+/// The next data or trailers frame of a body, skipping empty data frames.
+async fn next_frame<B>(mut body: std::pin::Pin<&mut B>) -> Result<Option<Frame>, BodyError>
+where
+    B: Body,
+    B::Data: Buf,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    loop {
+        let frame = std::future::poll_fn(|context| body.as_mut().poll_frame(context)).await;
+        let Some(frame) = frame else {
+            return Ok(None);
+        };
+        let frame = frame.map_err(|error| BodyError::Source(error.into()))?;
+        match frame.into_data() {
+            Ok(mut data) => {
+                let bytes = data.copy_to_bytes(data.remaining());
+                if bytes.is_empty() {
+                    continue;
+                }
+                return Ok(Some(Frame::Data(bytes.to_vec())));
+            }
+            Err(frame) => match frame.into_trailers() {
+                Ok(map) => return Ok(Some(Frame::Trailers(map))),
+                // Neither data nor trailers: an unknown frame kind. Skip it
+                // rather than guess at bytes to put on the wire.
+                Err(_other) => continue,
+            },
+        }
+    }
+}
+
+/// Flatten a trailer [`HeaderMap`] into the name/value byte pairs
+/// [`RequestQueue::send_trailers`](crate) wants.
+///
+/// A multi-valued trailer becomes one pair per value, matching how it would be
+/// sent as repeated header lines. Names are lower-cased already by `http`'s
+/// [`HeaderName`], which is what an HTTP/2 trailer block requires.
+fn encode_trailers(map: &HeaderMap) -> Vec<(Vec<u8>, Vec<u8>)> {
+    map.iter()
+        .map(|(name, value)| (name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1010,5 +1183,64 @@ mod tests {
         // client could parse.
         assert_eq!(format!("{:x}\r\n", 5usize), "5\r\n");
         assert_eq!(format!("{:x}\r\n", 4096usize), "1000\r\n");
+    }
+
+    #[test]
+    fn next_frame_preserves_trailers_where_next_chunk_drops_them() {
+        // The whole reason `send_streaming` exists (M3, M14): the trailer-capable
+        // path must see the trailers frame that `next_chunk` throws away, or
+        // there is nothing to turn into an HTTP/2 trailers frame.
+        use futures::stream;
+        use http_body_util::StreamBody;
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+
+        let make_body = || {
+            let frames = stream::iter(vec![
+                Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::from_static(
+                    b"msg",
+                ))),
+                Ok(http_body::Frame::trailers(trailers.clone())),
+            ]);
+            StreamBody::new(frames)
+        };
+
+        // `next_frame` keeps them.
+        let body = make_body();
+        let mut body = std::pin::pin!(body);
+        match futures::executor::block_on(next_frame(body.as_mut())).unwrap() {
+            Some(Frame::Data(bytes)) => assert_eq!(bytes, b"msg"),
+            other => panic!("expected a data frame, got {}", other.is_some()),
+        }
+        match futures::executor::block_on(next_frame(body.as_mut())).unwrap() {
+            Some(Frame::Trailers(map)) => {
+                assert_eq!(map.get("grpc-status").unwrap(), "0");
+            }
+            _ => panic!("expected a trailers frame"),
+        }
+
+        // `next_chunk` drops them: one data chunk, then end.
+        let body = make_body();
+        let mut body = std::pin::pin!(body);
+        let first = futures::executor::block_on(next_chunk(body.as_mut())).unwrap();
+        assert_eq!(first.as_deref(), Some(&b"msg"[..]));
+        let second = futures::executor::block_on(next_chunk(body.as_mut())).unwrap();
+        assert_eq!(second, None, "next_chunk skips trailers and ends");
+    }
+
+    #[test]
+    fn encode_trailers_lowercases_names_and_keeps_values() {
+        // HTTP/2 trailer blocks require lower-cased names; `http`'s HeaderName
+        // stores them that way, so the flattening just has to not undo it.
+        let mut map = HeaderMap::new();
+        map.insert("Grpc-Status", "0".parse().unwrap());
+        map.insert("grpc-message", "".parse().unwrap());
+
+        let pairs = encode_trailers(&map);
+        assert!(pairs.iter().any(|(n, v)| n == b"grpc-status" && v == b"0"));
+        assert!(pairs
+            .iter()
+            .any(|(n, v)| n == b"grpc-message" && v.is_empty()));
     }
 }

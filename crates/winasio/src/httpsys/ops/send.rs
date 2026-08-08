@@ -10,8 +10,9 @@ use std::task::Poll;
 
 use windows::core::Result;
 use windows::Win32::Networking::HttpServer::{
-    HttpDataChunkFromMemory, HttpSendHttpResponse, HttpSendResponseEntityBody, HTTP_DATA_CHUNK,
-    HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
+    HttpDataChunkFromMemory, HttpDataChunkTrailers, HttpSendHttpResponse,
+    HttpSendResponseEntityBody, HTTP_DATA_CHUNK, HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
+    HTTP_UNKNOWN_HEADER,
 };
 use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
 
@@ -188,5 +189,121 @@ impl<B: IoBuf> IntoInner for SendBody<B> {
         // The descriptor pointed into the buffer; it must not outlive the op.
         self.chunk = HTTP_DATA_CHUNK::default();
         self.buffer
+    }
+}
+
+/// Send a response's trailers as the terminal chunk (M3).
+///
+/// HTTP.sys carries trailers in a body chunk of type `HttpDataChunkTrailers`
+/// whose payload is an array of `HTTP_UNKNOWN_HEADER` (name/value pointers) —
+/// the same shape as ordinary unknown headers. This is what carries gRPC's
+/// `grpc-status`/`grpc-message`.
+///
+/// # Ordering obligation
+///
+/// Trailers may only follow a body that was left open: every preceding send
+/// (the head and each data chunk) must have set `HTTP_SEND_RESPONSE_FLAG_MORE_DATA`.
+/// This op is the terminal one and sends **without** `MORE_DATA`, closing the
+/// response. Sending trailers after a response was already completed is a
+/// caller error the API rejects, not something this op can detect up front.
+///
+/// Like every send op it owns its backing storage — the name/value bytes, the
+/// descriptor array, and the chunk — for the call's duration, deriving the
+/// pointers from `&mut self` inside `operate` once the address is final.
+pub struct SendTrailers {
+    queue: QueueHandle,
+    request_id: RequestId,
+    /// Owned trailer field name/value bytes. The raw array below points into
+    /// these, so they must not move for the call's duration.
+    trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The descriptor array HTTP.sys reads, built at send time.
+    raw: Vec<HTTP_UNKNOWN_HEADER>,
+    /// The single trailers chunk, pointing into `raw`.
+    chunk: HTTP_DATA_CHUNK,
+}
+
+// SAFETY: the operation owns the trailer bytes, the descriptor array and the
+// chunk; the raw pointers all point within storage this value owns. The raw
+// types are only `!Send` because they contain pointers.
+unsafe impl Send for SendTrailers {}
+
+impl SendTrailers {
+    pub(crate) fn new(
+        queue: QueueHandle,
+        request_id: RequestId,
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Self {
+        SendTrailers {
+            queue,
+            request_id,
+            trailers,
+            raw: Vec::new(),
+            chunk: HTTP_DATA_CHUNK::default(),
+        }
+    }
+}
+
+unsafe impl OpCode for SendTrailers {
+    unsafe fn operate(&mut self, optr: *mut OVERLAPPED) -> Poll<Result<usize>> {
+        // A trailer name or value beyond the API's `u16` length field would wrap
+        // silently, so it is reported rather than truncated.
+        for (name, value) in &self.trailers {
+            if u16::try_from(name.len()).is_err() || u16::try_from(value.len()).is_err() {
+                return Poll::Ready(Err(windows::core::Error::new(
+                    windows::Win32::Foundation::ERROR_INVALID_PARAMETER.to_hresult(),
+                    "a trailer field exceeds the u16 length the HTTP Server API accepts",
+                )));
+            }
+        }
+
+        // Built here, from `&mut self`, so every pointer refers to storage this
+        // operation already owns at its final address.
+        self.raw = self
+            .trailers
+            .iter()
+            .map(|(name, value)| HTTP_UNKNOWN_HEADER {
+                NameLength: name.len() as u16,
+                RawValueLength: value.len() as u16,
+                pName: windows::core::PCSTR(name.as_ptr()),
+                pRawValue: windows::core::PCSTR(value.as_ptr()),
+            })
+            .collect();
+
+        self.chunk = HTTP_DATA_CHUNK {
+            DataChunkType: HttpDataChunkTrailers,
+            ..Default::default()
+        };
+        self.chunk.Anonymous.Trailers.TrailerCount = self.raw.len() as u16;
+        self.chunk.Anonymous.Trailers.pTrailers = self.raw.as_mut_ptr();
+
+        let code = unsafe {
+            HttpSendResponseEntityBody(
+                self.queue.raw(),
+                self.request_id.get(),
+                // No MORE_DATA: the trailers chunk closes the response.
+                0,
+                Some(std::slice::from_ref(&self.chunk)),
+                None,
+                None,
+                None,
+                Some(optr),
+                None,
+            )
+        };
+        poll_from_code(code, optr)
+    }
+
+    unsafe fn cancel(&mut self, optr: *mut OVERLAPPED) -> Result<()> {
+        unsafe { CancelIoEx(self.queue.raw(), Some(optr)) }
+    }
+}
+
+impl IntoInner for SendTrailers {
+    type Inner = ();
+
+    fn into_inner(mut self) {
+        // The descriptor pointed into `trailers`; it must not outlive the op.
+        self.chunk = HTTP_DATA_CHUNK::default();
+        self.raw = Vec::new();
     }
 }

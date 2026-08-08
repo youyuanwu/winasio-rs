@@ -160,6 +160,7 @@ fn every_vocabulary_enum_can_be_matched_exhaustively_from_another_crate() {
         match stage {
             SendStage::Head => "head",
             SendStage::Body => "body",
+            SendStage::Trailers => "trailers",
         }
     }
     fn header_reason(reason: HeaderReason) -> &'static str {

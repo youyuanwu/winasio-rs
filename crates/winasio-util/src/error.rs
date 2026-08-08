@@ -851,6 +851,13 @@ pub enum SendStage {
     Head,
     /// Sending a piece of the response body.
     Body,
+    /// Sending the response trailers (M3).
+    ///
+    /// A distinct stage because a trailer failure is not a body failure: the
+    /// body reached the peer intact and only the terminal HTTP/2 trailers frame
+    /// was refused, which a gRPC peer reads as a missing `grpc-status` rather
+    /// than a truncated message.
+    Trailers,
 }
 
 impl fmt::Display for SendStage {
@@ -858,6 +865,7 @@ impl fmt::Display for SendStage {
         let text = match self {
             SendStage::Head => "sending the response head",
             SendStage::Body => "sending the response body",
+            SendStage::Trailers => "sending the response trailers",
         };
         f.write_str(text)
     }
@@ -1286,7 +1294,7 @@ mod tests {
         .map(ToString::to_string)
         .collect();
         server.extend(
-            [SendStage::Head, SendStage::Body]
+            [SendStage::Head, SendStage::Body, SendStage::Trailers]
                 .iter()
                 .map(ToString::to_string),
         );

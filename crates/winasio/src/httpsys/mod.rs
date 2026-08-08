@@ -144,7 +144,7 @@ pub use init::HttpInitializer;
 pub use ops::body::ReceiveBody;
 pub use ops::cancel::CancelRequest;
 pub use ops::receive::ReceiveRequest;
-pub use ops::send::{SendBody, SendResponse};
+pub use ops::send::{SendBody, SendResponse, SendTrailers};
 pub use queue::{ReceiveConfig, ReceiveError, RequestQueue};
 pub use request::{Method, Request, RequestId, UnknownHeaders, MIN_CAPACITY};
 pub use response::{Response, Value, INLINE_CHUNKS, INLINE_UNKNOWN_HEADERS};

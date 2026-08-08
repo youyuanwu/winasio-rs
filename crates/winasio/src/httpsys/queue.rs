@@ -22,7 +22,7 @@ use super::init::VERSION;
 use super::ops::body::ReceiveBody;
 use super::ops::cancel::CancelRequest;
 use super::ops::receive::ReceiveRequest;
-use super::ops::send::{SendBody, SendResponse};
+use super::ops::send::{SendBody, SendResponse, SendTrailers};
 use super::ops::QueueHandle;
 use super::request::{Request, RequestId, MIN_CAPACITY};
 use super::response::Response;
@@ -413,6 +413,34 @@ impl<S: Submitter> RequestQueue<S> {
         match self.submit(SendBody::new(handle, id, buffer, last)) {
             Ok(fut) => fut.await.map_state(IntoInner::into_inner),
             Err((e, op)) => OpResult(Err(e), op.into_inner()),
+        }
+    }
+
+    /// Send a response's trailers, closing the response (M3).
+    ///
+    /// Each preceding send — the head and every body chunk — must have been a
+    /// partial one (`send_partial` / `send_body` with `last = false`), so the
+    /// response is still open for trailers to follow. This is the terminal send;
+    /// no further body or trailers may follow it.
+    ///
+    /// Whether the host can send trailers at all is
+    /// [`HttpInitializer::supports_response_trailers`](super::HttpInitializer::supports_response_trailers);
+    /// calling this where trailers are unsupported surfaces the platform's error.
+    pub async fn send_trailers(
+        &self,
+        id: RequestId,
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> OpResult<usize, ()> {
+        let handle = match self.with_open(|h| h) {
+            Ok(h) => h,
+            Err(e) => return OpResult(Err(e), ()),
+        };
+        match self.submit(SendTrailers::new(handle, id, trailers)) {
+            Ok(fut) => fut.await.map_state(IntoInner::into_inner),
+            Err((e, op)) => {
+                op.into_inner();
+                OpResult(Err(e), ())
+            }
         }
     }
 

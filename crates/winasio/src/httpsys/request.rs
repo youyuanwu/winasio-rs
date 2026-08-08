@@ -9,7 +9,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use windows::Win32::Networking::HttpServer::{
-    HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS, HTTP_REQUEST_V2, HTTP_UNKNOWN_HEADER, HTTP_VERB,
+    HTTP_REQUEST_FLAG_HTTP2, HTTP_REQUEST_FLAG_HTTP3, HTTP_REQUEST_FLAG_MORE_ENTITY_BODY_EXISTS,
+    HTTP_REQUEST_V2, HTTP_UNKNOWN_HEADER, HTTP_VERB,
 };
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6};
 
@@ -299,9 +300,47 @@ impl Request {
     }
 
     /// The HTTP version, as `(major, minor)`.
+    ///
+    /// # Why this is not the way to detect HTTP/2 (M2)
+    ///
+    /// Measured on Windows Server 2025 (and consistent with the SDK): for an
+    /// HTTP/2 request HTTP.sys does **not** report `(2, 0)` here — it reports
+    /// the `(major, minor)` of the *nominal* request line, which for h2 is the
+    /// `(1, 1)` (or `(0, 0)`) that h2 has no real version line for. The
+    /// negotiated protocol is signalled out of band, in [`Self::is_http2`] /
+    /// [`Self::is_http3`], via the request's `Flags` field. Callers that need
+    /// the true wire protocol must consult those, not this tuple. This accessor
+    /// still reports the raw tuple verbatim rather than papering it over, so the
+    /// distinction stays visible.
     pub fn version(&self) -> (u16, u16) {
         let v = unsafe { (*self.base()).Base.Version };
         (v.MajorVersion, v.MinorVersion)
+    }
+
+    /// The raw `HTTP_REQUEST.Flags` bitfield.
+    ///
+    /// Exposed so the protocol-detection predicates below have a single source,
+    /// and so a caller can inspect flags this crate does not yet name.
+    pub fn flags(&self) -> u32 {
+        unsafe { (*self.base()).Base.Flags }
+    }
+
+    /// Whether HTTP.sys negotiated HTTP/2 for this request (M2).
+    ///
+    /// This is the reliable protocol signal — see [`Self::version`] for why the
+    /// `(major, minor)` tuple is not. It reads `HTTP_REQUEST_FLAG_HTTP2` from
+    /// the request `Flags`.
+    pub fn is_http2(&self) -> bool {
+        self.flags() & HTTP_REQUEST_FLAG_HTTP2 != 0
+    }
+
+    /// Whether HTTP.sys negotiated HTTP/3 for this request.
+    ///
+    /// The h2 sibling of [`Self::is_http2`]; reads `HTTP_REQUEST_FLAG_HTTP3`.
+    /// Not exercised by this crate's tests (no h3 binding in the harness) but
+    /// reported for completeness so a caller is not left guessing.
+    pub fn is_http3(&self) -> bool {
+        self.flags() & HTTP_REQUEST_FLAG_HTTP3 != 0
     }
 
     /// A header HTTP.sys recognises, or `None` if it was absent.
